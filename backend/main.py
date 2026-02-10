@@ -352,15 +352,15 @@ async def analyze_logline(
              {"label": "📺 电视剧 (TV Series)", "value": "tv"},
              {"label": "📱 现代短剧 (Short Drama)", "value": "short"}
         ]},
+        {"key": "episode_count", "question": "您计划创作多少集？"}, # New Step
         {"key": "tone", "question": "这部作品的基调是什么？"},
         {"key": "time_period", "question": "故事发生在什么时代背景？"},
         {"key": "title", "question": "不管是暂定还是正式，给这个故事起个名字吧？"},
-        {"key": "protagonist_core", "question": "主角的核心特征或最大欲望是什么？"},
-        {"key": "antagonist_obstacle", "question": "主角面临的最大阻碍或反派是谁？"},
-        {"key": "central_conflict", "question": "故事的核心冲突或两难困境是什么？"},
+        {"key": "character_details", "question": "主要角色的性格、外貌或背景有什么特别设定？"}, # New Step
+        {"key": "plot_details", "question": "有哪些一定要发生的关键情节或转折？"}, # New Step
         {"key": "theme", "question": "您想通过这个故事探讨什么主题？"},
         {"key": "visual_style", "question": "视觉风格偏向于什么？（如：赛博朋克、写实、黑白诺尔等）"},
-        {"key": "target_audience", "question": "您预想的目标观众是谁？"}
+        {"key": "user_notes", "question": "还有什么补充的内容，或者特别的要求吗？"} # New Final Step
     ]
 
     # 1. Check which steps are missing
@@ -368,9 +368,16 @@ async def analyze_logline(
     normalized_context = context.copy()
     if project.project_type and project.project_type != "pending":
         normalized_context['project_type'] = project.project_type
-
+    
     next_step = None
     for step in REQUIRED_STEPS:
+        # Check Dependency for Episode Count
+        if step["key"] == "episode_count":
+            # Only ask if TV or Short
+            p_type = normalized_context.get("project_type", "movie")
+            if p_type == "movie": 
+                continue 
+                
         if step["key"] not in normalized_context:
             next_step = step
             break
@@ -396,8 +403,30 @@ async def analyze_logline(
                 "options": next_step["default_options"]
             }
         }
-
-    # 3.2 For other steps, use LLM to generate context-aware options
+    
+    # 3.2 Hardcoded options for Episode Count
+    if next_step["key"] == "episode_count":
+         return {
+            "type": "interaction_required",
+            "payload": {
+                "field": "episode_count",
+                "question": next_step["question"],
+                "options": [
+                    {"label": "8集 (迷你剧)", "value": "8"},
+                    {"label": "12集 (标准季)", "value": "12"},
+                    {"label": "20集 (国产剧标准)", "value": "20"},
+                    {"label": "24集", "value": "24"},
+                    {"label": "30集以上", "value": "40"}
+                ]
+            }
+        }
+    
+    # 3.3 Check Prompt Richness (Optimization)
+    # If the user's initial logline is very long (> 100 chars) and detailed,
+    # we tell the LLM to verify if we even need to ask this question.
+    # Note: Currently we just proceed to ask to be comprehensive.
+    
+    # 3.4 For other steps, use LLM to generate context-aware options
     # We pass the logline + current context to LLM
     prompt_context = f"Logline: {project.logline}\nCurrent Settings: {json.dumps(normalized_context, ensure_ascii=False)}"
     

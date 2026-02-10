@@ -287,9 +287,11 @@ app.use('/api', createProxyMiddleware({
     target: API_URL, 
     changeOrigin: true,
     pathRewrite: { '^/api': '' },
+    proxyTimeout: 600000, // 10分钟超时，防止 AI 生成过程中断
+    timeout: 600000,      // 传入连接超时
     onProxyReq: (proxyReq, req, res) => {
-        // 可选: 记录代理请求，方便调试
-        // console.log('Proxy:', req.path, '->', API_URL + req.path);
+        // Keeps socket alive
+        proxyReq.setTimeout(600000);
     },
     onError: (err, req, res) => {
         console.error('Proxy Error:', err);

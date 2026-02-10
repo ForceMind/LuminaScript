@@ -191,7 +191,10 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     Your goal is to guide the user in defining their story's "Bible" step-by-step.
     
     Current Task: Generate 3-4 creative, distinct options for a specific aspect of the story based on the Logline an Context.
-    Also refine the question to be more specific to the story context if possible.
+    
+    CRITICAL INSTRUCTION - ADAPTIVITY:
+    - Assess the available context. If the user has ALREADY provided detailed information about this specific aspect in their Logline or previous answers, provide options that *refine* or *challenge* that detail, rather than asking basic questions.
+    - If the context is sparse, provide broad, inspiring options.
     
     IMPORTANT: The entire output MUST be in Chinese (Simplified). The question and all options (labels and values) must be in Chinese.
     

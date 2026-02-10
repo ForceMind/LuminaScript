@@ -14,7 +14,8 @@ import {
   Delete,
   Coin,
   SwitchButton,
-  DataLine
+  DataLine,
+  Download // Added Download Icon
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import AdminDashboard from './components/AdminDashboard.vue'
@@ -330,6 +331,33 @@ const deleteProject = async () => {
         }
     }
 }
+
+const exportScript = () => {
+    if (!currentProject.value || !currentProject.value.scenes) return
+    
+    // Simple Text format
+    let content = `Title: ${currentProject.value.title || 'Untitled'}\n`
+    content += `Type: ${currentProject.value.project_type}\n`
+    content += `Logline: ${currentProject.value.logline}\n`
+    content += `----------------------------\n\n`
+    
+    currentProject.value.scenes.forEach((s: any) => {
+        content += `SCENE ${s.scene_index}: ${s.status === 'completed' ? '' : '(Generating...)'}\n`
+        content += `${s.outline}\n\n`
+        if (s.content) {
+            content += `${s.content}\n\n`
+            content += `============================\n\n`
+        }
+    })
+    
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${currentProject.value.title || 'script'}.txt`
+    link.click()
+    URL.revokeObjectURL(url)
+}
 </script>
 
 <template>
@@ -369,7 +397,17 @@ const deleteProject = async () => {
                 <img src="/logo.png" alt="Logo" class="h-8 w-auto hidden lg:block" />
                 <span class="text-xl font-light tracking-tight text-slate-800">妙笔<span class="font-bold">流光</span></span>
             </div>
+            <!-- Logline Display in Header -->
+            <div v-if="currentProject && currentProject.logline" class="hidden md:block flex-1 mx-8 max-w-2xl">
+                 <div class="text-xs text-gray-400 font-bold uppercase tracking-wider mb-1">我的创意</div>
+                 <div class="text-sm text-gray-600 truncate" :title="currentProject.logline">
+                     {{ currentProject.logline }}
+                 </div>
+            </div>
             <div class="flex items-center gap-3">
+                 <el-button v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @click="exportScript" plain>
+                    <el-icon class="mr-1"><Download /></el-icon> 导出
+                 </el-button>
                  <el-button type="primary" round :icon="Plus" @click="currentProject=null">开始新创意</el-button>
             </div>
         </header>
@@ -603,6 +641,40 @@ const deleteProject = async () => {
                     </div>
 
                     <div class="space-y-6">
+                        <!-- Project Info Tabs -->
+                        <div v-if="currentProject.scenes && currentProject.scenes.length > 0" class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-6">
+                             <el-tabs>
+                                <el-tab-pane label="剧情大纲">
+                                    <div class="space-y-4">
+                                        <div v-for="s in currentProject.scenes" :key="'out-'+s.id" class="flex gap-4 p-3 rounded hover:bg-gray-50">
+                                            <div class="font-bold text-gray-400 w-12 shrink-0">#{{ s.scene_index }}</div>
+                                            <div class="text-sm text-gray-700">{{ s.outline }}</div>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
+                                <el-tab-pane label="人物设定">
+                                    <div v-if="currentProject.global_context?.character_details" class="whitespace-pre-wrap text-sm text-gray-600 leading-relaxed p-2">
+                                        {{ currentProject.global_context.character_details }}
+                                    </div>
+                                    <div v-else class="text-gray-400 text-sm text-center py-4">暂无详细人物设定</div>
+                                </el-tab-pane>
+                                <el-tab-pane label="关键设定">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                                        <div v-if="currentProject.global_context?.logline" class="col-span-full">
+                                            <div class="font-bold text-gray-500 mb-1">Logline</div>
+                                            <div class="bg-gray-50 p-2 rounded">{{ currentProject.logline }}</div>
+                                        </div>
+                                        <div v-for="(val, key) in currentProject.global_context" :key="key">
+                                            <template v-if="!['logline', 'character_details', 'project_type'].includes(key)">
+                                                <div class="font-bold text-gray-500 mb-1 capitalize">{{ key }}</div>
+                                                <div class="bg-gray-50 p-2 rounded truncate" :title="val">{{ val }}</div>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
+                             </el-tabs>
+                        </div>
+                        
                         <div v-if="!currentProject.scenes || currentProject.scenes.length === 0" class="text-center py-10 text-gray-400">
                              <div v-if="loading">
                                 <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
