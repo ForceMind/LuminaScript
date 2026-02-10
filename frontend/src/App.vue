@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted, nextTick } from 'vue' // Added nextTick
+import { ref, computed, onUnmounted, nextTick } from 'vue'
 import axios from 'axios'
 import {
   Document,
@@ -20,7 +20,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 // --- State ---
 const token = ref(localStorage.getItem('token') || '')
 const user = ref<any>(null)
-const drawerOpen = ref(false) // For mobile history
+const drawerOpen = ref(false)
 
 // Auth Form
 const isLoginMode = ref(true)
@@ -32,12 +32,12 @@ const logline = ref('')
 const currentProject = ref<any>(null)
 const interaction = ref<any>(null)
 const selectedOption = ref('')
-const customInput = ref('') // Added for manual input
+const customInput = ref('')
 const loading = ref(false)
-const loadingText = ref('AI 正在思考中...') // New Loading Text State
+const loadingText = ref('AI 正在思考中...')
 const projectList = ref<any[]>([])
 const pollTimer = ref<any>(null)
-const isStarted = ref(false) // Track if we have entered the "started" state for "New Project" view
+const isStarted = ref(false)
 
 // Project Sidebar Data
 const projectContext = computed(() => currentProject.value?.global_context || {})
