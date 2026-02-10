@@ -268,8 +268,8 @@ if ps -p $PID > /dev/null; then
     cd "$FRONTEND_DIR"
     npm install express http-proxy-middleware --no-save
 
-    # 生成 server.js
-    cat > server.js <<EOF
+    # 生成 server.cjs (使用 .cjs 避免 type: module 问题)
+    cat > server.cjs <<EOF
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
@@ -301,7 +301,7 @@ app.use('/api', createProxyMiddleware({
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // 3. SPA 回退 (所有其他请求返回 index.html)
-app.get('*', (req, res) => {
+app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
@@ -317,7 +317,7 @@ EOF
     fi
     
     # 启动 Node 服务
-    nohup node server.js > "$PROJECT_DIR/frontend.log" 2>&1 &
+    nohup node server.cjs > "$PROJECT_DIR/frontend.log" 2>&1 &
     
     echo -e "\n${GREEN}====== 部署成功 ======${NC}"
     echo -e "前端访问地址:  http://$IP:$FRONTEND_PORT"
