@@ -215,10 +215,16 @@ for ((i=0; i<10; i++)); do
 done
 
 cd "$BACKEND_DIR"
-nohup "$VENV_DIR/bin/uvicorn" main:app --host 0.0.0.0 --port $PORT > "$PROJECT_DIR/backend.log" 2>&1 &
+
+# 启用 Python 无缓冲模式，确保日志实时写入
+export PYTHONUNBUFFERED=1
+
+# 生产环境建议去掉 --reload，增强稳定性
+echo "启动后端服务 (Port: $PORT)..."
+nohup "$VENV_DIR/bin/uvicorn" main:app --host 0.0.0.0 --port $PORT >> "$PROJECT_DIR/backend.log" 2>&1 &
 PID=$!
 
-sleep 2
+sleep 5  # 增加等待时间，确保完全启动或报错退出
 if ps -p $PID > /dev/null; then
     IP=$(hostname -I | awk '{print $1}')
     
