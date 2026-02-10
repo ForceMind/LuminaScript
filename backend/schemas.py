@@ -82,6 +82,14 @@ class AIInteractionLogResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class PaginatedLoginLogs(BaseModel):
+    total: int
+    items: List[LoginLogResponse]
+
+class PaginatedAILogs(BaseModel):
+    total: int
+    items: List[AIInteractionLogResponse]
+
 class Token(BaseModel):
     access_token: str
     token_type: str

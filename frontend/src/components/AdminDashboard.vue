@@ -13,6 +13,15 @@ const loginLogs = ref([])
 const aiLogs = ref([])
 const loading = ref(false)
 
+// Pagination State
+const loginPage = ref(1)
+const loginPageSize = ref(20)
+const loginTotal = ref(0)
+
+const aiPage = ref(1)
+const aiPageSize = ref(20)
+const aiTotal = ref(0)
+
 const api = axios.create({ baseURL: '/api' })
 api.interceptors.request.use((config) => {
     config.headers.Authorization = `Bearer ${props.token}`
@@ -34,8 +43,15 @@ const fetchUsers = async () => {
 const fetchLoginLogs = async () => {
     loading.value = true
     try {
-        const res = await api.get('/admin/logs/login')
-        loginLogs.value = res.data
+        const res = await api.get(`/admin/logs/login?page=${loginPage.value}&page_size=${loginPageSize.value}`)
+        if (res.data.items) {
+             loginLogs.value = res.data.items
+             loginTotal.value = res.data.total
+        } else {
+             // Fallback for old API just in case
+             loginLogs.value = res.data
+             loginTotal.value = res.data.length
+        }
     } catch (e) {
         ElMessage.error('无法获取登录日志')
     } finally {
@@ -46,8 +62,14 @@ const fetchLoginLogs = async () => {
 const fetchAiLogs = async () => {
     loading.value = true
     try {
-        const res = await api.get('/admin/logs/ai')
-        aiLogs.value = res.data
+        const res = await api.get(`/admin/logs/ai?page=${aiPage.value}&page_size=${aiPageSize.value}`)
+        if (res.data.items) {
+            aiLogs.value = res.data.items
+            aiTotal.value = res.data.total
+        } else {
+            aiLogs.value = res.data
+            aiTotal.value = res.data.length
+        }
     } catch (e) {
         ElMessage.error('无法获取AI日志')
     } finally {
@@ -57,9 +79,19 @@ const fetchAiLogs = async () => {
 
 const handleTabChange = () => {
     if (activeTab.value === 'users') fetchUsers()
-    if (activeTab.value === 'logins') fetchLoginLogs()
-    if (activeTab.value === 'ai') fetchAiLogs()
+    if (activeTab.value === 'logins') {
+        loginPage.value = 1
+        fetchLoginLogs()
+    }
+    if (activeTab.value === 'ai') {
+        aiPage.value = 1
+        fetchAiLogs()
+    }
 }
+
+// Watchers for pagination
+watch(loginPage, () => fetchLoginLogs())
+watch(aiPage, () => fetchAiLogs())
 
 onMounted(() => {
     fetchUsers()
@@ -105,6 +137,15 @@ onMounted(() => {
                         </template>
                     </el-table-column>
                 </el-table>
+                <div class="mt-4 flex justify-center">
+                    <el-pagination 
+                        v-model:current-page="loginPage" 
+                        layout="total, prev, pager, next" 
+                        :total="loginTotal" 
+                        :page-size="loginPageSize" 
+                        background
+                    />
+                </div>
             </el-tab-pane>
 
             <el-tab-pane label="AI 交互审计" name="ai">
@@ -134,6 +175,15 @@ onMounted(() => {
                         </template>
                     </el-table-column>
                 </el-table>
+                <div class="mt-4 flex justify-center">
+                    <el-pagination 
+                        v-model:current-page="aiPage" 
+                        layout="total, prev, pager, next" 
+                        :total="aiTotal" 
+                        :page-size="aiPageSize" 
+                        background
+                    />
+                </div>
             </el-tab-pane>
         </el-tabs>
     </div>

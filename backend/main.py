@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from typing import List
+from typing import List, Dict, Any
 from pydantic import BaseModel 
 import json
 
@@ -96,43 +96,67 @@ async def admin_list_users(
     result = await db.execute(select(models.User))
     return result.scalars().all()
 
-@app.get("/admin/logs/login", response_model=List[schemas.LoginLogResponse])
+@app.get("/admin/logs/login", response_model=schemas.PaginatedLoginLogs)
 async def admin_list_login_logs(
+    page: int = 1,
+    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
     admin: models.User = Depends(check_admin)
 ):
-    # Join with User to get username
+    # Calculate offset
+    offset = (page - 1) * page_size
+    
+    # 1. Get Total Count
+    count_query = select(func.count()).select_from(models.LoginLog)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # 2. Get Items
     result = await db.execute(
         select(models.LoginLog, models.User.username)
         .join(models.User, models.LoginLog.user_id == models.User.id)
         .order_by(models.LoginLog.timestamp.desc())
-        .limit(100)
+        .offset(offset)
+        .limit(page_size)
     )
-    # Manually construct response to include username
+    
     logs = []
     for log, username in result:
         log_dict = log.__dict__
         log_dict['user_name'] = username
         logs.append(log_dict)
-    return logs
+        
+    return {"total": total, "items": logs}
 
-@app.get("/admin/logs/ai", response_model=List[schemas.AIInteractionLogResponse])
+@app.get("/admin/logs/ai", response_model=schemas.PaginatedAILogs)
 async def admin_list_ai_logs(
+    page: int = 1,
+    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
     admin: models.User = Depends(check_admin)
 ):
+    offset = (page - 1) * page_size
+    
+    # 1. Get Total Count
+    count_query = select(func.count()).select_from(models.AIInteractionLog)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # 2. Get Items
     result = await db.execute(
         select(models.AIInteractionLog, models.User.username)
         .join(models.User, models.AIInteractionLog.user_id == models.User.id)
         .order_by(models.AIInteractionLog.timestamp.desc())
-        .limit(50)
+        .offset(offset)
+        .limit(page_size)
     )
     logs = []
     for log, username in result:
         log_dict = log.__dict__
         log_dict['user_name'] = username
         logs.append(log_dict)
-    return logs
+        
+    return {"total": total, "items": logs}
 
 # --- Auth Routes ---
 
