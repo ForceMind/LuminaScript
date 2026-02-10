@@ -111,18 +111,6 @@ const handleAuth = async () => {
     }
 }
 
-const logout = () => {
-    stopPolling()
-    token.value = ''
-    user.value = null
-    showAdmin.value = false
-    localStorage.removeItem('token')
-    projectList.value = []
-    currentProject.value = null
-    interaction.value = null
-    ElMessage.info('已退出登录')
-}
-
 const fetchUser = async () => {
     if (!token.value) return
     try {
@@ -159,6 +147,18 @@ const stopPolling = () => {
         clearInterval(pollTimer.value)
         pollTimer.value = null
     }
+}
+
+const logout = () => {
+    try { stopPolling() } catch(e) { console.error(e) }
+    token.value = ''
+    user.value = null
+    showAdmin.value = false
+    localStorage.removeItem('token')
+    projectList.value = []
+    currentProject.value = null
+    interaction.value = null
+    ElMessage.info('已退出登录')
 }
 
 // Start polling if token exists on load
