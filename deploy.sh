@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# LuminaScript 智能部署助手 (稳定版)
+# LuminaScript 智能部署助手 (全栈版)
 # ==========================================
 
 # 颜色定义
@@ -20,7 +20,7 @@ ENV_FILE="$BACKEND_DIR/.env"
 echo -e "${BLUE}====== 妙笔流光 (LuminaScript) 部署助手 ======${NC}"
 
 # ================= 0. 内存优化 (自动 SWAP) =================
-# 解决低配服务器运行 dnf/yum/pip 时的 "Killed" 问题
+# 解决低配服务器运行 dnf/yum/pip/npm 时的 "Killed" 问题
 check_swap() {
     SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
     if [ "$SWAP_SIZE" -eq 0 ]; then
@@ -29,21 +29,22 @@ check_swap() {
         chmod 600 /swapfile
         mkswap /swapfile
         swapon /swapfile
-        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        if ! grep -q "/swapfile" /etc/fstab; then
+            echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        fi
         echo -e "${GREEN}Swap 创建成功!${NC}"
     else
         echo "检测到 Swap: ${SWAP_SIZE}MB (跳过创建)"
     fi
 }
-# 尝试创建 swap，需要 sudo 权限
 if [ "$EUID" -eq 0 ]; then
     check_swap
 else
-    echo -e "${YELLOW}非 root 用户运行，跳过 Swap 自动创建。若后续安装失败，请手动增加 Swap。${NC}"
+    echo -e "${YELLOW}非 root 用户运行，跳过 Swap 自动创建。${NC}"
 fi
 
-# ================= 1. 系统依赖安装 =================
-echo -e "${YELLOW}[1/6] 检查并安装系统依赖...${NC}"
+# ================= 1. 系统依赖安装 (含 Node.js) =================
+echo -e "${YELLOW}[1/6] 检查并安装系统依赖 (Python & Node.js)...${NC}"
 
 OS="Unknown"
 if [ -f /etc/os-release ]; then
@@ -52,40 +53,48 @@ if [ -f /etc/os-release ]; then
 fi
 echo "当前系统: $OS"
 
-install_deps_if_missing() {
-    # 优先尝试安装 Python 3.11，如果源里没有则回退
+install_系统软件() {
     if [[ "$OS" == *"Alibaba"* ]] || [[ "$OS" == *"CentOS"* ]] || [[ "$OS" == *"Red Hat"* ]]; then
-        echo "正在更新包管理器缓存..."
-        # 尝试安装 EPEL 源（如果不存在）
-        yum install -y epel-release 2>/dev/null
-
-        if command -v dnf > /dev/null; then
-            # 增加 --memory-limit 尝试防止 OOM，但最有效的是上面的 swap
-            sudo dnf install -y git nginx python3.11 python3.11-pip python3.11-devel bc || \
-            sudo dnf install -y git nginx python3 python3-pip python3-devel bc
-        else
-            sudo yum install -y git nginx python3 python3-pip python3-devel bc
+        # 安装 Node.js 18.x 源
+        if ! command -v node > /dev/null; then
+            echo "添加 Node.js 源..."
+            curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
         fi
+        
+        sudo yum install -y epel-release 2>/dev/null
+        # 尝试 dnf 或 yum
+        PKG_MGR="yum"
+        if command -v dnf > /dev/null; then PKG_MGR="dnf"; fi
+        
+        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs
     elif [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
+        # 安装 Node.js 18.x 源
+        if ! command -v node > /dev/null; then
+             curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+        fi
         sudo apt update -qq
-        # Ubuntu 20.04+ 通常有 python3.8+，尝试添加 deadsnakes PPA 以防万一 (暂略，直接用默认)
-        sudo apt install -y python3 python3-pip python3-venv git nginx bc -qq
+        sudo apt install -y python3 python3-pip python3-venv git nginx bc nodejs -qq
     fi
 }
 
-install_deps_if_missing
+install_系统软件
+
+# 验证 Node.js
+if command -v node > /dev/null && command -v npm > /dev/null; then
+    NODE_VER=$(node -v)
+    echo -e "${GREEN}Node.js 已就绪: $NODE_VER${NC}"
+else
+    echo -e "${RED}Node.js 安装失败，前端无法构建。${NC}"
+    exit 1
+fi
 
 # ================= 2. Python 环境配置 =================
 echo -e "${YELLOW}[2/6] 配置 Python 环境...${NC}"
 
-# 寻找合适的 Python 版本
-# 注意：RedHat 系可能叫 python3.11，Debian 系通常叫 python3
 PYTHON_EXE=""
 for callback in python3.12 python3.11 python3.10 python3; do
     if command -v $callback > /dev/null; then
-        # 检查具体版本号
         VER=$($callback -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-        # 简单浮点比较
         IS_OK=$(echo "$VER >= 3.10" | bc -l)
         if [ "$IS_OK" -eq 1 ]; then
             PYTHON_EXE=$callback
@@ -96,32 +105,19 @@ for callback in python3.12 python3.11 python3.10 python3; do
 done
 
 if [ -z "$PYTHON_EXE" ]; then
-    echo -e "${RED}[Error] 未找到 Python 3.10+。LuminaScript 依赖新版 Python 特性。${NC}"
-    echo "依赖安装步骤可能因内存不足被系统 Kill，导致新版 Python 未能安装成功。"
-    echo "建议重试，或手动安装 python 3.11: sudo dnf install python3.11"
+    echo -e "${RED}[Error] 未找到 Python 3.10+。${NC}"
     exit 1
 fi
 
-# 创建 venv
-# 无论如何，重新创建 venv 以确保 clean
-if [ -d "$VENV_DIR" ]; then
-    echo "清理旧的虚拟环境..."
-    rm -rf "$VENV_DIR"
-fi
-
+# 重建 venv
+if [ -d "$VENV_DIR" ]; then rm -rf "$VENV_DIR"; fi
 echo "创建虚拟环境 ($VENV_DIR)..."
-$PYTHON_EXE -m venv "$VENV_DIR" || {
-    echo -e "${RED}虚拟环境创建失败!${NC}"
-    echo "可能原因: 缺少 python3-venv 包 (Debian/Ubuntu) 或 内存不足。"
-    exit 1
-}
+$PYTHON_EXE -m venv "$VENV_DIR"
 
-# 强制使用 venv 中的 pip
 VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
 
 # ================= 3. 配置文件 (.env) =================
-# ... (保持不变)
 if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<EOF
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
@@ -132,39 +128,40 @@ LLM_MODEL_ID=gpt-3.5-turbo
 EOF
 fi
 
-# ================= 4. 代码与依赖 =================
-echo -e "${YELLOW}[4/6] 安装应用依赖...${NC}"
-
-if [ -d ".git" ]; then
-    git pull || echo "Git pull 失败，跳过。"
-fi
-
+# ================= 4. 后端依赖 =================
+echo -e "${YELLOW}[4/6] 安装后端依赖...${NC}"
+if [ -d ".git" ]; then git pull; fi
 echo "正在安装 Python 库..."
-# 使用阿里云镜像加速，减少超时概率
 $VENV_PIP install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/
-$VENV_PIP install -r "$BACKEND_DIR/requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/ || {
-    echo -e "${RED}依赖安装失败!${NC}"
-    echo "如果是 'killed'，请确保 Swap 已启用。"
-    echo "如果是 'No matching distribution'，请确认 python 版本 >= 3.10。"
-    exit 1
-}
+$VENV_PIP install -r "$BACKEND_DIR/requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/
 
 # ================= 5. 前端构建 =================
 echo -e "${YELLOW}[5/6] 构建前端资源...${NC}"
-if command -v npm &>/dev/null; then
-    cd "$FRONTEND_DIR"
-    if [ ! -d "node_modules" ]; then
-        npm install --silent
-    fi
-    npm run build
+cd "$FRONTEND_DIR"
+
+# 设置 npm 淘宝镜像加速
+npm config set registry https://registry.npmmirror.com
+
+echo "安装前端依赖..."
+if [ ! -d "node_modules" ]; then
+    npm install
 else
-    echo -e "${YELLOW}跳过前端构建 (无 npm)${NC}"
+    # 简单的全部重装耗时太久，尝试直接 install
+    npm install
 fi
+
+echo "编译前端应用..."
+npm run build || {
+    echo -e "${RED}前端构建失败!${NC}"
+    # 很多低配机构建前端容易内存溢出，最后提醒一下 Swap
+    echo "提示: 如果出现 'Killed' 错误，请检查 Swap 是否已成功挂载。"
+    exit 1
+}
 
 # ================= 6. 启动服务 =================
 echo -e "${YELLOW}[6/6] 启动服务...${NC}"
 
-# 端口检查 (Python 实现)
+# Python 端口检查
 check_port() {
     $VENV_PYTHON -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); exit(0 if s.connect_ex(('127.0.0.1', $1)) != 0 else 1)"
     return $?
@@ -178,7 +175,7 @@ for ((i=0; i<10; i++)); do
         echo -e "${GREEN}使用端口: $PORT${NC}"
         break
     else
-        echo "端口 $PORT 被占用，尝试下一端口..."
+        echo "端口 $PORT 被占用，尝试 $((PORT+1))..."
         PORT=$((PORT+1))
     fi
 done
