@@ -124,13 +124,25 @@ VENV_PIP="$VENV_DIR/bin/pip"
 
 # ================= 3. 配置文件 (.env) =================
 if [ ! -f "$ENV_FILE" ]; then
+    echo -e "${YELLOW}[配置] 检测到首次运行 (或缺少 .env)，请配置 AI 服务信息:${NC}"
+    read -p "请输入 LLM API Key (回车使用默认占位符): " INPUT_KEY
+    
+    # Default values suitable for the user's previous context (Xunfei/Spark)
+    if [ -z "$INPUT_KEY" ]; then
+        INPUT_KEY="your_key_here"
+        echo "未输入 Key，将使用默认占位符。后续请手动编辑 backend/.env 修改。"
+    fi
+
     cat > "$ENV_FILE" <<EOF
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
 LLM_PROVIDER=openai
-LLM_API_KEY=your_key_here
-LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v2
-LLM_MODEL_ID=gpt-3.5-turbo
+LLM_API_KEY=$INPUT_KEY
+LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v1
+LLM_MODEL_ID=xopglm47blth2
 EOF
+    echo -e "${GREEN}配置文件已生成: $ENV_FILE${NC}"
+else
+    echo "检测到现有配置文件 (.env)，跳过配置。"
 fi
 
 # ================= 4. 后端依赖 =================

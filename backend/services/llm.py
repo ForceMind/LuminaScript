@@ -15,8 +15,11 @@ API_KEY = os.getenv("LLM_API_KEY")
 BASE_URL = os.getenv("LLM_BASE_URL", "https://maas-api.cn-huabei-1.xf-yun.com/v1")
 MODEL_ID = os.getenv("LLM_MODEL_ID", "xopglm47blth2")
 
+if not API_KEY:
+    logger.warning("⚠️ LLM_API_KEY implies not set. LLM features will fail. Please set it in .env file.")
+
 client = AsyncOpenAI(
-    api_key=API_KEY,
+    api_key=API_KEY if API_KEY else "dummy_key", # Prevent client init failure, fail at request time
     base_url=BASE_URL,
 )
 

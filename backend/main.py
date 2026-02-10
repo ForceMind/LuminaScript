@@ -14,6 +14,10 @@ import auth
 from services import llm  # Import LLM Service
 import logging
 import sys
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists
+load_dotenv()
 
 # Configure Logging
 logging.basicConfig(
@@ -298,11 +302,18 @@ async def analyze_logline(
     logger.info(f"正在调用 LLM 为步骤 {next_step['key']} 生成选项...")
     
     # 3.2 For other steps, use LLM to generate context-aware options
-    question_data, usage = await llm.generate_interaction_options(
-        step_key=next_step["key"],
-        base_question=next_step["question"],
-        context_str=prompt_context
-    )
+    try:
+        question_data, usage = await llm.generate_interaction_options(
+            step_key=next_step["key"],
+            base_question=next_step["question"],
+            context_str=prompt_context
+        )
+    except Exception as e:
+        logger.error(f"LLM 交互生成失败: {e}")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"AI 服务暂时不可用，请检查 API Key 配置或稍后重试 ({str(e)})"
+        )
     
     # Update Token Usage
     project.total_tokens += usage

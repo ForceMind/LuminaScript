@@ -210,7 +210,10 @@ const analyzeLogline = async (id: number) => {
             fetchProjects()
         }
     }
-  } catch (e) { console.error(e) } finally {
+    } catch (e: any) { 
+        console.error(e) 
+        ElMessage.error(e.response?.data?.detail || '分析失败，请检查网络或后端日志')
+    } finally {
       loading.value = false
   }
 }
