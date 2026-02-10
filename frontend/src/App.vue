@@ -182,6 +182,10 @@ const createProject = async () => {
 }
 
 const analyzeLogline = async (id: number) => {
+  if (!id) {
+    console.error("Analysis invoked without ID")
+    return
+  }
   try {
     interaction.value = null // Clear previous to show loading state if needed
     loading.value = true
@@ -397,17 +401,35 @@ const deleteProject = async () => {
                 <template #header>
                     <div class="text-lg font-bold">我的剧本</div>
                 </template>
-                <div class="h-full overflow-y-auto pb-20">
-                    <ul class="space-y-2 p-1">
-                        <div class="p-2">
-                            <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
+                <div class="flex flex-col h-full">
+                    <div class="flex-1 overflow-y-auto">
+                        <ul class="space-y-2 p-1">
+                            <div class="p-2">
+                                <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
+                            </div>
+                            <li v-for="p in projectList" :key="p.id" 
+                                @click="loadProject(p)"
+                                class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 truncate shadow-sm active:bg-blue-50">
+                                {{ p.title || p.logline }}
+                            </li>
+                        </ul>
+                        <div v-if="projectList.length === 0" class="text-center text-gray-400 text-sm py-8">
+                            暂无历史
                         </div>
-                        <li v-for="p in projectList" :key="p.id" 
-                            @click="loadProject(p)"
-                            class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 truncate shadow-sm active:bg-blue-50">
-                            {{ p.logline }}
-                        </li>
-                    </ul>
+                    </div>
+                    
+                    <!-- Mobile Footer -->
+                    <div class="p-4 border-t border-gray-100 bg-gray-50 shrink-0">
+                         <div class="flex items-center justify-between px-1">
+                             <div class="flex items-center gap-2 text-sm text-gray-600">
+                                 <el-icon><User /></el-icon>
+                                 <span>当前账号</span>
+                             </div>
+                             <el-button link type="danger" @click="logout; drawerOpen=false">
+                                 <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
+                             </el-button>
+                        </div>
+                    </div>
                 </div>
             </el-drawer>
 
@@ -561,7 +583,7 @@ const deleteProject = async () => {
                              </div>
                              <div v-else class="py-4">
                                 <p class="mb-4 text-gray-500">剧本尚未生成或生成过程中断。</p>
-                                <el-button type="primary" plain round @click="analyzeLogline(currentProject.id)">尝试重新分析</el-button>
+                                <el-button v-if="currentProject?.id" type="primary" plain round @click="analyzeLogline(currentProject.id)">尝试重新分析</el-button>
                              </div>
                         </div>
 
