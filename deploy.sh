@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# LuminaScript 智能部署助手 (终极版)
+# LuminaScript 智能部署助手 (稳定版)
 # ==========================================
 
 # 颜色定义
@@ -9,7 +9,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 PROJECT_DIR=$(pwd)
 BACKEND_DIR="$PROJECT_DIR/backend"
@@ -18,6 +18,29 @@ VENV_DIR="$BACKEND_DIR/venv"
 ENV_FILE="$BACKEND_DIR/.env"
 
 echo -e "${BLUE}====== 妙笔流光 (LuminaScript) 部署助手 ======${NC}"
+
+# ================= 0. 内存优化 (自动 SWAP) =================
+# 解决低配服务器运行 dnf/yum/pip 时的 "Killed" 问题
+check_swap() {
+    SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
+    if [ "$SWAP_SIZE" -eq 0 ]; then
+        echo -e "${YELLOW}[0/6] 检测到无 Swap，正在创建 2GB 临时 Swap 以防 OOM...${NC}"
+        dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        echo -e "${GREEN}Swap 创建成功!${NC}"
+    else
+        echo "检测到 Swap: ${SWAP_SIZE}MB (跳过创建)"
+    fi
+}
+# 尝试创建 swap，需要 sudo 权限
+if [ "$EUID" -eq 0 ]; then
+    check_swap
+else
+    echo -e "${YELLOW}非 root 用户运行，跳过 Swap 自动创建。若后续安装失败，请手动增加 Swap。${NC}"
+fi
 
 # ================= 1. 系统依赖安装 =================
 echo -e "${YELLOW}[1/6] 检查并安装系统依赖...${NC}"
@@ -29,74 +52,77 @@ if [ -f /etc/os-release ]; then
 fi
 echo "当前系统: $OS"
 
-if [[ "$OS" == *"Alibaba"* ]] || [[ "$OS" == *"CentOS"* ]] || [[ "$OS" == *"Red Hat"* ]]; then
-    # RedHat 系
-    if command -v dnf > /dev/null; then
-        echo "使用 dnf 安装依赖..."
-        sudo dnf install -y git nginx python3.11 python3.11-pip python3.11-devel bc || sudo yum install -y git python3 python3-pip nginx bc
-    else
-        echo "使用 yum 安装依赖..."
-        sudo yum install -y git python3 python3-pip nginx bc
+install_deps_if_missing() {
+    # 优先尝试安装 Python 3.11，如果源里没有则回退
+    if [[ "$OS" == *"Alibaba"* ]] || [[ "$OS" == *"CentOS"* ]] || [[ "$OS" == *"Red Hat"* ]]; then
+        echo "正在更新包管理器缓存..."
+        # 尝试安装 EPEL 源（如果不存在）
+        yum install -y epel-release 2>/dev/null
+
+        if command -v dnf > /dev/null; then
+            # 增加 --memory-limit 尝试防止 OOM，但最有效的是上面的 swap
+            sudo dnf install -y git nginx python3.11 python3.11-pip python3.11-devel bc || \
+            sudo dnf install -y git nginx python3 python3-pip python3-devel bc
+        else
+            sudo yum install -y git nginx python3 python3-pip python3-devel bc
+        fi
+    elif [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
+        sudo apt update -qq
+        # Ubuntu 20.04+ 通常有 python3.8+，尝试添加 deadsnakes PPA 以防万一 (暂略，直接用默认)
+        sudo apt install -y python3 python3-pip python3-venv git nginx bc -qq
     fi
-elif [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
-    # Debian 系
-    echo "使用 apt 安装依赖..."
-    sudo apt update -qq
-    sudo apt install -y python3 python3-pip python3-venv git nginx bc -qq
-else
-    echo -e "${YELLOW}未识别的 Linux 发行版，跳过系统依赖自动安装。请手动确保安装了 python3, git, nginx。${NC}"
-fi
+}
+
+install_deps_if_missing
 
 # ================= 2. Python 环境配置 =================
 echo -e "${YELLOW}[2/6] 配置 Python 环境...${NC}"
 
-# 寻找合适的 Python 版本 (优先 3.12 > 3.11 > 3.10)
+# 寻找合适的 Python 版本
+# 注意：RedHat 系可能叫 python3.11，Debian 系通常叫 python3
 PYTHON_EXE=""
-if command -v python3.12 > /dev/null; then PYTHON_EXE="python3.12"
-elif command -v python3.11 > /dev/null; then PYTHON_EXE="python3.11"
-elif command -v python3.10 > /dev/null; then PYTHON_EXE="python3.10"
-elif command -v python3 > /dev/null; then PYTHON_EXE="python3"
-fi
+for callback in python3.12 python3.11 python3.10 python3; do
+    if command -v $callback > /dev/null; then
+        # 检查具体版本号
+        VER=$($callback -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        # 简单浮点比较
+        IS_OK=$(echo "$VER >= 3.10" | bc -l)
+        if [ "$IS_OK" -eq 1 ]; then
+            PYTHON_EXE=$callback
+            echo "选定 Python: $PYTHON_EXE (版本 $VER)"
+            break
+        fi
+    fi
+done
 
 if [ -z "$PYTHON_EXE" ]; then
-    echo -e "${RED}[Error] 未找到 Python 3。请手动安装。${NC}"
-    exit 1
-fi
-
-# 检查版本是否满足要求 (>= 3.10)
-PY_VERSION=$($PYTHON_EXE -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-echo "选定 Python: $PYTHON_EXE (版本 $PY_VERSION)"
-
-# 使用 Python 自身来比较版本，避免依赖 bc
-IS_VALID=$($PYTHON_EXE -c "import sys; print(1 if sys.version_info >= (3, 10) else 0)")
-
-if [ "$IS_VALID" -eq 0 ]; then
-    echo -e "${RED}[Error] LuminaScript 需要 Python 3.10+, 但当前版本为 $PY_VERSION${NC}"
-    echo -e "${YELLOW}建议手动安装: sudo dnf install python3.11 (CentOS/Alibaba) 或 sudo apt install python3.11 (Ubuntu)${NC}"
+    echo -e "${RED}[Error] 未找到 Python 3.10+。LuminaScript 依赖新版 Python 特性。${NC}"
+    echo "依赖安装步骤可能因内存不足被系统 Kill，导致新版 Python 未能安装成功。"
+    echo "建议重试，或手动安装 python 3.11: sudo dnf install python3.11"
     exit 1
 fi
 
 # 创建 venv
-if [ ! -d "$VENV_DIR" ]; then
-    echo "创建虚拟环境..."
-    $PYTHON_EXE -m venv "$VENV_DIR" || {
-        echo -e "${YELLOW}venv 创建失败，尝试补装 venv 模块...${NC}"
-        if [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
-             sudo apt install -y python3-venv -qq
-             $PYTHON_EXE -m venv "$VENV_DIR"
-        else
-             echo -e "${RED}无法创建虚拟环境，请检查 python-venv 是否安装。${NC}"
-             exit 1
-        fi
-    }
+# 无论如何，重新创建 venv 以确保 clean
+if [ -d "$VENV_DIR" ]; then
+    echo "清理旧的虚拟环境..."
+    rm -rf "$VENV_DIR"
 fi
 
-source "$VENV_DIR/bin/activate"
+echo "创建虚拟环境 ($VENV_DIR)..."
+$PYTHON_EXE -m venv "$VENV_DIR" || {
+    echo -e "${RED}虚拟环境创建失败!${NC}"
+    echo "可能原因: 缺少 python3-venv 包 (Debian/Ubuntu) 或 内存不足。"
+    exit 1
+}
+
+# 强制使用 venv 中的 pip
+VENV_PYTHON="$VENV_DIR/bin/python"
+VENV_PIP="$VENV_DIR/bin/pip"
 
 # ================= 3. 配置文件 (.env) =================
-echo -e "${YELLOW}[3/6] 检查配置...${NC}"
+# ... (保持不变)
 if [ ! -f "$ENV_FILE" ]; then
-    echo -e "${RED}创建默认配置 .env...${NC}"
     cat > "$ENV_FILE" <<EOF
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
 LLM_PROVIDER=openai
@@ -104,22 +130,22 @@ LLM_API_KEY=your_key_here
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL_ID=gpt-3.5-turbo
 EOF
-    echo -e "${GREEN}已创建默认 .env，请务必修改 API Key!${NC}"
 fi
 
 # ================= 4. 代码与依赖 =================
 echo -e "${YELLOW}[4/6] 安装应用依赖...${NC}"
 
-# Git 拉取 (如果存在)
 if [ -d ".git" ]; then
     git pull || echo "Git pull 失败，跳过。"
 fi
 
-# pip 安装
-echo "正在安装 Python 库 (这可能需要几分钟)..."
-pip install --upgrade pip -q
-pip install -r "$BACKEND_DIR/requirements.txt" -q || {
-    echo -e "${RED}依赖安装失败。请检查 requirements.txt 或网络连接。${NC}"
+echo "正在安装 Python 库..."
+# 使用阿里云镜像加速，减少超时概率
+$VENV_PIP install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/
+$VENV_PIP install -r "$BACKEND_DIR/requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/ || {
+    echo -e "${RED}依赖安装失败!${NC}"
+    echo "如果是 'killed'，请确保 Swap 已启用。"
+    echo "如果是 'No matching distribution'，请确认 python 版本 >= 3.10。"
     exit 1
 }
 
@@ -132,57 +158,40 @@ if command -v npm &>/dev/null; then
     fi
     npm run build
 else
-    echo -e "${YELLOW}未找到 npm，跳过前端构建 (请确保已上传 dist 目录)${NC}"
+    echo -e "${YELLOW}跳过前端构建 (无 npm)${NC}"
 fi
 
 # ================= 6. 启动服务 =================
-echo -e "${YELLOW}[6/6] 启动服务 (端口自动避让)...${NC}"
+echo -e "${YELLOW}[6/6] 启动服务...${NC}"
 
-# 端口检查函数
+# 端口检查 (Python 实现)
 check_port() {
-    local p=$1
-    # 优先用 python 检测端口 (因为 python 肯定装了)
-    $PYTHON_EXE -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); result = s.connect_ex(('127.0.0.1', $p)); s.close(); exit(0 if result == 0 else 1)"
-    # connect_ex return 0 means success (open/listening), so it IS occupied
-    # We want return 0 if occupied (consistent with typical shell logic "true it is occupied")
+    $VENV_PYTHON -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); exit(0 if s.connect_ex(('127.0.0.1', $1)) != 0 else 1)"
     return $?
 }
 
 DEFAULT_PORT=8000
 PORT=$DEFAULT_PORT
-MAX_RETRIES=10
 
-for ((i=0; i<MAX_RETRIES; i++)); do
-    # check_port returns 0 if occupied
+for ((i=0; i<10; i++)); do
     if check_port $PORT; then
-        echo -e "端口 $PORT 被占用，尝试 $((PORT+1))..."
-        PORT=$((PORT+1))
-    else
         echo -e "${GREEN}使用端口: $PORT${NC}"
         break
+    else
+        echo "端口 $PORT 被占用，尝试下一端口..."
+        PORT=$((PORT+1))
     fi
 done
 
-if ((i==MAX_RETRIES)); then
-    echo -e "${RED}找不到可用端口。${NC}"
-    exit 1
-fi
-
 cd "$BACKEND_DIR"
-# 后台启动
 nohup "$VENV_DIR/bin/uvicorn" main:app --host 0.0.0.0 --port $PORT > "$PROJECT_DIR/backend.log" 2>&1 &
 PID=$!
 
 sleep 2
 if ps -p $PID > /dev/null; then
-    # 获取 IP
     IP=$(hostname -I | awk '{print $1}')
-    PUBLIC_IP=$(curl -s --connect-timeout 2 ifconfig.me || echo "未知")
     echo -e "\n${GREEN}====== 部署成功 ======${NC}"
-    echo -e "服务 PID: $PID"
-    echo -e "访问地址 (内网): http://$IP:$PORT"
-    echo -e "访问地址 (公网): http://$PUBLIC_IP:$PORT"
-    echo -e "静态文件: $FRONTEND_DIR/dist"
+    echo -e "访问地址: http://$IP:$PORT"
     echo -e "日志监控: tail -f $PROJECT_DIR/backend.log"
 else
     echo -e "${RED}启动失败，请查看 backend.log${NC}"
