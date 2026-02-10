@@ -171,12 +171,13 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
     - Write in professional Screenplay format.
     - Be concise but dramatic.
     - IMPORTANT: Write mainly in Chinese (Dialogues and Actions), but standard format markers (INT./EXT.) can be standard.
+    - FORCE: The output language MUST be Chinese (Simplified) for all dialogue and scene descriptions.
     - Output ONLY the raw text.
     """
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Action!"}
+        {"role": "user", "content": "Action! Please verify you are writing in Chinese."}
     ]
     
     return await raw_generation(messages, temperature=0.8)
@@ -235,8 +236,8 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     return {
         "question": base_question,
         "options": [
-            {"label": "Standard/Classic Approach", "value": "classic"},
-            {"label": "Subversive/Twist Approach", "value": "subversive"},
-            {"label": "Experimental Approach", "value": "experimental"}
+            {"label": "经典模式", "value": "classic"},
+            {"label": "反转模式", "value": "subversive"},
+            {"label": "实验风格", "value": "experimental"}
         ]
     }, usage
