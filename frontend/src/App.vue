@@ -13,14 +13,17 @@ import {
   Loading,
   Delete,
   Coin,
-  SwitchButton
+  SwitchButton,
+  DataLine
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import AdminDashboard from './components/AdminDashboard.vue'
 
 // --- State ---
 const token = ref(localStorage.getItem('token') || '')
 const user = ref<any>(null)
 const drawerOpen = ref(false)
+const showAdmin = ref(false)
 
 // Auth Form
 const isLoginMode = ref(true)
@@ -90,6 +93,7 @@ const handleAuth = async () => {
             ElMessage.success('登录成功')
             
             // Fetch data in background so we don't block the UI transition
+            fetchUser()
             fetchProjects()
             startPolling()
         } else {
@@ -110,11 +114,23 @@ const handleAuth = async () => {
 const logout = () => {
     stopPolling()
     token.value = ''
+    user.value = null
+    showAdmin.value = false
     localStorage.removeItem('token')
     projectList.value = []
     currentProject.value = null
     interaction.value = null
     ElMessage.info('已退出登录')
+}
+
+const fetchUser = async () => {
+    if (!token.value) return
+    try {
+        const res = await api.get('/users/me')
+        user.value = res.data
+    } catch (e) {
+        console.error("Fetch User Failed", e)
+    }
 }
 
 const fetchProjects = async () => {
@@ -147,6 +163,7 @@ const stopPolling = () => {
 
 // Start polling if token exists on load
 if (token.value) {
+    fetchUser()
     fetchProjects()
     startPolling()
 } 
@@ -387,7 +404,12 @@ const deleteProject = async () => {
                              <div class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold">
                                  <el-icon><User /></el-icon>
                              </div>
-                             <span>我的账号</span>
+                             <div class="flex flex-col">
+                                 <span>{{ user?.username || '我的账号' }}</span>
+                                 <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true">
+                                    管理后台
+                                 </el-button>
+                             </div>
                          </div>
                          <el-button link class="text-gray-400 hover:text-red-500" @click="logout">
                              <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
@@ -423,7 +445,12 @@ const deleteProject = async () => {
                          <div class="flex items-center justify-between px-1">
                              <div class="flex items-center gap-2 text-sm text-gray-600">
                                  <el-icon><User /></el-icon>
-                                 <span>当前账号</span>
+                                 <div class="flex flex-col">
+                                     <span>{{ user?.username || '我的账号' }}</span>
+                                      <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true; drawerOpen=false">
+                                        管理后台
+                                     </el-button>
+                                 </div>
                              </div>
                              <el-button link type="danger" @click="logout; drawerOpen=false">
                                  <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
@@ -619,6 +646,8 @@ const deleteProject = async () => {
 
         </div>
     </div>
+    
+    <AdminDashboard v-if="showAdmin" :token="token" @close="showAdmin = false" />
   </div>
 </template>
 

@@ -14,10 +14,14 @@ import auth
 from services import llm  # Import LLM Service
 import logging
 import sys
+from datetime import datetime
 from dotenv import load_dotenv
+from fastapi import Request
 
 # Load environment variables from .env file if it exists
 load_dotenv()
+from database import init_db, get_db, SessionLocal
+import database # needed for SessionLocal access in some scopes if not imported directly
 
 # Configure Logging
 logging.basicConfig(
@@ -50,29 +54,121 @@ async def root():
     logger.info("收到根路径请求")
     return {"message": "欢迎使用妙笔流光 (LuminaScript) API"}
 
+# --- Admin & Logging Helpers ---
+
+async def check_admin(current_user: models.User = Depends(auth.get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return current_user
+
+async def log_login(user_id: int, ip: str, status: str):
+    async with SessionLocal() as db:
+        log = models.LoginLog(
+             user_id=user_id, 
+             ip_address=ip, 
+             status=status, 
+             timestamp=datetime.now().isoformat()
+        )
+        db.add(log)
+        await db.commit()
+
+async def log_ai_action(user_id: int, project_id: int, action: str, prompt: str, response: str, tokens: int):
+    async with SessionLocal() as db:
+        log = models.AIInteractionLog(
+            user_id=user_id,
+            project_id=project_id,
+            action=action,
+            prompt=prompt[:5000],  # Truncate if too long to save generic DB space
+            response=response[:5000],
+            tokens=tokens,
+            timestamp=datetime.now().isoformat()
+        )
+        db.add(log)
+        await db.commit()
+
+# --- Admin Routes ---
+
+@app.get("/admin/users", response_model=List[schemas.UserResponse])
+async def admin_list_users(
+    db: AsyncSession = Depends(get_db), 
+    admin: models.User = Depends(check_admin)
+):
+    result = await db.execute(select(models.User))
+    return result.scalars().all()
+
+@app.get("/admin/logs/login", response_model=List[schemas.LoginLogResponse])
+async def admin_list_login_logs(
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(check_admin)
+):
+    # Join with User to get username
+    result = await db.execute(
+        select(models.LoginLog, models.User.username)
+        .join(models.User, models.LoginLog.user_id == models.User.id)
+        .order_by(models.LoginLog.timestamp.desc())
+        .limit(100)
+    )
+    # Manually construct response to include username
+    logs = []
+    for log, username in result:
+        log_dict = log.__dict__
+        log_dict['user_name'] = username
+        logs.append(log_dict)
+    return logs
+
+@app.get("/admin/logs/ai", response_model=List[schemas.AIInteractionLogResponse])
+async def admin_list_ai_logs(
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(check_admin)
+):
+    result = await db.execute(
+        select(models.AIInteractionLog, models.User.username)
+        .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+        .order_by(models.AIInteractionLog.timestamp.desc())
+        .limit(50)
+    )
+    logs = []
+    for log, username in result:
+        log_dict = log.__dict__
+        log_dict['user_name'] = username
+        logs.append(log_dict)
+    return logs
+
 # --- Auth Routes ---
 
 @app.post("/token", response_model=schemas.Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+async def login_for_access_token(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    form_data: OAuth2PasswordRequestForm = Depends(), 
+    db: AsyncSession = Depends(get_db)
+):
     logger.info(f"收到登录请求: 用户名={form_data.username}")
     # 1. Fetch user
     result = await db.execute(select(models.User).where(models.User.username == form_data.username))
     user = result.scalars().first()
     
+    ip = request.client.host
+    
     # 2. Verify
     if not user:
         logger.warning(f"登录失败: 用户 {form_data.username} 不存在")
+        # Log failed attempt (No user_id, use 0 or distinct log)
+        # For simplicity, we skip logging unknown users or we need to change model to allow nullable user_id
     elif not auth.verify_password(form_data.password, user.hashed_password):
         logger.warning(f"登录失败: 用户 {form_data.username} 密码错误")
+        background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="failed")
         
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
+         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
     logger.info(f"用户 {form_data.username} 登录成功")
+    background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="success")
+    
     # 3. Create Token
     access_token = auth.create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
@@ -228,6 +324,7 @@ async def submit_interaction(
 @app.post("/projects/{project_id}/analyze")
 async def analyze_logline(
     project_id: int, 
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
@@ -313,6 +410,16 @@ async def analyze_logline(
             base_question=next_step["question"],
             context_str=prompt_context
         )
+        # Log AI action
+        background_tasks.add_task(
+            log_ai_action,
+            user_id=current_user.id,
+            project_id=project_id,
+            action=f"analyze_step_{next_step['key']}",
+            prompt=prompt_context,
+            response=str(question_data),
+            tokens=usage
+        )
     except Exception as e:
         logger.error(f"LLM 交互生成失败: {e}")
         raise HTTPException(
@@ -371,6 +478,17 @@ async def generate_scenes(
     # 2. Real: Generate Scene Outline using LLM
     scenes_data, usage = await llm.generate_outline(project.logline, style_context)
     project.total_tokens += usage
+    
+    # Log AI action
+    background_tasks.add_task(
+        log_ai_action,
+        user_id=current_user.id,
+        project_id=project_id,
+        action="generate_outline",
+        prompt=f"Logline: {project.logline}, Style: {style_context}",
+        response=str(scenes_data),
+        tokens=usage
+    )
     
     if not scenes_data:
         logger.error("分场大纲生成失败或为空")
@@ -450,6 +568,16 @@ async def run_generation_loop(project_id: int):
             )
             
             project.total_tokens += usage
+
+            # Log AI Action (Direct call since we are already in background)
+            await log_ai_action(
+                user_id=project.owner_id,
+                project_id=project.id,
+                action=f"write_scene_{scene.scene_index}",
+                prompt=f"Outline: {scene.outline}, PrevContextLength: {len(cumulative_context)}",
+                response=generated_content if generated_content else "Error/Empty",
+                tokens=usage
+            )
 
             # 3. Update Content
             if generated_content:

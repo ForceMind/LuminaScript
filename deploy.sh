@@ -145,6 +145,31 @@ else
     echo "检测到现有配置文件 (.env)，跳过配置。"
 fi
 
+# ================= 3.1 管理员账户配置 =================
+echo -e "${YELLOW}[3.1] 配置管理员账户${NC}"
+read -p "是否修改默认管理员(admin)密码? [y/N] " MODIFY_ADMIN
+ADMIN_USER_VAL="admin"
+ADMIN_PASS_VAL="admin123"
+
+if [[ "$MODIFY_ADMIN" =~ ^[Yy]$ ]]; then
+    read -p "请输入管理员用户名 (默认 admin): " INPUT_USER
+    if [ ! -z "$INPUT_USER" ]; then ADMIN_USER_VAL=$INPUT_USER; fi
+    
+    while true; do
+        read -s -p "请输入管理员密码: " INPUT_PASS
+        echo ""
+        read -s -p "请再次输入密码: " INPUT_PASS2
+        echo ""
+        if [ "$INPUT_PASS" == "$INPUT_PASS2" ] && [ ! -z "$INPUT_PASS" ]; then
+            ADMIN_PASS_VAL=$INPUT_PASS
+            break
+        else
+            echo -e "${RED}密码不匹配或为空，请重试。${NC}"
+        fi
+    done
+fi
+echo -e "管理员将在部署时设置为: ${GREEN}$ADMIN_USER_VAL${NC}"
+
 # ================= 4. 后端依赖 =================
 echo -e "${YELLOW}[4/6] 安装后端依赖...${NC}"
 if [ -d ".git" ]; then git pull; fi
@@ -218,6 +243,10 @@ cd "$BACKEND_DIR"
 
 # 启用 Python 无缓冲模式，确保日志实时写入
 export PYTHONUNBUFFERED=1
+
+# 运行数据库升级与管理员设置
+echo "应用数据库变更与管理员权限..."
+ADMIN_USER="$ADMIN_USER_VAL" ADMIN_PASS="$ADMIN_PASS_VAL" "$VENV_PYTHON" upgrade_admin.py
 
 # 生产环境建议去掉 --reload，增强稳定性
 echo "启动后端服务 (Port: $PORT)..."

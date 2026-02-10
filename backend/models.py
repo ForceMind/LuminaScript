@@ -15,8 +15,36 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    is_admin = Column(Integer, default=0) # 0=User, 1=Admin
     
     projects = relationship("Project", back_populates="owner")
+    login_logs = relationship("LoginLog", back_populates="user")
+    ai_logs = relationship("AIInteractionLog", back_populates="user")
+
+class LoginLog(Base):
+    __tablename__ = "login_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    ip_address = Column(String)
+    status = Column(String) # success, failed
+    timestamp = Column(String) # ISO format
+
+    user = relationship("User", back_populates="login_logs")
+
+class AIInteractionLog(Base):
+    __tablename__ = "ai_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    action = Column(String) # analyze, generate_scene, etc.
+    prompt = Column(Text)
+    response = Column(Text)
+    tokens = Column(Integer, default=0)
+    timestamp = Column(String) # ISO format
+
+    user = relationship("User", back_populates="ai_logs")
 
 class Project(Base):
     __tablename__ = "projects"

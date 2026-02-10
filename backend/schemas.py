@@ -52,7 +52,33 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     id: int
     username: str
+    is_admin: int = 0
     
+    class Config:
+        from_attributes = True
+
+class LoginLogResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: Optional[str] = None # Computed field
+    ip_address: str
+    status: str
+    timestamp: str
+
+    class Config:
+        from_attributes = True
+
+class AIInteractionLogResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: Optional[str] = None
+    project_id: Optional[int]
+    action: str
+    prompt: str
+    response: str
+    tokens: int
+    timestamp: str
+
     class Config:
         from_attributes = True
 
