@@ -17,6 +17,9 @@ MODEL_ID = os.getenv("LLM_MODEL_ID", "xopglm47blth2")
 
 if not API_KEY:
     logger.warning("⚠️ LLM_API_KEY implies not set. LLM features will fail. Please set it in .env file.")
+else:
+    masked_key = API_KEY[:4] + "****" + API_KEY[-4:] if len(API_KEY) > 8 else "****"
+    logger.info(f"LLM 服务配置加载: Model={MODEL_ID}, BaseURL={BASE_URL}, Key={masked_key}")
 
 client = AsyncOpenAI(
     api_key=API_KEY if API_KEY else "dummy_key", # Prevent client init failure, fail at request time
@@ -60,7 +63,16 @@ async def raw_generation(messages, temperature=0.7, json_response=False):
             
             return content, usage
         except Exception as e:
-            logger.error(f"LLM调用失败: {e}")
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"❌ LLM调用失败 Details:\nERROR_TYPE: {type(e).__name__}\nMESSAGE: {str(e)}\nTRACE:\n{error_details}")
+            
+            # Additional debug info for specific failures
+            if "401" in str(e):
+                logger.error("💡 提示: 401 错误通常意味着 API Key 无效或过期。请检查 .env 文件。")
+            elif "404" in str(e):
+                logger.error(f"💡 提示: 404 错误通常意味着 Base URL ({BASE_URL}) 不正确或模型 ID ({MODEL_ID}) 错误。")
+            
             raise e # Raise to trigger retry
 
 async def analyze_script_requirements(logline: str, project_type: str="movie"):

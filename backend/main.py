@@ -32,6 +32,11 @@ logger = logging.getLogger("lumina_backend")
 # Initialize App
 app = FastAPI(title="LuminaScript API", version="0.1.0")
 
+if __name__ == "__main__":
+    import uvicorn
+    # Allow running this file directly for debugging
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+
 import asyncio
 
 @app.on_event("startup")

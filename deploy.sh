@@ -137,7 +137,7 @@ if [ ! -f "$ENV_FILE" ]; then
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
 LLM_PROVIDER=openai
 LLM_API_KEY=$INPUT_KEY
-LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v1
+LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v2
 LLM_MODEL_ID=xopglm47blth2
 EOF
     echo -e "${GREEN}配置文件已生成: $ENV_FILE${NC}"
