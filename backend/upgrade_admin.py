@@ -52,25 +52,50 @@ def upgrade_schema():
     """)
     print("Checked 'ai_logs' table.")
 
-    # 4. Create or Update default admin
+    # 4. Enforce Single Admin Policy
+    # User Requirement: "Only one admin allowed, delete all others and recreate/ensure the specific one."
+    
     admin_user = os.environ.get("ADMIN_USER", "admin")
     admin_pass = os.environ.get("ADMIN_PASS", "admin123")
     
-    cursor.execute("SELECT id FROM users WHERE username = ?", (admin_user,))
-    admin = cursor.fetchone()
+    # Check current admins
+    cursor.execute("SELECT id, username FROM users WHERE is_admin = 1")
+    admins = cursor.fetchall()
     
+    # Strategy:
+    # 1. If strict reset is requested OR if we want to enforce "Only one exists and it must be ADMIN_USER"
+    #    The user specifically asked: "delete all and let me recreate [the one I want]"
+    
+    # Let's clean up ANY admin that doesn't match the current ENV target or just wipe all admins if prompted.
+    # To be safe but compliant with the user's strong request:
+    # We will remove ALL admins first, then ensure the target admin exists.
+    # This guarantees "Only One" and "Recreated".
+
+    if len(admins) > 0:
+        print(f"Found {len(admins)} admin(s). Enforcing single-admin policy...")
+        # Remove admin privilege from everyone
+        cursor.execute("UPDATE users SET is_admin = 0 WHERE is_admin = 1")
+    
+    # Now ensure the target admin exists and has privileges
     hashed = get_password_hash(admin_pass)
     
-    if not admin:
-        print(f"Creating default admin user ({admin_user}/******)...")
+    cursor.execute("SELECT id FROM users WHERE username = ?", (admin_user,))
+    target_user = cursor.fetchone()
+    
+    if target_user:
+        print(f"Updating privileges for admin: {admin_user}")
+        cursor.execute("UPDATE users SET is_admin = 1, hashed_password = ? WHERE username = ?", (hashed, admin_user))
+    else:
+        print(f"Creating sole admin user: {admin_user}")
         cursor.execute(
             "INSERT INTO users (username, hashed_password, is_admin) VALUES (?, ?, ?)", 
             (admin_user, hashed, 1)
         )
-    else:
-        # Initial or Reset password logic
-        print(f"Admin user '{admin_user}' exists. Updating password and ensuring privileges...")
-        cursor.execute("UPDATE users SET is_admin = 1, hashed_password = ? WHERE username = ?", (hashed, admin_user))
+
+    # Clean up: Verify only one admin exists
+    cursor.execute("SELECT username FROM users WHERE is_admin = 1")
+    final_admins = cursor.fetchall()
+    print(f"Admin Policy Enforced. Current Admin: {[u[0] for u in final_admins]}")
 
     conn.commit()
     conn.close()

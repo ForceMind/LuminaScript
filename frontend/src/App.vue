@@ -452,7 +452,7 @@ const deleteProject = async () => {
                                      </el-button>
                                  </div>
                              </div>
-                             <el-button link type="danger" @click="logout; drawerOpen=false">
+                             <el-button link type="danger" @click="logout(); drawerOpen=false">
                                  <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
                              </el-button>
                         </div>
