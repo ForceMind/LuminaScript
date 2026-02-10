@@ -15,7 +15,8 @@ import {
   Coin,
   SwitchButton,
   DataLine,
-  Download // Added Download Icon
+  Download,
+  ArrowDown
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import AdminDashboard from './components/AdminDashboard.vue'
@@ -332,31 +333,53 @@ const deleteProject = async () => {
     }
 }
 
-const exportScript = () => {
-    if (!currentProject.value || !currentProject.value.scenes) return
-    
-    // Simple Text format
-    let content = `Title: ${currentProject.value.title || 'Untitled'}\n`
-    content += `Type: ${currentProject.value.project_type}\n`
-    content += `Logline: ${currentProject.value.logline}\n`
-    content += `----------------------------\n\n`
-    
-    currentProject.value.scenes.forEach((s: any) => {
-        content += `SCENE ${s.scene_index}: ${s.status === 'completed' ? '' : '(Generating...)'}\n`
-        content += `${s.outline}\n\n`
-        if (s.content) {
-            content += `${s.content}\n\n`
-            content += `============================\n\n`
+const regenerateScene = async (sceneId: number, sceneIndex: number) => {
+    if (!currentProject.value) return;
+    try {
+        await api.post(`/projects/${currentProject.value.id}/scenes/${sceneIndex}/regenerate`)
+        ElMessage.success(`已请求重写第 ${sceneIndex} 场`)
+        // Update local state to reflect pending
+        const s = currentProject.value.scenes.find((x:any) => x.id === sceneId)
+        if (s) {
+            s.status = 'pending'
+            s.content = ''
         }
-    })
+        startPolling()
+    } catch(e) { console.error(e); ElMessage.error('重试请求失败') }
+}
+
+const exportScript = (format: string = 'txt') => {
+    if (!currentProject.value) return
     
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
+    // Use backend endpoint
+    const url = `/api/projects/${currentProject.value.id}/export?format=${format}`
+    
+    // Create hidden link to download
     const link = document.createElement('a')
     link.href = url
-    link.download = `${currentProject.value.title || 'script'}.txt`
-    link.click()
-    URL.revokeObjectURL(url)
+    link.target = '_blank'
+    // Add auth token to url if needed, but usually browser handles cookies or we need to pass token in query for pure GET link download if Authorization header is not possible via simple link click.
+    // Since we use Bearer token in headers for AJAX, direct link click might fail if backend requires Auth header.
+    // Solution: Use axios to download blob.
+    
+    api.get(`/projects/${currentProject.value.id}/export?format=${format}`, { responseType: 'blob' })
+       .then((response) => {
+           const url = window.URL.createObjectURL(new Blob([response.data]));
+           const link = document.createElement('a');
+           link.href = url;
+           // Try to extract filename from header
+           const contentDisposition = response.headers['content-disposition'];
+           let fileName = `script.${format}`;
+           if (contentDisposition) {
+               const fileNameMatch = contentDisposition.match(/filename=(.+)/);
+               if (fileNameMatch && fileNameMatch.length === 2) fileName = fileNameMatch[1];
+           }
+           link.setAttribute('download', fileName);
+           document.body.appendChild(link);
+           link.click();
+           document.body.removeChild(link);
+       })
+       .catch(e => ElMessage.error('导出失败'))
 }
 </script>
 
@@ -405,9 +428,18 @@ const exportScript = () => {
                  </div>
             </div>
             <div class="flex items-center gap-3">
-                 <el-button v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @click="exportScript" plain>
-                    <el-icon class="mr-1"><Download /></el-icon> 导出
-                 </el-button>
+                 <el-dropdown v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @command="exportScript">
+                    <el-button plain>
+                        <el-icon class="mr-1"><Download /></el-icon> 导出 <el-icon class="el-icon--right"><arrow-down /></el-icon>
+                    </el-button>
+                    <template #dropdown>
+                        <el-dropdown-menu>
+                            <el-dropdown-item command="txt">纯文本 (.txt)</el-dropdown-item>
+                            <el-dropdown-item command="md">Markdown (.md)</el-dropdown-item>
+                            <el-dropdown-item command="docx">Word 文档 (.docx)</el-dropdown-item>
+                        </el-dropdown-menu>
+                    </template>
+                 </el-dropdown>
                  <el-button type="primary" round :icon="Plus" @click="currentProject=null">开始新创意</el-button>
             </div>
         </header>
@@ -696,6 +728,18 @@ const exportScript = () => {
                                      <el-tag v-if="scene.status === 'completed'" type="success" size="small" effect="plain">已完成</el-tag>
                                      <el-tag v-else-if="scene.status === 'generating'" type="primary" size="small" effect="plain">生成中...</el-tag>
                                      <el-tag v-else type="info" size="small" effect="plain">等待中</el-tag>
+
+                                     <!-- Regenerate Button -->
+                                     <el-button 
+                                        v-if="scene.status === 'completed'" 
+                                        size="small" 
+                                        link 
+                                        type="primary" 
+                                        @click="regenerateScene(scene.id, scene.scene_index)"
+                                        title="重新生成这一场"
+                                     >
+                                        <el-icon><MagicStick /></el-icon> 重写
+                                     </el-button>
                                 </div>
                             </div>
                             

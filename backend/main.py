@@ -148,7 +148,12 @@ async def login_for_access_token(
     result = await db.execute(select(models.User).where(models.User.username == form_data.username))
     user = result.scalars().first()
     
-    ip = request.client.host
+    # 获取真实IP (X-Forwarded-For 优先)
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    else:
+        ip = request.client.host
     
     # 2. Verify
     if not user:
@@ -352,7 +357,8 @@ async def analyze_logline(
              {"label": "📺 电视剧 (TV Series)", "value": "tv"},
              {"label": "📱 现代短剧 (Short Drama)", "value": "short"}
         ]},
-        {"key": "episode_count", "question": "您计划创作多少集？"}, # New Step
+        {"key": "episode_count", "question": "您计划创作多少集？"},
+        {"key": "episode_duration", "question": "每一集的大致时长是？"},
         {"key": "tone", "question": "这部作品的基调是什么？"},
         {"key": "time_period", "question": "故事发生在什么时代背景？"},
         {"key": "title", "question": "不管是暂定还是正式，给这个故事起个名字吧？"},
@@ -371,8 +377,8 @@ async def analyze_logline(
     
     next_step = None
     for step in REQUIRED_STEPS:
-        # Check Dependency for Episode Count
-        if step["key"] == "episode_count":
+        # Check Dependency for Episode Count & Duration
+        if step["key"] in ["episode_count", "episode_duration"]:
             # Only ask if TV or Short
             p_type = normalized_context.get("project_type", "movie")
             if p_type == "movie": 
@@ -421,7 +427,24 @@ async def analyze_logline(
             }
         }
     
-    # 3.3 Check Prompt Richness (Optimization)
+    # 3.3 Hardcoded options for Episode Duration
+    if next_step["key"] == "episode_duration":
+         return {
+            "type": "interaction_required",
+            "payload": {
+                "field": "episode_duration",
+                "question": next_step["question"],
+                "options": [
+                    {"label": "1-2分钟 (竖屏短剧)", "value": "2mins"},
+                    {"label": "5-10分钟 (迷你剧)", "value": "10mins"},
+                    {"label": "20分钟 (情景喜剧/动画)", "value": "20mins"},
+                    {"label": "45分钟 (标准剧集)", "value": "45mins"},
+                    {"label": "60分钟 (美剧/电影感)", "value": "60mins"}
+                ]
+            }
+        }
+    
+    # 3.4 Check Prompt Richness (Optimization)
     # If the user's initial logline is very long (> 100 chars) and detailed,
     # we tell the LLM to verify if we even need to ask this question.
     # Note: Currently we just proceed to ask to be comprehensive.
@@ -546,6 +569,148 @@ async def generate_scenes(
     background_tasks.add_task(run_generation_loop, project.id)
     
     return {"status": "Scene generation started", "project_id": project_id}
+
+@app.post("/projects/{project_id}/scenes/{scene_index}/regenerate")
+async def regenerate_scene(
+    project_id: int, 
+    scene_index: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    project = await db.get(models.Project, project_id)
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Project not found")
+        
+    result = await db.execute(
+        select(models.Scene)
+        .where(models.Scene.project_id == project_id)
+        .where(models.Scene.scene_index == scene_index)
+    )
+    scene = result.scalars().first()
+    if not scene:
+        raise HTTPException(status_code=404, detail="Scene not found")
+        
+    # Reset status
+    scene.status = models.ProcessingStatus.PENDING
+    scene.content = None # Clear old content
+    if project.status == models.ProcessingStatus.COMPLETED:
+        project.status = models.ProcessingStatus.GENERATING
+        
+    await db.commit()
+    
+    # Trigger loop again
+    background_tasks.add_task(run_generation_loop, project.id)
+    return {"status": "Regeneration scheduled"}
+
+# --- Export (New) ---
+import io
+# Try imports, fallback to plain text if failed
+try:
+    from docx import Document as DocxDocument
+except ImportError:
+    DocxDocument = None
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+except ImportError:
+    canvas = None
+
+from fastapi.responses import StreamingResponse
+
+@app.get("/projects/{project_id}/export")
+async def export_project(
+    project_id: int, 
+    format: str = "txt",
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    # Eager load scenes
+    result = await db.execute(
+        select(models.Project)
+        .where(models.Project.id == project_id)
+        .options(selectinload(models.Project.scenes))
+    )
+    project = result.scalars().first()
+    
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    filename = f"{project.title or 'Untitled_Script'}"
+    
+    # Prepare Content Data
+    project_scenes = sorted(project.scenes, key=lambda s: s.scene_index)
+    context = project.global_context or {}
+    
+    if format == "docx":
+        if not DocxDocument:
+            raise HTTPException(501, "Word export library (python-docx) not installed on server.")
+        
+        doc = DocxDocument()
+        doc.add_heading(project.title or "Untitled", 0)
+        
+        doc.add_heading("Project Bible", level=1)
+        doc.add_paragraph(f"Logline: {project.logline}")
+        doc.add_paragraph(f"Type: {project.project_type} | Genre: {project.genre}")
+        for k, v in context.items():
+            if k not in ['logline', 'project_type']:
+                doc.add_paragraph(f"{k.capitalize()}: {v}")
+                
+        doc.add_page_break()
+        doc.add_heading("Screenplay", level=1)
+        
+        for scene in project_scenes:
+            doc.add_heading(f"SCENE {scene.scene_index}", level=2)
+            doc.add_paragraph(f"Outline: {scene.outline}", style='Intense Quote')
+            if scene.content:
+                # Basic formatting for script
+                doc.add_paragraph(scene.content)
+            else:
+                doc.add_paragraph("[Content Generating...]")
+            doc.add_paragraph("") # Spacing
+            
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer, 
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename={filename}.docx"}
+        )
+
+    elif format == "md":
+        content = f"# {project.title or 'Untitled'}\n\n"
+        content += f"**Logline:** {project.logline}\n\n"
+        content += f"**Type:** {project.project_type}\n"
+        content += "---\n\n## Project Settings\n"
+        for k, v in context.items():
+             content += f"- **{k}:** {v}\n"
+        content += "\n---\n\n## Script\n\n"
+        
+        for scene in project_scenes:
+            content += f"### SCENE {scene.scene_index}\n"
+            content += f"> **Outline:** {scene.outline}\n\n"
+            content += (scene.content or "[Generating...]") + "\n\n"
+            content += "---\n\n"
+            
+        return StreamingResponse(
+            io.BytesIO(content.encode('utf-8')),
+            media_type="text/markdown",
+            headers={"Content-Disposition": f"attachment; filename={filename}.md"}
+        )
+        
+    else: # Default TXT
+        content = f"Title: {project.title}\nLogline: {project.logline}\n\n"
+        for scene in project_scenes:
+            content += f"SCENE {scene.scene_index}\n{scene.content or ''}\n\n"
+        return StreamingResponse(
+            io.BytesIO(content.encode('utf-8')),
+            media_type="text/plain",
+            headers={"Content-Disposition": f"attachment; filename={filename}.txt"}
+        )
 
 # --- Background Task (The Engine) ---
 
