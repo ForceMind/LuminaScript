@@ -230,21 +230,65 @@ if ps -p $PID > /dev/null; then
     
     echo -e "${YELLOW}正在启动前端服务 (端口: $FRONTEND_PORT)...${NC}"
     
-    # 检查并安装 serve
-    if ! command -v serve &> /dev/null; then
-        echo "安装静态文件服务器 'serve'..."
-        npm install -g serve
-    fi
+    # ----------------------------------------------------
+    # 使用 Node.js + Express 搭建简易生产环境代理服务器
+    # 解决 serve 无法代理 /api 请求导致的 404/undefined 问题
+    # ----------------------------------------------------
     
+    echo "安装生产环境服务依赖 (express, http-proxy-middleware)..."
+    cd "$FRONTEND_DIR"
+    npm install express http-proxy-middleware --no-save
+
+    # 生成 server.js
+    cat > server.js <<EOF
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const path = require('path');
+const app = express();
+
+const BACKEND_PORT = $PORT;
+const FRONTEND_PORT = $FRONTEND_PORT;
+const API_URL = "http://127.0.0.1:" + BACKEND_PORT;
+
+console.log("启动前端服务器...");
+console.log("代理目标:", API_URL);
+
+// 1. 配置 API 代理 (与 vite.config.ts 逻辑保持一致)
+app.use('/api', createProxyMiddleware({ 
+    target: API_URL, 
+    changeOrigin: true,
+    pathRewrite: { '^/api': '' },
+    onProxyReq: (proxyReq, req, res) => {
+        // 可选: 记录代理请求，方便调试
+        // console.log('Proxy:', req.path, '->', API_URL + req.path);
+    },
+    onError: (err, req, res) => {
+        console.error('Proxy Error:', err);
+        res.status(500).send('Proxy Error');
+    }
+}));
+
+// 2. 托管静态文件 (dist)
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// 3. SPA 回退 (所有其他请求返回 index.html)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+app.listen(FRONTEND_PORT, '0.0.0.0', () => {
+  console.log(\`Frontend service running at http://0.0.0.0:\${FRONTEND_PORT}\`);
+});
+EOF
+
     # 清理旧的前端进程 (如果有)
     fpid=$(lsof -t -i:$FRONTEND_PORT)
     if [ -n "$fpid" ]; then
         kill -9 $fpid
     fi
     
-    # 启动前端
-    cd "$FRONTEND_DIR"
-    nohup serve -s dist -l $FRONTEND_PORT > "$PROJECT_DIR/frontend.log" 2>&1 &
+    # 启动 Node 服务
+    nohup node server.js > "$PROJECT_DIR/frontend.log" 2>&1 &
     
     echo -e "\n${GREEN}====== 部署成功 ======${NC}"
     echo -e "前端访问地址:  http://$IP:$FRONTEND_PORT"
