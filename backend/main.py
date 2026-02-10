@@ -17,6 +17,13 @@ import sys
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import Request
+from fastapi.responses import StreamingResponse
+import io
+
+try:
+    from docx import Document as DocxDocument
+except ImportError:
+    DocxDocument = None
 
 # Load environment variables from .env file if it exists
 load_dotenv()
