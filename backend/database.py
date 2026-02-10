@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./lumina.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./lumina_v2.db")
 
 engine = create_async_engine(DATABASE_URL, echo=True)
 

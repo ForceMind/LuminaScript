@@ -23,18 +23,42 @@ class SceneResponse(SceneBase):
 class ProjectBase(BaseModel):
     logline: str
     title: Optional[str] = "Untitled Script"
+    project_type: Optional[str] = "movie"
 
 class ProjectCreate(ProjectBase):
     pass
 
+class ProjectUpdate(BaseModel):
+    project_type: Optional[str] = None
+
 class ProjectResponse(ProjectBase):
     id: int
     genre: Optional[str] = None
+    project_type: Optional[str] = "movie"
     global_context: Dict[str, Any] = {}
     scenes: List[SceneResponse] = []
+    owner_id: int
+    total_tokens: int = 0
+    status: ProcessingStatus = ProcessingStatus.PENDING
 
     class Config:
         from_attributes = True
+
+# --- Auth Schemas ---
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 # --- Interaction Protocol Schemas ---
 

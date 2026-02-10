@@ -9,16 +9,36 @@ class ProcessingStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    
+    projects = relationship("Project", back_populates="owner")
+
 class Project(Base):
     __tablename__ = "projects"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True, default="New Project")
     logline = Column(String)
+    project_type = Column(String, default="movie") # movie, tv, short, etc.
     genre = Column(String, nullable=True)
+    
+    # Tracking
+    total_tokens = Column(Integer, default=0)
+    status = Column(Enum(ProcessingStatus), default=ProcessingStatus.PENDING)
+
+    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="projects")
     
     # Stores global context like Character Bios, World View, etc.
     global_context = Column(JSON, default={}) 
+    
+    # Stores the next interaction step to cache specific questions
+    next_step_cache = Column(JSON, nullable=True)
     
     # Stores the overall summary/hook
     global_summary = Column(Text, nullable=True)

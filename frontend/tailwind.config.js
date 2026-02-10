@@ -7,8 +7,8 @@ export default {
   theme: {
     extend: {
       colors: {
-        'cinema-bg': '#121212',
-        'cinema-accent': '#e50914', 
+        brand: '#409EFF', // Element Plus Primary
+        surface: '#ffffff',
       }
     },
   },
