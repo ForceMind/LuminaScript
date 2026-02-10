@@ -83,18 +83,25 @@ const handleAuth = async () => {
             formData.append('username', authForm.value.username)
             formData.append('password', authForm.value.password)
             const res = await api.post('/token', formData)
+            
+            // Set token immediately to trigger view switch
             token.value = res.data.access_token
             localStorage.setItem('token', token.value)
             ElMessage.success('登录成功')
-            await fetchProjects()
+            
+            // Fetch data in background so we don't block the UI transition
+            fetchProjects()
             startPolling()
         } else {
             await api.post('/auth/register', authForm.value)
-            ElMessage.success('注册成功，请登录')
+            ElMessage.success('注册成功，请使用新账号登录')
             isLoginMode.value = true
+            // Optional: Auto-fill password for convenience
+            // authForm.value.password = '' 
         }
     } catch (e: any) {
         ElMessage.error(e.response?.data?.detail || "认证失败")
+        console.error("Auth Error:", e)
     } finally {
         authLoading.value = false
     }
@@ -387,16 +394,18 @@ const deleteProject = async () => {
                 <template #header>
                     <div class="text-lg font-bold">我的剧本</div>
                 </template>
-                <ul class="space-y-2">
-                    <div class="p-2">
-                         <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
-                    </div>
-                    <li v-for="p in projectList" :key="p.id" 
-                        @click="loadProject(p)"
-                        class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 truncate shadow-sm">
-                        {{ p.logline }}
-                    </li>
-                </ul>
+                <div class="h-full overflow-y-auto pb-20">
+                    <ul class="space-y-2 p-1">
+                        <div class="p-2">
+                            <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
+                        </div>
+                        <li v-for="p in projectList" :key="p.id" 
+                            @click="loadProject(p)"
+                            class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 truncate shadow-sm active:bg-blue-50">
+                            {{ p.logline }}
+                        </li>
+                    </ul>
+                </div>
             </el-drawer>
 
             <!-- Workspace -->
@@ -543,8 +552,14 @@ const deleteProject = async () => {
 
                     <div class="space-y-6">
                         <div v-if="!currentProject.scenes || currentProject.scenes.length === 0" class="text-center py-10 text-gray-400">
-                             <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
-                             <p>{{ loadingText || '正在初始化剧本结构...' }}</p>
+                             <div v-if="loading">
+                                <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
+                                <p>{{ loadingText || '正在初始化剧本结构...' }}</p>
+                             </div>
+                             <div v-else class="py-4">
+                                <p class="mb-4 text-gray-500">剧本尚未生成或生成过程中断。</p>
+                                <el-button type="primary" plain round @click="analyzeLogline(currentProject.id)">尝试重新分析</el-button>
+                             </div>
                         </div>
 
                         <div v-for="scene in currentProject.scenes" :key="scene.id" 

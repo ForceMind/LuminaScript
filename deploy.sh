@@ -128,7 +128,7 @@ if [ ! -f "$ENV_FILE" ]; then
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
 LLM_PROVIDER=openai
 LLM_API_KEY=your_key_here
-LLM_BASE_URL=https://api.openai.com/v1
+LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v2
 LLM_MODEL_ID=gpt-3.5-turbo
 EOF
 fi
