@@ -547,12 +547,28 @@ async def generate_scenes(
         c = project.global_context or {}
         style_context = f"Genre: {project.project_type}, Tone: {c.get('tone')}, Style: {c.get('visual_style')}"
 
+    # Extract target episode count from context
+    c = project.global_context or {}
+    target_count = 5
+    raw_count = c.get("episode_count")
+    if raw_count:
+        try:
+            if isinstance(raw_count, int):
+                target_count = raw_count
+            elif isinstance(raw_count, str):
+                import re
+                digits = re.findall(r'\d+', raw_count)
+                if digits:
+                    target_count = int(digits[0])
+        except Exception as e:
+            logger.warning(f"Error parsing episode_count: {e}")
+
     project.genre = style_context
     await db.commit()
 
-    logger.info(f"正在调用 LLM 生成分场大纲... (Style: {style_context})")
+    logger.info(f"正在调用 LLM 生成分场大纲... (Style: {style_context}, Count: {target_count})")
     # 2. Real: Generate Scene Outline using LLM
-    scenes_data, usage = await llm.generate_outline(project.logline, style_context)
+    scenes_data, usage = await llm.generate_outline(project.logline, style_context, target_count=target_count)
     project.total_tokens += usage
     
     # Log AI action

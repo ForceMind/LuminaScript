@@ -115,25 +115,25 @@ async def analyze_script_requirements(logline: str, project_type: str="movie"):
              return None, usage
     return None, 0
 
-async def generate_outline(logline: str, style_guide: str):
+async def generate_outline(logline: str, style_guide: str, target_count: int = 5):
     """
     Step 2: Generate a list of scenes. Matches return signature (data, usage).
     """
-    logger.info("Step 2: 正在生成分场大纲...")
-    system_prompt = """
+    logger.info(f"Step 2: 正在生成分场大纲 (目标场次数: {target_count})...")
+    system_prompt = f"""
     You are a professional Screenwriter.
     Based on the logline and selected style, create a concise scene-by-scene outline.
-    Create exactly 5 scenes for this demo.
+    Create exactly {target_count} scenes/episodes as requested.
     
     IMPORTANT: Output in Chinese (Simplified).
     
     Return ONLY a JSON object:
-    {
+    {{
         "scenes": [
-            {"index": 1, "outline": "具体的场景梗概 (Description)..."},
-            {"index": 2, "outline": "..."}
+            {{"index": 1, "outline": "具体的场景梗概 (Description)..."}},
+            {{"index": 2, "outline": "..."}}
         ]
-    }
+    }}
     """
     
     messages = [
@@ -170,14 +170,15 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
     Instructions:
     - Write in professional Screenplay format.
     - Be concise but dramatic.
-    - IMPORTANT: Write mainly in Chinese (Dialogues and Actions), but standard format markers (INT./EXT.) can be standard.
-    - FORCE: The output language MUST be Chinese (Simplified) for all dialogue and scene descriptions.
+    - IMPORTANT: Write mainly in Chinese (Dialogues and Actions).
+    - TRANSLATE SCENE HEADERS: Convert 'INT.' to '内景', 'EXT.' to '外景', 'DAY' to '日', 'NIGHT' to '夜'.
+    - FORCE: The output language MUST be Chinese (Simplified) for everything including Headers, Transitions, Dialogue and Actions.
     - Output ONLY the raw text.
     """
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Action! Please verify you are writing in Chinese."}
+        {"role": "user", "content": "Action! Write in Chinese."}
     ]
     
     return await raw_generation(messages, temperature=0.8)

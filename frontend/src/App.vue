@@ -693,13 +693,40 @@ const exportScript = (format: string = 'txt') => {
                                 <el-tab-pane label="关键设定">
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                                         <div v-if="currentProject.global_context?.logline" class="col-span-full">
-                                            <div class="font-bold text-gray-500 mb-1">Logline</div>
-                                            <div class="bg-gray-50 p-2 rounded">{{ currentProject.logline }}</div>
+                                            <div class="font-bold text-gray-500 mb-1">故事梗概 (Logline)</div>
+                                            <el-popover placement="top" :width="400" trigger="hover">
+                                                <template #reference>
+                                                  <div class="bg-gray-50 p-2 rounded cursor-pointer truncate">{{ currentProject.logline }}</div>
+                                                </template>
+                                                <div class="whitespace-pre-wrap">{{ currentProject.logline }}</div>
+                                            </el-popover>
                                         </div>
                                         <div v-for="(val, key) in currentProject.global_context" :key="key">
                                             <template v-if="!['logline', 'character_details', 'project_type'].includes(key)">
-                                                <div class="font-bold text-gray-500 mb-1 capitalize">{{ key }}</div>
-                                                <div class="bg-gray-50 p-2 rounded truncate" :title="val">{{ val }}</div>
+                                                <div class="font-bold text-gray-500 mb-1 capitalize">
+                                                    {{ 
+                                                        key === 'tone' ? '基调' : 
+                                                        key === 'time_period' ? '时代背景' : 
+                                                        key === 'title' ? '标题' : 
+                                                        key === 'protagonist_core' ? '主角核心' : 
+                                                        key === 'antagonist_obstacle' ? '反派/阻碍' : 
+                                                        key === 'central_conflict' ? '核心冲突' : 
+                                                        key === 'theme' ? '主题' : 
+                                                        key === 'visual_style' ? '视觉风格' : 
+                                                        key === 'target_audience' ? '目标受众' : 
+                                                        key === 'episode_count' ? '集数' :
+                                                        key === 'episode_duration' ? '单集时长' :
+                                                        key === 'plot_details' ? '关键剧情' :
+                                                        key === 'user_notes' ? '补充说明' :
+                                                        key 
+                                                    }}
+                                                </div>
+                                                <el-popover placement="top" :width="300" trigger="hover">
+                                                    <template #reference>
+                                                        <div class="bg-gray-50 p-2 rounded truncate cursor-pointer" :title="val">{{ val }}</div>
+                                                    </template>
+                                                    <div class="whitespace-pre-wrap">{{ val }}</div>
+                                                </el-popover>
                                             </template>
                                         </div>
                                     </div>
