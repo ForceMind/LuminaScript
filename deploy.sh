@@ -17,6 +17,11 @@ FRONTEND_DIR="$PROJECT_DIR/frontend"
 VENV_DIR="$BACKEND_DIR/venv"
 ENV_FILE="$BACKEND_DIR/.env"
 
+# ================= 配置区 =================
+# 在这里设置您期望的前端访问端口
+FRONTEND_PORT=8600
+# ========================================
+
 echo -e "${BLUE}====== 妙笔流光 (LuminaScript) 部署助手 ======${NC}"
 
 # ================= 0. 内存优化 (自动 SWAP) =================
@@ -66,14 +71,14 @@ install_系统软件() {
         PKG_MGR="yum"
         if command -v dnf > /dev/null; then PKG_MGR="dnf"; fi
         
-        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs
+        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs lsof
     elif [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
         # 安装 Node.js 18.x 源
         if ! command -v node > /dev/null; then
              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
         fi
         sudo apt update -qq
-        sudo apt install -y python3 python3-pip python3-venv git nginx bc nodejs -qq
+        sudo apt install -y python3 python3-pip python3-venv git nginx bc nodejs lsof -qq
     fi
 }
 
@@ -154,12 +159,19 @@ echo "编译前端应用..."
 # 尝试消除 vue-tsc 版本不兼容问题: 如果构建失败，尝试仅使用 vite build
 if ! npm run build; then
     echo -e "${YELLOW}标准构建失败 (可能是 vue-tsc 类型检查问题)，尝试跳过类型检查强制构建...${NC}"
-    # 临时使用 vite build
-    ./node_modules/.bin/vite build || {
-        echo -e "${RED}前端构建再次失败!${NC}"
-        echo "提示: 如果出现 'Killed' 错误，请检查 Swap 是否已成功挂载。"
+    # 临时使用 vite build - 为了纯净输出，我们这里不打印 tsc 信息
+    # 直接运行 vite build (它应该在 PATH 中，如果不在则尝试 node_modules)
+    if [ -f "./node_modules/.bin/vite" ]; then
+        ./node_modules/.bin/vite build
+    else
+        npx vite build
+    fi
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}构建再次失败!${NC}"
+        echo "提示: 如果出现 'Killed' 错误，检查 Swap。"
         exit 1
-    }
+    fi
 fi
 
 # ================= 6. 启动服务 =================
@@ -170,6 +182,12 @@ check_port() {
     $VENV_PYTHON -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); exit(0 if s.connect_ex(('127.0.0.1', $1)) != 0 else 1)"
     return $?
 }
+
+for ((i=0; i<3; i++)); do
+    # 尝试kill以前可能残留的同名服务 (极其简单的防堆积逻辑)
+    # 注意: 这里仅杀死关联到当前目录的 uvicorn
+    pkill -f "$PROJECT_DIR/backend/venv/bin/uvicorn" 2>/dev/null
+done
 
 DEFAULT_PORT=8000
 PORT=$DEFAULT_PORT
@@ -191,10 +209,34 @@ PID=$!
 sleep 2
 if ps -p $PID > /dev/null; then
     IP=$(hostname -I | awk '{print $1}')
+    
+    echo -e "${YELLOW}正在启动前端服务 (端口: $FRONTEND_PORT)...${NC}"
+    
+    # 检查并安装 serve
+    if ! command -v serve &> /dev/null; then
+        echo "安装静态文件服务器 'serve'..."
+        npm install -g serve
+    fi
+    
+    # 清理旧的前端进程 (如果有)
+    fpid=$(lsof -t -i:$FRONTEND_PORT)
+    if [ -n "$fpid" ]; then
+        kill -9 $fpid
+    fi
+    
+    # 启动前端
+    cd "$FRONTEND_DIR"
+    nohup serve -s dist -l $FRONTEND_PORT > "$PROJECT_DIR/frontend.log" 2>&1 &
+    
     echo -e "\n${GREEN}====== 部署成功 ======${NC}"
-    echo -e "访问地址: http://$IP:$PORT"
-    echo -e "日志监控: tail -f $PROJECT_DIR/backend.log"
+    echo -e "前端访问地址:  http://$IP:$FRONTEND_PORT"
+    echo -e "后端 API 地址: http://$IP:$PORT"
+    echo -e "--------------------------------------------------------"
+    echo -e "前端日志:      tail -f $PROJECT_DIR/frontend.log"
+    echo -e "后端日志:      tail -f $PROJECT_DIR/backend.log"
+    echo -e "--------------------------------------------------------"
+    echo -e "${YELLOW}重要提示: 请确保云服务器安全组/防火墙已放行端口: $PORT (后端) 和 $FRONTEND_PORT (前端)${NC}"
 else
-    echo -e "${RED}启动失败，请查看 backend.log${NC}"
+    echo -e "${RED}后端启动失败，请查看 backend.log${NC}"
     exit 1
 fi
