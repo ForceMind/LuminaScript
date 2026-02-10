@@ -207,6 +207,9 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
             {"label": "Option text desc (e.g. '黑暗赛博朋克')", "value": "short_summary_of_option_in_chinese"}
         ]
     }
+    
+    SPECIAL RULE FOR 'TITLE':
+    If the Target Field is 'title', the options must be specific, creative title suggestions. The 'value' must be the TITLE ITSELF, not a description of the title.
     """
     
     user_prompt = f"""

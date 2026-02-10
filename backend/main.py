@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 import io
+from urllib.parse import quote
 
 try:
     from docx import Document as DocxDocument
@@ -347,7 +348,14 @@ async def submit_interaction(
     
     # Handle Title Update specifically
     if interaction.context_key == 'title':
-        project.title = interaction.answer
+        logger.info(f"Checking title update. Proposed Title: '{interaction.answer}'")
+        # Ensure we don't accidentally set the title to the question string if logic failed somewhere
+        # Simple heuristic: If it ends with '?', it's likely a mistake.
+        if interaction.answer and not interaction.answer.strip().endswith('?'):
+            project.title = interaction.answer
+            logger.info(f"Project Title Updated to: {project.title}")
+        else:
+             logger.warning(f"Ignored suspicious title update: {interaction.answer}")
         
     # Clear the cache because state has changed
     project.next_step_cache = None
@@ -406,17 +414,22 @@ async def analyze_logline(
     if project.project_type and project.project_type != "pending":
         normalized_context['project_type'] = project.project_type
     
-    next_step = None
+    # Calculate Total Steps (Dynamic based on Type)
+    relevant_steps = []
+    p_type = normalized_context.get("project_type", "movie")
     for step in REQUIRED_STEPS:
-        # Check Dependency for Episode Count & Duration
-        if step["key"] in ["episode_count", "episode_duration"]:
-            # Only ask if TV or Short
-            p_type = normalized_context.get("project_type", "movie")
-            if p_type == "movie": 
-                continue 
-                
+         if step["key"] in ["episode_count", "episode_duration"]:
+             if p_type == "movie": continue
+         relevant_steps.append(step)
+
+    next_step = None
+    next_step_index = 0
+    total_steps = len(relevant_steps)
+
+    for i, step in enumerate(relevant_steps):
         if step["key"] not in normalized_context:
             next_step = step
+            next_step_index = i + 1
             break
             
     # 2. If all steps completed -> Proceed to Outline Generation
@@ -427,25 +440,30 @@ async def analyze_logline(
         # For now, let's trigger scene generation or "outline confirmation"
         return {"type": "completed", "message": "基础设定已完成！准备生成大纲..."}
 
-    logger.info(f"项目 {project_id} 下一步骤: {next_step['key']}")
+    logger.info(f"项目 {project_id} 下一步骤: {next_step['key']} ({next_step_index}/{total_steps})")
+    
+    # helper to inject progress info
+    def add_progress(payload):
+        payload["progress"] = {"current": next_step_index, "total": total_steps}
+        return payload
 
     # 3. Handle specific logic for the next step
     # 3.1 Hardcoded options for Type
     if next_step["key"] == "project_type":
         return {
             "type": "interaction_required",
-            "payload": {
+            "payload": add_progress({
                 "field": "project_type",
                 "question": next_step["question"],
                 "options": next_step["default_options"]
-            }
+            })
         }
     
     # 3.2 Hardcoded options for Episode Count
     if next_step["key"] == "episode_count":
          return {
             "type": "interaction_required",
-            "payload": {
+            "payload": add_progress({
                 "field": "episode_count",
                 "question": next_step["question"],
                 "options": [
@@ -455,14 +473,14 @@ async def analyze_logline(
                     {"label": "24集", "value": "24"},
                     {"label": "30集以上", "value": "40"}
                 ]
-            }
+            })
         }
     
     # 3.3 Hardcoded options for Episode Duration
     if next_step["key"] == "episode_duration":
          return {
             "type": "interaction_required",
-            "payload": {
+            "payload": add_progress({
                 "field": "episode_duration",
                 "question": next_step["question"],
                 "options": [
@@ -472,7 +490,7 @@ async def analyze_logline(
                     {"label": "45分钟 (标准剧集)", "value": "45mins"},
                     {"label": "60分钟 (美剧/电影感)", "value": "60mins"}
                 ]
-            }
+            })
         }
     
     # 3.4 Check Prompt Richness (Optimization)
@@ -516,11 +534,11 @@ async def analyze_logline(
     # Construction Response
     response_payload = {
         "type": "interaction_required",
-        "payload": {
+        "payload": add_progress({
             "field": next_step["key"],
             "question": question_data.get("question", next_step["question"]), 
             "options": question_data.get("options", [])
-        }
+        })
     }
     
     # Cache the result to DB so next fetch is instant
@@ -685,7 +703,8 @@ async def export_project(
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    filename = f"{project.title or 'Untitled_Script'}"
+    filename_raw = project.title or 'Untitled_Script'
+    filename_encoded = quote(filename_raw)
     
     # Prepare Content Data
     project_scenes = sorted(project.scenes, key=lambda s: s.scene_index)
@@ -703,7 +722,10 @@ async def export_project(
         doc.add_paragraph(f"Type: {project.project_type} | Genre: {project.genre}")
         for k, v in context.items():
             if k not in ['logline', 'project_type']:
-                doc.add_paragraph(f"{k.capitalize()}: {v}")
+                try:
+                     doc.add_paragraph(f"{str(k).capitalize()}: {str(v)}")
+                except:
+                     pass
                 
         doc.add_page_break()
         doc.add_heading("Screenplay", level=1)
@@ -725,7 +747,7 @@ async def export_project(
         return StreamingResponse(
             buffer, 
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f"attachment; filename={filename}.docx"}
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}.docx"}
         )
 
     elif format == "md":
@@ -746,7 +768,7 @@ async def export_project(
         return StreamingResponse(
             io.BytesIO(content.encode('utf-8')),
             media_type="text/markdown",
-            headers={"Content-Disposition": f"attachment; filename={filename}.md"}
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}.md"}
         )
         
     else: # Default TXT
@@ -756,7 +778,7 @@ async def export_project(
         return StreamingResponse(
             io.BytesIO(content.encode('utf-8')),
             media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename={filename}.txt"}
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}.txt"}
         )
 
 # --- Background Task (The Engine) ---

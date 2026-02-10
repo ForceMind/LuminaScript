@@ -579,12 +579,22 @@ const exportScript = (format: string = 'txt') => {
 
                      <div class="flex-1 bg-white rounded-2xl shadow-xl overflow-hidden border border-gray-100">
                         <div class="bg-blue-50/50 p-6 border-b border-blue-100 flex items-center justify-between">
-                            <h3 class="text-lg font-medium text-blue-900">{{ interaction.question }}</h3>
+                            <div>
+                                <h3 class="text-lg font-medium text-blue-900">{{ interaction.question }}</h3>
+                                <div v-if="interaction.progress" class="text-xs text-blue-600/70 mt-1 font-mono">
+                                    Step {{ interaction.progress.current }} / {{ interaction.progress.total }}
+                                </div>
+                            </div>
                             <div v-if="loading" class="text-sm text-blue-500 flex items-center gap-2">
                                 <el-icon class="is-loading"><Loading /></el-icon> {{ loadingText }}
                             </div>
                         </div>
                         <div class="p-6 relative">
+                            <!-- Progress Bar -->
+                            <div v-if="interaction.progress" class="w-full bg-blue-100 rounded-full h-1.5 mb-6 overflow-hidden">
+                                <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500 shadow-sm" :style="{ width: (interaction.progress.current / interaction.progress.total * 100) + '%' }"></div>
+                            </div>
+
                             <!-- Loading Overlay for Interaction -->
                             <div v-if="loading" class="absolute inset-0 bg-white/60 z-10 flex items-center justify-center">
                                 <!-- Spinner is in header, this disables clicks -->
