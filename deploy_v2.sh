@@ -73,24 +73,43 @@ if [ -d ".git" ]; then
     git pull || echo -e "${RED}Git 拉取失败，将使用现有代码继续...${NC}"
 fi
 
-# ================= 2.5 端口清理 =================
-PORT=8000
-echo -e "${YELLOW}[2.5/5] 检查端口 $PORT...${NC}"
+# ================= 2.5 端口选择 (自动避让) =================
+DEFAULT_PORT=8000
+PORT=$DEFAULT_PORT
+MAX_RETRIES=10
 
-# 兼容多种检查方式
-PID=""
-if command -v lsof &>/dev/null; then
-    PID=$(lsof -t -i:$PORT)
-elif command -v netstat &>/dev/null; then
-    PID=$(netstat -nlp | grep :$PORT | awk '{print $7}' | cut -d'/' -f1)
-elif command -v fuser &>/dev/null; then
-    PID=$(fuser $PORT/tcp 2>/dev/null)
-fi
+echo -e "${YELLOW}[2.5/5] 寻找可用端口...${NC}"
 
-if [ ! -z "$PID" ]; then
-    echo -e "${YELLOW}端口 $PORT 被进程 $PID 占用。正在尝试关闭...${NC}"
-    kill -9 $PID 2>/dev/null || true
-    sleep 2
+check_port() {
+    local p=$1
+    if command -v lsof &>/dev/null; then
+        lsof -i:$p &>/dev/null
+        return $?
+    elif command -v netstat &>/dev/null; then
+        netstat -nlp | grep ":$p " &>/dev/null
+        return $?
+    elif command -v fuser &>/dev/null; then
+        fuser $p/tcp &>/dev/null
+        return $?
+    else
+        # 如果没有工具，默认盲目尝试启动，或者假设端口可用
+        return 1
+    fi
+}
+
+for ((i=0; i<MAX_RETRIES; i++)); do
+    if check_port $PORT; then
+        echo -e "端口 $PORT 被占用，尝试下一端口..."
+        PORT=$((PORT+1))
+    else
+        echo -e "${GREEN}将使用端口: $PORT${NC}"
+        break
+    fi
+done
+
+if ((i==MAX_RETRIES)); then
+    echo -e "${RED}错误: 找不到可用端口 (尝试了 $DEFAULT_PORT - $PORT)。请清理服务器进程。${NC}"
+    exit 1
 fi
 
 # ================= 3. 后端部署 =================
@@ -135,12 +154,12 @@ fi
 echo -e "${YELLOW}[5/5] 启动服务...${NC}"
 cd "$BACKEND_DIR"
 # 后台启动
-nohup "$VENV_DIR/bin/uvicorn" main:app --host 0.0.0.0 --port 8000 > "$PROJECT_DIR/backend.log" 2>&1 &
+nohup "$VENV_DIR/bin/uvicorn" main:app --host 0.0.0.0 --port $PORT > "$PROJECT_DIR/backend.log" 2>&1 &
 SERVER_PID=$!
 
 sleep 3
 if ps -p $SERVER_PID > /dev/null; then
-    echo -e "${GREEN}后端服务已启动! PID: $SERVER_PID${NC}"
+    echo -e "${GREEN}后端服务已启动! PID: $SERVER_PID (Port: $PORT)${NC}"
 else
     echo -e "${RED}后端服务启动似乎失败了。请查看日志:${NC}"
     tail -n 10 "$PROJECT_DIR/backend.log"
@@ -154,9 +173,9 @@ IP=$(hostname -I | awk '{print $1}')
 PUBLIC_IP=$(curl -s --connect-timeout 2 ifconfig.me || echo "未知")
 
 echo -e "\n${GREEN}====== 部署成功 ======${NC}"
-echo -e "访问地址 (内网):  http://$IP:8000"
-echo -e "访问地址 (公网):  http://$PUBLIC_IP:8000"
+echo -e "访问地址 (内网):  http://$IP:$PORT"
+echo -e "访问地址 (公网):  http://$PUBLIC_IP:$PORT"
 echo -e "前端构建目录:     $FRONTEND_DIR/dist"
 echo -e "------------------------------------------------"
-echo -e "注意: 若无法访问，请检查服务器防火墙 (安全组) 是否放行 8000 端口。"
+echo -e "注意: 若无法访问，请检查服务器防火墙 (安全组) 是否放行 $PORT 端口。"
 echo -e "日志监控: tail -f $PROJECT_DIR/backend.log"
