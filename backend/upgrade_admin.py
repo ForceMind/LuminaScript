@@ -53,8 +53,9 @@ def upgrade_schema():
     print("Checked 'ai_logs' table.")
 
     # 4. Enforce Single Admin Policy
-    # User Requirement: "Only one admin allowed, delete all others and recreate/ensure the specific one."
+    # User Requirement: "Ask if modify, restore default or set new"
     
+    update_admin = os.environ.get("UPDATE_ADMIN", "false").lower() == "true"
     admin_user = os.environ.get("ADMIN_USER", "admin")
     admin_pass = os.environ.get("ADMIN_PASS", "admin123")
     
@@ -62,18 +63,19 @@ def upgrade_schema():
     cursor.execute("SELECT id, username FROM users WHERE is_admin = 1")
     admins = cursor.fetchall()
     
-    # Strategy:
-    # 1. If strict reset is requested OR if we want to enforce "Only one exists and it must be ADMIN_USER"
-    #    The user specifically asked: "delete all and let me recreate [the one I want]"
-    
-    # Let's clean up ANY admin that doesn't match the current ENV target or just wipe all admins if prompted.
-    # To be safe but compliant with the user's strong request:
-    # We will remove ALL admins first, then ensure the target admin exists.
-    # This guarantees "Only One" and "Recreated".
+    if not update_admin:
+        if len(admins) > 0:
+            print(f"Skipping admin update. Current admins: {[u[1] for u in admins]}")
+            conn.commit()
+            return
+        else:
+            print("No admin detected in database. Proceeding to create initial admin...")
 
+    # Strategy:
+    # 1. If update is requested or no admin exists:
+    #    We will remove ALL other admins first to enforce "Single Admin"
     if len(admins) > 0:
-        print(f"Found {len(admins)} admin(s). Enforcing single-admin policy...")
-        # Remove admin privilege from everyone
+        print(f"Enforcing single-admin policy for {admin_user}...")
         cursor.execute("UPDATE users SET is_admin = 0 WHERE is_admin = 1")
     
     # Now ensure the target admin exists and has privileges

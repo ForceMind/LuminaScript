@@ -146,29 +146,48 @@ else
 fi
 
 # ================= 3.1 管理员账户配置 =================
-echo -e "${YELLOW}[3.1] 配置管理员账户${NC}"
-read -p "是否修改默认管理员(admin)密码? [y/N] " MODIFY_ADMIN
+echo -e "${YELLOW}[3.1] 管理员账户配置${NC}"
+echo "提示: 首次部署建议配置。如果跳过，系统将保持数据库现有管理员状态。"
+read -p "是否需要配置/重置管理员账户? [y/N] " WANT_ADMIN
+UPDATE_ADMIN="false"
 ADMIN_USER_VAL="admin"
 ADMIN_PASS_VAL="admin123"
 
-if [[ "$MODIFY_ADMIN" =~ ^[Yy]$ ]]; then
-    read -p "请输入管理员用户名 (默认 admin): " INPUT_USER
-    if [ ! -z "$INPUT_USER" ]; then ADMIN_USER_VAL=$INPUT_USER; fi
+if [[ "$WANT_ADMIN" =~ ^[Yy]$ ]]; then
+    echo -e "请选择操作:"
+    echo "  1) 恢复默认设置 (admin / admin123)"
+    echo "  2) 设置新的管理员"
+    read -p "请输入选项 [1/2]: " ADMIN_OPT
     
-    while true; do
-        read -s -p "请输入管理员密码: " INPUT_PASS
-        echo ""
-        read -s -p "请再次输入密码: " INPUT_PASS2
-        echo ""
-        if [ "$INPUT_PASS" == "$INPUT_PASS2" ] && [ ! -z "$INPUT_PASS" ]; then
-            ADMIN_PASS_VAL=$INPUT_PASS
-            break
-        else
-            echo -e "${RED}密码不匹配或为空，请重试。${NC}"
-        fi
-    done
+    if [ "$ADMIN_OPT" == "1" ]; then
+        ADMIN_USER_VAL="admin"
+        ADMIN_PASS_VAL="admin123"
+        UPDATE_ADMIN="true"
+        echo -e "${GREEN}已选择恢复默认设置。${NC}"
+    elif [ "$ADMIN_OPT" == "2" ]; then
+        read -p "请输入管理员用户名 (默认 admin): " INPUT_USER
+        ADMIN_USER_VAL=${INPUT_USER:-"admin"}
+        
+        while true; do
+            read -s -p "请输入管理员密码: " INPUT_PASS
+            echo ""
+            read -s -p "请再次输入密码: " INPUT_PASS2
+            echo ""
+            if [ "$INPUT_PASS" == "$INPUT_PASS2" ] && [ ! -z "$INPUT_PASS" ]; then
+                ADMIN_PASS_VAL=$INPUT_PASS
+                UPDATE_ADMIN="true"
+                break
+            else
+                echo -e "${RED}密码不匹配或为空，请重试。${NC}"
+            fi
+        done
+        echo -e "${GREEN}已设置新管理员: $ADMIN_USER_VAL${NC}"
+    else
+        echo "未识别选项，将跳过配置。"
+    fi
+else
+    echo "跳过管理员配置。"
 fi
-echo -e "管理员将在部署时设置为: ${GREEN}$ADMIN_USER_VAL${NC}"
 
 # ================= 4. 后端依赖 =================
 echo -e "${YELLOW}[4/6] 安装后端依赖...${NC}"
@@ -246,7 +265,7 @@ export PYTHONUNBUFFERED=1
 
 # 运行数据库升级与管理员设置
 echo "应用数据库变更与管理员权限..."
-ADMIN_USER="$ADMIN_USER_VAL" ADMIN_PASS="$ADMIN_PASS_VAL" "$VENV_PYTHON" upgrade_admin.py
+UPDATE_ADMIN="$UPDATE_ADMIN" ADMIN_USER="$ADMIN_USER_VAL" ADMIN_PASS="$ADMIN_PASS_VAL" "$VENV_PYTHON" upgrade_admin.py
 
 # 生产环境建议去掉 --reload，增强稳定性
 echo "启动后端服务 (Port: $PORT)..."
