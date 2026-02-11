@@ -381,6 +381,46 @@ const exportScript = (format: string = 'txt') => {
        })
        .catch(e => ElMessage.error('导出失败'))
 }
+
+// Sorted Key Settings Help
+const keySettingsOrder = [
+    'title', 'theme', 'tone', 'time_period', 
+    'protagonist_core', 'antagonist_obstacle', 'central_conflict',
+    'visual_style', 'target_audience', 
+    'episode_count', 'episode_duration', 'movie_duration', 'scene_count_target',
+    'plot_details', 'user_notes'
+]
+
+const sortedContext = computed(() => {
+    if (!currentProject.value?.global_context) return []
+    const ctx = currentProject.value.global_context
+    const keys = Object.keys(ctx).filter(k => !['logline', 'character_details', 'project_type'].includes(k))
+    
+    // Sort logic
+    return keys.sort((a, b) => {
+        const idxA = keySettingsOrder.indexOf(a)
+        const idxB = keySettingsOrder.indexOf(b)
+        // If both in list, sort by index
+        if (idxA !== -1 && idxB !== -1) return idxA - idxB
+        // If a in list, it goes first
+        if (idxA !== -1) return -1
+        // If b in list, it goes first
+        if (idxB !== -1) return 1
+        // Otherwise alphabetical
+        return a.localeCompare(b)
+    }).map(k => ({ key: k, value: ctx[k] }))
+})
+
+const copyText = (text: string) => {
+    if (!text) return
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => {
+            ElMessage.success('已复制')
+        }).catch(() => ElMessage.error('复制失败'))
+    } else {
+        ElMessage.warning('浏览器不支持自动复制')
+    }
+}
 </script>
 
 <template>
@@ -494,6 +534,14 @@ const exportScript = (format: string = 'txt') => {
                     <div class="text-lg font-bold">我的剧本</div>
                 </template>
                 <div class="flex flex-col h-full">
+                    <!-- Mobile Logline Display -->
+                    <div v-if="currentProject && currentProject.logline" class="px-4 py-3 bg-blue-50/50 border-b border-blue-100 mb-2">
+                        <div class="text-xs font-bold text-blue-400 uppercase tracking-wider mb-1">我的创意 (点击复制)</div>
+                        <div class="text-sm text-blue-900 leading-relaxed active:opacity-70" @click="copyText(currentProject.logline)">
+                            {{ currentProject.logline }}
+                        </div>
+                    </div>
+
                     <div class="flex-1 overflow-y-auto">
                         <ul class="space-y-2 p-1">
                             <div class="p-2">
@@ -709,41 +757,41 @@ const exportScript = (format: string = 'txt') => {
                                 <el-tab-pane label="关键设定">
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                                         <div v-if="currentProject.global_context?.logline" class="col-span-full">
-                                            <div class="font-bold text-gray-500 mb-1">故事梗概 (Logline)</div>
-                                            <el-popover placement="top" :width="400" trigger="hover">
-                                                <template #reference>
-                                                  <div class="bg-gray-50 p-2 rounded cursor-pointer truncate">{{ currentProject.logline }}</div>
-                                                </template>
-                                                <div class="whitespace-pre-wrap">{{ currentProject.logline }}</div>
-                                            </el-popover>
+                                            <div class="font-bold text-gray-500 mb-1 flex items-center justify-between">
+                                                故事梗概 (Logline)
+                                                <el-button type="primary" link size="small" @click="copyText(currentProject.global_context.logline)">复制</el-button>
+                                            </div>
+                                            <div class="bg-gray-50 p-3 rounded border border-gray-100 whitespace-pre-wrap cursor-pointer hover:bg-gray-100 transition" @click="copyText(currentProject.global_context.logline)">
+                                                {{ currentProject.logline }}
+                                            </div>
                                         </div>
-                                        <div v-for="(val, key) in currentProject.global_context" :key="key">
-                                            <template v-if="!['logline', 'character_details', 'project_type'].includes(key)">
-                                                <div class="font-bold text-gray-500 mb-1 capitalize">
-                                                    {{ 
-                                                        key === 'tone' ? '基调' : 
-                                                        key === 'time_period' ? '时代背景' : 
-                                                        key === 'title' ? '标题' : 
-                                                        key === 'protagonist_core' ? '主角核心' : 
-                                                        key === 'antagonist_obstacle' ? '反派/阻碍' : 
-                                                        key === 'central_conflict' ? '核心冲突' : 
-                                                        key === 'theme' ? '主题' : 
-                                                        key === 'visual_style' ? '视觉风格' : 
-                                                        key === 'target_audience' ? '目标受众' : 
-                                                        key === 'episode_count' ? '集数' :
-                                                        key === 'episode_duration' ? '单集时长' :
-                                                        key === 'plot_details' ? '关键剧情' :
-                                                        key === 'user_notes' ? '补充说明' :
-                                                        key 
-                                                    }}
-                                                </div>
-                                                <el-popover placement="top" :width="300" trigger="hover">
-                                                    <template #reference>
-                                                        <div class="bg-gray-50 p-2 rounded truncate cursor-pointer" :title="val">{{ val }}</div>
-                                                    </template>
-                                                    <div class="whitespace-pre-wrap">{{ val }}</div>
-                                                </el-popover>
-                                            </template>
+                                        <div v-for="item in sortedContext" :key="item.key">
+                                            <div class="font-bold text-gray-500 mb-1 capitalize">
+                                                {{ 
+                                                    item.key === 'tone' ? '基调' : 
+                                                    item.key === 'time_period' ? '时代背景' : 
+                                                    item.key === 'title' ? '标题' : 
+                                                    item.key === 'protagonist_core' ? '主角核心' : 
+                                                    item.key === 'antagonist_obstacle' ? '反派/阻碍' : 
+                                                    item.key === 'central_conflict' ? '核心冲突' : 
+                                                    item.key === 'theme' ? '主题' : 
+                                                    item.key === 'visual_style' ? '视觉风格' : 
+                                                    item.key === 'target_audience' ? '目标受众' : 
+                                                    item.key === 'episode_count' ? '集数' :
+                                                    item.key === 'episode_duration' ? '单集时长' :
+                                                    item.key === 'movie_duration' ? '电影时长' :
+                                                    item.key === 'scene_count_target' ? '预期场次' :
+                                                    item.key === 'plot_details' ? '关键剧情' :
+                                                    item.key === 'user_notes' ? '补充说明' :
+                                                    item.key 
+                                                }}
+                                            </div>
+                                            <el-popover placement="top" :width="300" trigger="hover">
+                                                <template #reference>
+                                                    <div class="bg-gray-50 p-2 rounded truncate cursor-pointer" :title="item.value">{{ item.value }}</div>
+                                                </template>
+                                                <div class="whitespace-pre-wrap">{{ item.value }}</div>
+                                            </el-popover>
                                         </div>
                                     </div>
                                 </el-tab-pane>

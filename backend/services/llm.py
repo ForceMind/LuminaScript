@@ -244,6 +244,9 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
         {"role": "user", "content": user_prompt}
     ]
     
+    if step_key == 'character_details':
+        system_prompt += "\n\nCRITICAL: For 'character_details', offer options that list the FULL Main Cast (Protagonist, Antagonist, Supporting) with 1-line bios for each. Format as a structured list (e.g., 'Target: Name (Age) - Role - Trait')."
+
     content, usage = await raw_generation(messages, temperature=0.8, json_response=True)
     if content:
         try:
