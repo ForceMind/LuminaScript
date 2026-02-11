@@ -120,17 +120,30 @@ async def generate_outline(logline: str, style_guide: str, target_count: int = 5
     Step 2: Generate a list of scenes. Matches return signature (data, usage).
     """
     logger.info(f"Step 2: 正在生成分场大纲 (目标场次数: {target_count})...")
+    
+    # Adjust prompt for large scene counts (Snowflake Step 6)
+    count_instruction = f"Create exactly {target_count} scenes."
+    if target_count > 20:
+        count_instruction = f"""
+        Create a detailed scene-by-scene outline with exactly {target_count} scenes. 
+        Ensure you follow a professional story structure (e.g., 3-Act Structure or Hero's Journey).
+        Distribute the {target_count} scenes across the acts appropriately:
+        - Act 1: Intro & Inciting Incident (approx. 25% of scenes)
+        - Act 2: Rising Action & Midpoint (approx. 50% of scenes)
+        - Act 3: Climax & Resolution (approx. 25% of scenes)
+        """
+
     system_prompt = f"""
     You are a professional Screenwriter.
-    Based on the logline and selected style, create a concise scene-by-scene outline.
-    Create exactly {target_count} scenes/episodes as requested.
+    Based on the logline and project bible context provided, create a scene-by-scene outline.
+    {count_instruction}
     
     IMPORTANT: Output in Chinese (Simplified).
     
     Return ONLY a JSON object:
     {{
         "scenes": [
-            {{"index": 1, "outline": "具体的场景梗概 (Description)..."}},
+            {{"index": 1, "outline": "内景/外景. 场景描述... (1-2 sentences)"}},
             {{"index": 2, "outline": "..."}}
         ]
     }}
@@ -138,7 +151,7 @@ async def generate_outline(logline: str, style_guide: str, target_count: int = 5
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Logline: {logline}\nStyle Direction: {style_guide}"}
+        {"role": "user", "content": f"Logline: {logline}\nContext/Style: {style_guide}"}
     ]
     
     content, usage = await raw_generation(messages, temperature=0.7, json_response=True)
@@ -186,25 +199,27 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
 async def generate_interaction_options(step_key: str, base_question: str, context_str: str):
     """
     Generates tailored options for a specific step in the Project Bible creation.
-    Returns: {"question": "Refined Question?", "options": [{"label": "...", "value": "..."}, ...]}
+    Follows "Snowflake Method" principles (Iterative Expansion).
     """
     system_prompt = """
-    You are a professional Script Consultant (Script Doctor). 
-    Your goal is to guide the user in defining their story's "Bible" step-by-step.
+    You are a professional Script Consultant and Story Architect. 
+    Your goal is to guide the user in defining their story's "Bible" using the Snowflake Method (雪花写作法).
     
-    Current Task: Generate 3-4 creative, distinct options for a specific aspect of the story based on the Logline an Context.
+    Current Task: Based on the current story context, generate 3-4 creative and distinct options for a specific aspect of the story.
     
-    CRITICAL INSTRUCTION - ADAPTIVITY:
-    - Assess the available context. If the user has ALREADY provided detailed information about this specific aspect in their Logline or previous answers, provide options that *refine* or *challenge* that detail, rather than asking basic questions.
-    - If the context is sparse, provide broad, inspiring options.
+    CRITICAL INSTRUCTION - SNOWFLAKE METHOD:
+    - If the user has already provided some details, DON'T ask basic questions. Instead, propose EXPANSIONS or CONFLICTS that build on what they have.
+    - Focus on deepening the stakes, clarifying character motivations, or expanding the world-building.
+    - If the 'Target Field' is 'story_expansion', provide three different 3-act structure summaries.
+    - If the 'Target Field' is 'character_details', suggest specific character arcs or hidden secrets.
     
-    IMPORTANT: The entire output MUST be in Chinese (Simplified). The question and all options (labels and values) must be in Chinese.
+    IMPORTANT: The entire output MUST be in Chinese (Simplified).
     
     Output Format (JSON):
     {
-        "question": "The refined question to ask the user (In Chinese)",
+        "question": "The refined, thought-provoking question (In Chinese)",
         "options": [
-            {"label": "Option text desc (e.g. '黑暗赛博朋克')", "value": "short_summary_of_option_in_chinese"}
+            {"label": "Detailed option description", "value": "the_actual_data_to_store"}
         ]
     }
     

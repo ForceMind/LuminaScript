@@ -339,6 +339,16 @@ async def submit_interaction(
     # Update context
     # Note: sqlalchemy JSON field needs reassignment to trigger update
     current_context = dict(project.global_context) if project.global_context else {}
+    
+    # Special Handling: Reset
+    if interaction.context_key == 'final_confirm' and interaction.answer == 'reset':
+        logger.info(f"项目 {project_id} 收到重置请求，清空上下文重新开始设定流程")
+        project.global_context = {}
+        project.next_step_cache = None
+        project.project_type = "pending"
+        await db.commit()
+        return {"status": "reset", "context": {}}
+
     current_context[interaction.context_key] = interaction.answer
     project.global_context = current_context
 
@@ -390,22 +400,38 @@ async def analyze_logline(
     context = project.global_context or {}
     
     # --- Definition of the 10-Step Setup Flow ---
+    # Follow Snowflake Method concepts: Logline -> Expansion -> Characters -> Detailed Plot -> Confirmation
     REQUIRED_STEPS = [
         {"key": "project_type", "question": "您想创作哪种类型的剧本？", "default_options": [
              {"label": "🎥 电影剧本 (Movie)", "value": "movie"},
              {"label": "📺 电视剧 (TV Series)", "value": "tv"},
              {"label": "📱 现代短剧 (Short Drama)", "value": "short"}
         ]},
-        {"key": "episode_count", "question": "您计划创作多少集？"},
-        {"key": "episode_duration", "question": "每一集的大致时长是？"},
+        # Dynamic steps based on Project Type
+        {"key": "movie_duration", "question": "电影预期的时长是多少分钟？", "movie_only": True},
+        {"key": "scene_count_target", "question": "您希望生成多少场戏？(电影通常40-100场，精细剧本可能更多)", "movie_only": True},
+        {"key": "episode_count", "question": "您计划创作多少集？", "tv_short_only": True},
+        {"key": "episode_duration", "question": "每一集的大致时长是？", "tv_short_only": True},
+        
         {"key": "tone", "question": "这部作品的基调是什么？"},
         {"key": "time_period", "question": "故事发生在什么时代背景？"},
         {"key": "title", "question": "不管是暂定还是正式，给这个故事起个名字吧？"},
-        {"key": "character_details", "question": "主要角色的性格、外貌或背景有什么特别设定？"}, # New Step
-        {"key": "plot_details", "question": "有哪些一定要发生的关键情节或转折？"}, # New Step
+        
+        # Snowflake Step 2 & 4: Expansion
+        {"key": "story_expansion", "question": "我们需要基于目前的构思扩展出一个完整的三幕式大纲，您有什么特别的想法吗？"},
+        
+        # Snowflake Step 3 & 5: Character focus
+        {"key": "character_details", "question": "主要角色的性格、外貌或背景有什么特别设定？"},
+        
+        # Detailed plot
+        {"key": "plot_details", "question": "有哪些一定要发生的关键情节或转折？"},
+        
         {"key": "theme", "question": "您想通过这个故事探讨什么主题？"},
-        {"key": "visual_style", "question": "视觉风格偏向于什么？（如：赛博朋克、写实、黑白诺尔等）"},
-        {"key": "user_notes", "question": "还有什么补充的内容，或者特别的要求吗？"} # New Final Step
+        {"key": "visual_style", "question": "视觉风格偏向于什么？"},
+        {"key": "user_notes", "question": "还有什么补充的内容，或者特别的要求吗？"},
+        
+        # Final confirmation
+        {"key": "final_confirm", "question": "以上是剧本的完整设定，请确认是否可以开始生成分场大纲？", "is_confirmation": True}
     ]
 
     # 1. Check which steps are missing
@@ -418,8 +444,9 @@ async def analyze_logline(
     relevant_steps = []
     p_type = normalized_context.get("project_type", "movie")
     for step in REQUIRED_STEPS:
-         if step["key"] in ["episode_count", "episode_duration"]:
-             if p_type == "movie": continue
+         # Filter based on type
+         if step.get("movie_only") and p_type != "movie": continue
+         if step.get("tv_short_only") and p_type == "movie": continue
          relevant_steps.append(step)
 
     next_step = None
@@ -435,9 +462,6 @@ async def analyze_logline(
     # 2. If all steps completed -> Proceed to Outline Generation
     if not next_step:
         logger.info(f"项目 {project_id} 所有基础设定步骤已完成，准备生成大纲。")
-        # Check if Outline exists, if not, generate it
-        # return {"type": "complete", "message": "Bible complete. Ready for Outline."}
-        # For now, let's trigger scene generation or "outline confirmation"
         return {"type": "completed", "message": "基础设定已完成！准备生成大纲..."}
 
     logger.info(f"项目 {project_id} 下一步骤: {next_step['key']} ({next_step_index}/{total_steps})")
@@ -459,7 +483,37 @@ async def analyze_logline(
             })
         }
     
-    # 3.2 Hardcoded options for Episode Count
+    # 3.2 Hardcoded options for Episode Count / Movie Duration / Scene Count
+    if next_step["key"] == "movie_duration":
+         return {
+            "type": "interaction_required",
+            "payload": add_progress({
+                "field": "movie_duration",
+                "question": next_step["question"],
+                "options": [
+                    {"label": "90分钟 (标准电影)", "value": "90"},
+                    {"label": "120分钟 (长篇商业片)", "value": "120"},
+                    {"label": "150分钟以上 (史诗篇幅)", "value": "150"},
+                    {"label": "60分钟 (中片/电视电影)", "value": "60"}
+                ]
+            })
+        }
+
+    if next_step["key"] == "scene_count_target":
+         return {
+            "type": "interaction_required",
+            "payload": add_progress({
+                "field": "scene_count_target",
+                "question": next_step["question"],
+                "options": [
+                    {"label": "40场 (简约大纲)", "value": "40"},
+                    {"label": "60场 (标准大纲)", "value": "60"},
+                    {"label": "100场 (精细大纲)", "value": "100"},
+                    {"label": "120场以上 (极度详尽)", "value": "120"}
+                ]
+            })
+        }
+
     if next_step["key"] == "episode_count":
          return {
             "type": "interaction_required",
@@ -471,12 +525,11 @@ async def analyze_logline(
                     {"label": "12集 (标准季)", "value": "12"},
                     {"label": "20集 (国产剧标准)", "value": "20"},
                     {"label": "24集", "value": "24"},
-                    {"label": "30集以上", "value": "40"}
+                    {"label": "40集以上", "value": "40"}
                 ]
             })
         }
     
-    # 3.3 Hardcoded options for Episode Duration
     if next_step["key"] == "episode_duration":
          return {
             "type": "interaction_required",
@@ -489,6 +542,25 @@ async def analyze_logline(
                     {"label": "20分钟 (情景喜剧/动画)", "value": "20mins"},
                     {"label": "45分钟 (标准剧集)", "value": "45mins"},
                     {"label": "60分钟 (美剧/电影感)", "value": "60mins"}
+                ]
+            })
+        }
+    
+    if next_step.get("is_confirmation"):
+        # Format a summary for confirmation
+        summary_lines = []
+        for k, v in normalized_context.items():
+             summary_lines.append(f"- {k}: {v}")
+        summary_text = "\n".join(summary_lines)
+        return {
+            "type": "interaction_required",
+            "payload": add_progress({
+                "field": "final_confirm",
+                "question": next_step["question"],
+                "context_summary": summary_text,
+                "options": [
+                    {"label": "✅ 确定并开始生成", "value": "confirmed"},
+                    {"label": "🔄 我想修改一些内容", "value": "reset"}
                 ]
             })
         }
@@ -572,21 +644,37 @@ async def generate_scenes(
         c = project.global_context or {}
         style_context = f"Genre: {project.project_type}, Tone: {c.get('tone')}, Style: {c.get('visual_style')}"
 
-    # Extract target episode count from context
+    # Extract target episode count / scene count from context
     c = project.global_context or {}
     target_count = 5
-    raw_count = c.get("episode_count")
+    
+    # Priority for Movie: scene_count_target
+    if project.project_type == "movie":
+        raw_count = c.get("scene_count_target")
+    else:
+        raw_count = c.get("episode_count")
+
     if raw_count:
         try:
             if isinstance(raw_count, int):
                 target_count = raw_count
             elif isinstance(raw_count, str):
                 import re
+                # Try to find first number
                 digits = re.findall(r'\d+', raw_count)
                 if digits:
                     target_count = int(digits[0])
         except Exception as e:
-            logger.warning(f"Error parsing episode_count: {e}")
+            logger.warning(f"Error parsing count: {e}")
+            
+    # If movie duration is set but scene count isn't, estimate
+    if project.project_type == "movie" and not c.get("scene_count_target"):
+        duration = c.get("movie_duration")
+        if duration:
+            try:
+                # 1.5 scenes per minute is a high-detail script, 0.5 is low. 1.0 is standard.
+                target_count = int(int(re.findall(r'\d+', str(duration))[0]) * 0.8)
+            except: pass
 
     project.genre = style_context
     await db.commit()

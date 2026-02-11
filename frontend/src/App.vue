@@ -595,6 +595,12 @@ const exportScript = (format: string = 'txt') => {
                                 <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500 shadow-sm" :style="{ width: (interaction.progress.current / interaction.progress.total * 100) + '%' }"></div>
                             </div>
 
+                            <!-- Context Summary (For Final Confirmation Step) -->
+                            <div v-if="interaction.context_summary" class="mb-6 p-4 bg-gray-50 rounded-xl border border-gray-100 text-sm whitespace-pre-wrap text-gray-600 max-h-64 overflow-y-auto">
+                                <div class="font-bold text-gray-400 mb-2 uppercase text-xs">剧本设定汇总</div>
+                                {{ interaction.context_summary }}
+                            </div>
+
                             <!-- Loading Overlay for Interaction -->
                             <div v-if="loading" class="absolute inset-0 bg-white/60 z-10 flex items-center justify-center">
                                 <!-- Spinner is in header, this disables clicks -->
