@@ -388,7 +388,8 @@ const keySettingsOrder = [
     'protagonist_core', 'antagonist_obstacle', 'central_conflict',
     'visual_style', 'target_audience', 
     'episode_count', 'episode_duration', 'movie_duration', 'scene_count_target',
-    'plot_details', 'user_notes'
+    'plot_details', 'story_expansion', 'user_notes',
+    'final_confirm'
 ]
 
 const sortedContext = computed(() => {
@@ -782,6 +783,8 @@ const copyText = (text: string) => {
                                                     item.key === 'movie_duration' ? '电影时长' :
                                                     item.key === 'scene_count_target' ? '预期场次' :
                                                     item.key === 'plot_details' ? '关键剧情' :
+                                                    item.key === 'story_expansion' ? '故事深化' :
+                                                    item.key === 'character_details' ? '角色设定' :
                                                     item.key === 'user_notes' ? '补充说明' :
                                                     item.key 
                                                 }}

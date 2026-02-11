@@ -697,8 +697,10 @@ async def generate_scenes(
     
     if not scenes_data:
         logger.error("分场大纲生成失败或为空")
-        # Fallback
-        scenes_data = [{"index": 1, "outline": "Start: Intro Protagonist"}]
+        # Fallback: Create placeholders so user knows something went wrong but can potentially retry or edit
+        # If target_count is reasonable, generate empty slots? No, that's messy.
+        # Just create one clear error scene.
+        scenes_data = [{"index": 1, "outline": "大纲生成失败，请尝试重新生成或检查网络(API)设置。"}]
     else:
         logger.info(f"成功生成 {len(scenes_data)} 个分场")
 

@@ -59,7 +59,11 @@ async def raw_generation(messages, temperature=0.7, json_response=False):
             # If user expects JSON, we try to clean it up lightly
             if json_response and content:
                  content = content.replace("```json", "").replace("```", "").strip()
-                 # Heuristic fix for trailing comma or simple markdown wrapper
+                 # Try to find the first '{' and last '}' to extract valid JSON
+                 import re
+                 json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                 if json_match:
+                     content = json_match.group(0)
             
             return content, usage
         except Exception as e:
@@ -219,7 +223,7 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     {
         "question": "The refined, thought-provoking question (In Chinese)",
         "options": [
-            {"label": "Detailed option description", "value": "the_actual_data_to_store"}
+            {"label": "Detailed option description", "value": "A short Chinese summary of this option (e.g. '黑暗悬疑风格')"}
         ]
     }
     
@@ -236,7 +240,7 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     
     Generate options that fit the genre and logic of the logline. 
     Ensure options allow for variety (e.g., one safe, one subversive, one high-concept).
-    REPLY IN CHINESE ONLY.
+    REPLY IN CHINESE ONLY. ENSURE 'value' fields are in Chinese.
     """
     
     messages = [
@@ -258,8 +262,8 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     return {
         "question": base_question,
         "options": [
-            {"label": "经典模式", "value": "classic"},
-            {"label": "反转模式", "value": "subversive"},
-            {"label": "实验风格", "value": "experimental"}
+            {"label": "经典模式", "value": "经典叙事风格"},
+            {"label": "反转模式", "value": "带有反转的剧情"},
+            {"label": "实验风格", "value": "大胆的实验性风格"}
         ]
     }, usage
