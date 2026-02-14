@@ -813,7 +813,7 @@ const copyText = (text: string) => {
                              <div v-if="loading || currentProject.status === 'generating'">
                                 <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
                                 <p>{{ loadingText || 'AI 正在逐场构架剧本，请稍候...' }}</p>
-                                <p class="text-xs mt-2 text-gray-400">（已启动后台生成，场次将实时刷新出现）</p>
+                                <p class="text-xs mt-2 text-gray-400">（受网络速度和模型提供商影响，生成速度无法控制，请耐心等待）</p>
                              </div>
                              <div v-else class="py-4">
                                 <p class="mb-4 text-gray-500">剧本尚未生成或生成过程中断。</p>
