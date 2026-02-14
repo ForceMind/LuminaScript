@@ -677,53 +677,100 @@ async def generate_scenes(
             except: pass
 
     project.genre = style_context
+    project.status = models.ProcessingStatus.GENERATING
+    # Force clearing of any old scenes from a previous attempt
+    await db.execute(delete(models.Scene).where(models.Scene.project_id == project_id))
     await db.commit()
 
-    logger.info(f"正在调用 LLM 生成分场大纲... (Style: {style_context}, Count: {target_count})")
-    # 2. Real: Generate Scene Outline using LLM
-    scenes_data, usage = await llm.generate_outline(project.logline, style_context, target_count=target_count)
-    project.total_tokens += usage
+    logger.info(f"启动后台任务生成大纲... (Style: {style_context}, Count: {target_count})")
     
-    # Log AI action
+    # 2. Trigger Background Task for Incremental Outline Generation
     background_tasks.add_task(
-        log_ai_action,
-        user_id=current_user.id,
-        project_id=project_id,
-        action="generate_outline",
-        prompt=f"Logline: {project.logline}, Style: {style_context}",
-        response=str(scenes_data),
-        tokens=usage
+        run_incremental_outline_generation, 
+        project_id, 
+        style_context, 
+        target_count,
+        current_user.id
     )
     
-    if not scenes_data:
-        logger.error("分场大纲生成失败或为空")
-        # Fallback: Create placeholders so user knows something went wrong but can potentially retry or edit
-        # If target_count is reasonable, generate empty slots? No, that's messy.
-        # Just create one clear error scene.
-        scenes_data = [{"index": 1, "outline": "大纲生成失败，请尝试重新生成或检查网络(API)设置。"}]
-    else:
-        logger.info(f"成功生成 {len(scenes_data)} 个分场")
-
-    # Clear existing scenes if any (cleanup for retry)
-    # Note: For basic version, we just append. Advanced: delete old.
-    
-    for scene_item in scenes_data:
-        new_scene = models.Scene(
-            project_id=project.id,
-            scene_index=scene_item.get("index", 1),
-            outline=scene_item.get("outline", "Unknown Scene"),
-            status=models.ProcessingStatus.PENDING
-        )
-        db.add(new_scene)
-    
-    project.status = models.ProcessingStatus.GENERATING
-    await db.commit()
-    
-    # 3. Trigger Background Loop (Concept)
-    logger.info(f"启动后台任务生成具体的剧本内容...")
-    background_tasks.add_task(run_generation_loop, project.id)
-    
     return {"status": "Scene generation started", "project_id": project_id}
+
+# --- Background Task Implementation ---
+from sqlalchemy import delete
+
+async def run_incremental_outline_generation(project_id: int, style_context: str, target_count: int, user_id: int):
+    logger.info(f"[Task] Starting Incremental Outline Gen for Project {project_id}")
+    
+    async with database.SessionLocal() as db:
+        project = await db.get(models.Project, project_id)
+        if not project: return
+        
+        # Determine Batch Size (User requested "safe/one-by-one", so we choose 1 to be absolutely safe and responsive)
+        # Using 1 allows frontend to see each scene pop up.
+        batch_size = 1 
+        current_idx = 1
+        last_context = "Start of story."
+        
+        while current_idx <= target_count:
+            # Re-check status in case user cancelled
+            await db.refresh(project)
+            if project.status == models.ProcessingStatus.FAILED:
+                logger.info("[Task] Outline Gen Cancelled.")
+                return 
+
+            end_idx = min(current_idx + batch_size - 1, target_count)
+            logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
+            
+            try:
+                batch_scenes, usage = await llm.generate_scene_batch(
+                    project.logline, 
+                    style_context, 
+                    current_idx, 
+                    end_idx, 
+                    previous_context=last_context,
+                    total_target=target_count
+                )
+                
+                project.total_tokens += usage
+                
+                # If success, save to DB immediately
+                if batch_scenes:
+                    for s_data in batch_scenes:
+                        new_scene = models.Scene(
+                            project_id=project.id,
+                            scene_index=s_data.get("index", current_idx),
+                            outline=s_data.get("outline", "Unknown"),
+                            status=models.ProcessingStatus.PENDING
+                        )
+                        db.add(new_scene)
+                    
+                    # Update context for next batch
+                    summaries = [s.get('outline', '') for s in batch_scenes]
+                    last_context = "; ".join(summaries) # Keep it short
+                else:
+                    # Fallback for empty/failure
+                    logger.error(f"[Task] Batch {current_idx} failed.")
+                    new_scene = models.Scene(
+                        project_id=project.id,
+                        scene_index=current_idx,
+                        outline="[生成失败] 请稍后尝试重写此场。",
+                        status=models.ProcessingStatus.PENDING
+                    )
+                    db.add(new_scene)
+
+                await db.commit()
+                
+            except Exception as e:
+                logger.error(f"[Task] Critical error in outline batch: {e}")
+            
+            current_idx += batch_size
+        
+        # After Outline Complete -> Trigger Content Generation
+        logger.info("[Task] Outline Complete. Starting Content Gen Loop...")
+        # Since we are not in a request scope, we can't use BackgroundTasks object easily to chain.
+        # But we can just await the next function directly since we are already in an async background loop.
+        await run_generation_loop(project.id)
+
 
 @app.post("/projects/{project_id}/scenes/{scene_index}/regenerate")
 async def regenerate_scene(

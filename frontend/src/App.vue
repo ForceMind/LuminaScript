@@ -220,11 +220,19 @@ const analyzeLogline = async (id: number) => {
     } else if (res.data.type === 'completed') {
         // Analysis complete. Trigger Scene Generation automatically.
         interaction.value = null
-        loadingText.value = '基础设定完成！AI 正在为您生成分场大纲...'
+        loadingText.value = '基础设定完成！AI 正在为您生成分场大纲（这可能需要几分钟，请耐心等待）...'
         ElMessage.success('基础设定完成！正在生成分场大纲...')
         
         // Call generate_scenes without selected_option, forcing it to use Context
-        await api.post(`/projects/${id}/generate_scenes`, null, { params: { selected_option: 'auto' } })
+        // Increase timeout for this specific call since batch generation can be slow
+        await api.post(
+            `/projects/${id}/generate_scenes`, 
+            null, 
+            { 
+                params: { selected_option: 'auto' },
+                timeout: 300000 // 5 minutes timeout for large batches
+            }
+        )
         
         await fetchProjects()
     } else {

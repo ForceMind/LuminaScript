@@ -119,54 +119,43 @@ async def analyze_script_requirements(logline: str, project_type: str="movie"):
              return None, usage
     return None, 0
 
-async def generate_outline(logline: str, style_guide: str, target_count: int = 5):
+async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, end_idx: int, previous_context: str = "", total_target: int = 0):
     """
-    Step 2: Generate a list of scenes. Matches return signature (data, usage).
+    Generate a specific batch of scenes.
     """
-    logger.info(f"Step 2: 正在生成分场大纲 (目标场次数: {target_count})...")
-    
-    # Adjust prompt for large scene counts (Snowflake Step 6)
-    count_instruction = f"Create exactly {target_count} scenes."
-    if target_count > 20:
-        count_instruction = f"""
-        Create a detailed scene-by-scene outline with exactly {target_count} scenes. 
-        Ensure you follow a professional story structure (e.g., 3-Act Structure or Hero's Journey).
-        Distribute the {target_count} scenes across the acts appropriately:
-        - Act 1: Intro & Inciting Incident (approx. 25% of scenes)
-        - Act 2: Rising Action & Midpoint (approx. 50% of scenes)
-        - Act 3: Climax & Resolution (approx. 25% of scenes)
-        """
-
+    count = end_idx - start_idx + 1
     system_prompt = f"""
     You are a professional Screenwriter.
-    Based on the logline and project bible context provided, create a scene-by-scene outline.
-    {count_instruction}
+    Create a scene-by-scene outline for scenes #{start_idx} to #{end_idx}.
+    Total Scenes in Movie: {total_target}.
+    This Batch: {count} scenes.
+    
+    Context: {logline}
+    Style/Settings: {style_guide}
+    Previous Scene Arc: {previous_context}
     
     IMPORTANT: Output in Chinese (Simplified).
-    
     Return ONLY a JSON object:
     {{
         "scenes": [
-            {{"index": 1, "outline": "内景/外景. 场景描述... (1-2 sentences)"}},
-            {{"index": 2, "outline": "..."}}
+            {{"index": {start_idx}, "outline": "..."}},
+            ...
+            {{"index": {end_idx}, "outline": "..."}}
         ]
     }}
     """
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Logline: {logline}\nContext/Style: {style_guide}"}
-    ]
-    
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": "Generate scenes."}]
     content, usage = await raw_generation(messages, temperature=0.7, json_response=True)
     if content:
         try:
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match: content = json_match.group(0)
             data = json.loads(content)
             return data.get("scenes", []), usage
-        except json.JSONDecodeError:
-            logger.error(f"Generate Outline JSON Decode Error. Content: {content}")
-            return [], usage
-    return [], 0
+        except Exception as e:
+            logger.error(f"Batch {start_idx}-{end_idx} JSON Error: {e}")
+    return [], usage
 
 async def write_scene_content(logline: str, style_guide: str, current_scene_outline: str, previous_context: str = ""):
     """
