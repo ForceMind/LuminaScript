@@ -735,14 +735,19 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                 
                 # If success, save to DB immediately
                 if batch_scenes:
+                    # Logic Fix: Enforce strictly sequential indexing based on loop counter.
+                    # Do not trust LLM returned 'index' property to avoid duplicates if LLM resets to 1.
+                    offset = 0
                     for s_data in batch_scenes:
+                        calculated_index = current_idx + offset
                         new_scene = models.Scene(
                             project_id=project.id,
-                            scene_index=s_data.get("index", current_idx),
+                            scene_index=calculated_index, 
                             outline=s_data.get("outline", "Unknown"),
                             status=models.ProcessingStatus.PENDING
                         )
                         db.add(new_scene)
+                        offset += 1
                     
                     # Update context for next batch
                     summaries = [s.get('outline', '') for s in batch_scenes]
