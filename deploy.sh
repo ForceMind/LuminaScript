@@ -305,6 +305,7 @@ console.log("代理目标:", API_URL);
 app.use('/api', createProxyMiddleware({ 
     target: API_URL, 
     changeOrigin: true,
+    xfwd: true, // Auto-add x-forwarded-for headers so backend sees real IP
     pathRewrite: { '^/api': '' },
     proxyTimeout: 600000, // 10分钟超时，防止 AI 生成过程中断
     timeout: 600000,      // 传入连接超时

@@ -69,11 +69,24 @@ async def check_admin(current_user: models.User = Depends(auth.get_current_user)
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return current_user
 
-async def log_login(user_id: int, ip: str, status: str):
+async def log_login(user_id: int, ip: str, status: str, user_agent_str: str = ''):
+    try:
+        from user_agents import parse
+        import json
+        ua = parse(user_agent_str)
+        device_info = f"{ua.os.family} {ua.os.version_string} / {ua.browser.family} {ua.browser.version_string}"
+        if ua.is_mobile: device_info += " (Mobile)"
+        if ua.is_tablet: device_info += " (Tablet)"
+        if ua.is_pc: device_info += " (PC)"
+    except Exception as e:
+        logger.error(f"Error parsing UA: {e}")
+        device_info = user_agent_str[:50] # Fallback
+
     async with SessionLocal() as db:
         log = models.LoginLog(
              user_id=user_id, 
              ip_address=ip, 
+             user_agent=device_info,
              status=status, 
              timestamp=datetime.now().isoformat()
         )
@@ -187,6 +200,9 @@ async def login_for_access_token(
     else:
         ip = request.client.host
     
+    # User Agent
+    user_agent = request.headers.get("user-agent", "")
+    
     # 2. Verify
     if not user:
         logger.warning(f"登录失败: 用户 {form_data.username} 不存在")
@@ -194,7 +210,7 @@ async def login_for_access_token(
         # For simplicity, we skip logging unknown users or we need to change model to allow nullable user_id
     elif not auth.verify_password(form_data.password, user.hashed_password):
         logger.warning(f"登录失败: 用户 {form_data.username} 密码错误")
-        background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="failed")
+        background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="failed", user_agent_str=user_agent)
         
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
          raise HTTPException(
@@ -204,7 +220,7 @@ async def login_for_access_token(
         )
     
     logger.info(f"用户 {form_data.username} 登录成功")
-    background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="success")
+    background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="success", user_agent_str=user_agent)
     
     # 3. Create Token
     access_token = auth.create_access_token(data={"sub": user.username})

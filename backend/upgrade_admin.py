@@ -28,11 +28,19 @@ def upgrade_schema():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             ip_address VARCHAR,
+            user_agent VARCHAR,
             status VARCHAR,
             timestamp VARCHAR,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
+    # 2.1 Add user_agent to login_logs if missing
+    try:
+        cursor.execute("SELECT user_agent FROM login_logs LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Adding 'user_agent' column to login_logs table...")
+        cursor.execute("ALTER TABLE login_logs ADD COLUMN user_agent VARCHAR")
+    
     print("Checked 'login_logs' table.")
 
     # 3. Create ai_logs

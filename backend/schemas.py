@@ -62,6 +62,7 @@ class LoginLogResponse(BaseModel):
     user_id: int
     user_name: Optional[str] = None # Computed field
     ip_address: str
+    user_agent: Optional[str] = None
     status: str
     timestamp: str
 

@@ -27,6 +27,8 @@ class LoginLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     ip_address = Column(String)
+    user_agent = Column(String, nullable=True) # Browser/Device info
+    location = Column(String, nullable=True) # Geo info (Optional)
     status = Column(String) # success, failed
     timestamp = Column(String) # ISO format
 

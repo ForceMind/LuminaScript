@@ -126,10 +126,19 @@ onMounted(() => {
 
             <el-tab-pane label="登录日志" name="logins">
                 <el-table :data="loginLogs" stripe v-loading="loading">
-                    <el-table-column prop="timestamp" label="时间" width="200" />
-                    <el-table-column prop="user_name" label="用户" width="150" />
-                    <el-table-column prop="ip_address" label="IP 地址" width="150" />
-                    <el-table-column label="状态">
+                    <el-table-column prop="timestamp" label="时间" width="200">
+                        <template #default="scope">
+                            {{ new Date(scope.row.timestamp).toLocaleString() }}
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="user_name" label="用户" width="120" />
+                    <el-table-column prop="ip_address" label="IP 地址" width="140" />
+                    <el-table-column prop="user_agent" label="设备信息" min-width="180">
+                         <template #default="scope">
+                             <span class="text-xs text-gray-500 break-words">{{ scope.row.user_agent || 'Unknown' }}</span>
+                         </template>
+                    </el-table-column>
+                    <el-table-column label="状态" width="100">
                         <template #default="scope">
                             <el-tag :type="scope.row.status === 'success' ? 'success' : 'danger'">
                                 {{ scope.row.status }}
