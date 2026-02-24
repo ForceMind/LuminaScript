@@ -19,7 +19,21 @@ import {
   ArrowDown
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { marked } from 'marked'
 import AdminDashboard from './components/AdminDashboard.vue'
+
+// Setup marked options if needed (optional)
+// marked.use({...})
+
+const renderMarkdown = (text: string) => {
+    if (!text) return ''
+    try {
+        return marked.parse(text)
+    } catch (e) {
+        console.error("Markdown parse error:", e)
+        return text
+    }
+}
 
 // --- State ---
 const token = ref(localStorage.getItem('token') || '')
@@ -423,14 +437,14 @@ const keySettingsOrder = [
     'protagonist_core', 'antagonist_obstacle', 'central_conflict',
     'visual_style', 'target_audience', 
     'episode_count', 'episode_duration', 'movie_duration', 'scene_count_target',
-    'plot_details', 'story_expansion', 'user_notes',
-    'final_confirm'
+    'plot_details', 'story_expansion', 'user_notes'
 ]
 
 const sortedContext = computed(() => {
     if (!currentProject.value?.global_context) return []
     const ctx = currentProject.value.global_context
-    const keys = Object.keys(ctx).filter(k => !['logline', 'character_details', 'project_type'].includes(k))
+    // Filter out internal keys like final_confirm, logline, etc.
+    const keys = Object.keys(ctx).filter(k => !['logline', 'character_details', 'project_type', 'final_confirm', 'next_step_cache'].includes(k))
     
     // Sort logic
     return keys.sort((a, b) => {
@@ -703,9 +717,9 @@ const copyText = (text: string) => {
                             </div>
 
                             <!-- Context Summary (For Final Confirmation Step) -->
-                            <div v-if="interaction.context_summary" class="mb-6 p-4 bg-gray-50 rounded-xl border border-gray-100 text-sm whitespace-pre-wrap text-gray-600 max-h-64 overflow-y-auto">
+                            <div v-if="interaction.context_summary" class="mb-6 p-4 bg-gray-50 rounded-xl border border-gray-100 text-sm max-h-64 overflow-y-auto prose prose-sm max-w-none text-gray-600">
                                 <div class="font-bold text-gray-400 mb-2 uppercase text-xs">剧本设定汇总</div>
-                                {{ interaction.context_summary }}
+                                <div v-html="renderMarkdown(interaction.context_summary)"></div>
                             </div>
 
                             <!-- Loading Overlay for Interaction -->
@@ -801,15 +815,36 @@ const copyText = (text: string) => {
                              <el-tabs>
                                 <el-tab-pane label="剧情大纲">
                                     <div class="space-y-4">
-                                        <div v-for="s in currentProject.scenes" :key="'out-'+s.id" class="flex gap-4 p-3 rounded hover:bg-gray-50">
-                                            <div class="font-bold text-gray-400 w-12 shrink-0">#{{ s.scene_index }}</div>
-                                            <div class="text-sm text-gray-700">{{ s.outline }}</div>
-                                        </div>
+                                        <el-collapse accordion>
+                                            <el-collapse-item v-for="s in currentProject.scenes" :key="'out-'+s.id" :name="s.id">
+                                                <template #title>
+                                                    <div class="flex items-center gap-4 w-full px-2">
+                                                        <span class="font-bold text-gray-400 shrink-0">#{{ s.scene_index }}</span>
+                                                        <span class="text-sm text-gray-700 truncate mr-4">{{ s.outline }}</span>
+                                                    </div>
+                                                </template>
+                                                <div class="px-4 py-2 text-sm text-gray-600 leading-relaxed bg-gray-50 rounded">
+                                                    {{ s.outline }}
+                                                </div>
+                                            </el-collapse-item>
+                                        </el-collapse>
                                     </div>
                                 </el-tab-pane>
                                 <el-tab-pane label="人物设定">
-                                    <div v-if="currentProject.global_context?.character_details" class="whitespace-pre-wrap text-sm text-gray-600 leading-relaxed p-2">
-                                        {{ currentProject.global_context.character_details }}
+                                    <div v-if="currentProject.global_context?.character_details" class="p-2">
+                                        <!-- Attempt to parse list format if present -->
+                                        <div v-if="currentProject.global_context.character_details.includes('\n-')" class="space-y-3">
+                                            <div v-for="(line, idx) in currentProject.global_context.character_details.split('\n')" :key="idx">
+                                                <div v-if="line.trim().startsWith('-')" class="bg-gray-50 p-3 rounded-lg border border-gray-100 shadow-sm flex gap-3">
+                                                    <div class="w-1 h-full bg-blue-400 rounded-full shrink-0 mt-1"></div>
+                                                    <div class="text-sm text-gray-700 leading-relaxed prose prose-sm max-w-none" v-html="renderMarkdown(line.replace(/^-/, '').trim())"></div>
+                                                </div>
+                                                <div v-else-if="line.trim()" class="text-xs font-bold text-gray-400 uppercase mt-4 mb-1 pl-1">
+                                                     {{ line.trim().replace(/:$/, '') }}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div v-else class="text-sm text-gray-600 leading-relaxed prose prose-sm max-w-none" v-html="renderMarkdown(currentProject.global_context.character_details)"></div>
                                     </div>
                                     <div v-else class="text-gray-400 text-sm text-center py-4">暂无详细人物设定</div>
                                 </el-tab-pane>
@@ -821,12 +856,12 @@ const copyText = (text: string) => {
                                                 <el-button type="primary" link size="small" @click="copyText(currentProject.global_context.logline)">复制</el-button>
                                             </div>
                                             <div class="bg-gray-50 p-3 rounded border border-gray-100 whitespace-pre-wrap cursor-pointer hover:bg-gray-100 transition" @click="copyText(currentProject.global_context.logline)">
-                                                {{ currentProject.logline }}
+                                                {{ currentProject.global_context.logline }}
                                             </div>
                                         </div>
                                         <div v-for="item in sortedContext" :key="item.key">
-                                            <div class="font-bold text-gray-500 mb-1 capitalize">
-                                                {{ 
+                                            <div class="font-bold text-gray-500 mb-1 capitalize flex items-center justify-between">
+                                                <span>{{ 
                                                     item.key === 'tone' ? '基调' : 
                                                     item.key === 'time_period' ? '时代背景' : 
                                                     item.key === 'title' ? '标题' : 
@@ -845,13 +880,23 @@ const copyText = (text: string) => {
                                                     item.key === 'character_details' ? '角色设定' :
                                                     item.key === 'user_notes' ? '补充说明' :
                                                     item.key 
-                                                }}
+                                                }}</span>
+                                                <el-button link size="small" :icon="Document" @click="copyText(item.value)"></el-button>
                                             </div>
-                                            <el-popover placement="top" :width="300" trigger="hover">
+                                            
+                                            <el-popover placement="top" :width="400" trigger="click">
                                                 <template #reference>
-                                                    <div class="bg-gray-50 p-2 rounded truncate cursor-pointer" :title="item.value">{{ item.value }}</div>
+                                                    <div class="bg-gray-50 p-2 rounded truncate cursor-pointer hover:bg-blue-50 transition border border-transparent hover:border-blue-100" :title="item.value">
+                                                        {{ item.value }}
+                                                    </div>
                                                 </template>
-                                                <div class="whitespace-pre-wrap">{{ item.value }}</div>
+                                                <div class="p-2">
+                                                    <h4 class="font-bold text-gray-700 mb-2 border-b pb-1">详细内容</h4>
+                                                    <div class="prose prose-sm text-sm text-gray-600 max-h-60 overflow-y-auto custom-scrollbar" v-html="renderMarkdown(item.value)"></div>
+                                                    <div class="mt-2 text-right">
+                                                        <el-button size="small" type="primary" plain @click="copyText(item.value)">复制全文</el-button>
+                                                    </div>
+                                                </div>
                                             </el-popover>
                                         </div>
                                     </div>
