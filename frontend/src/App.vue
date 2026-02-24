@@ -128,10 +128,20 @@ const fetchProjects = async () => {
     try {
         const res = await api.get('/projects/')
         projectList.value = res.data
-        // Update current project view if active
+        // Update current project status if active (Incremental only)
         if (currentProject.value) {
              const found = projectList.value.find(p => p.id === currentProject.value.id)
-             if (found) currentProject.value = found
+             if (found) {
+                 // Only update generation-critical fields to avoid UI reset
+                 if (found.status !== currentProject.value.status) currentProject.value.status = found.status
+                 if (found.total_tokens !== currentProject.value.total_tokens) currentProject.value.total_tokens = found.total_tokens
+                 
+                 // For scenes, we do a careful check before replacement to avoid jitter
+                 // However, since scenes are nested, we rely on backend sending them.
+                 if (found.scenes && JSON.stringify(found.scenes) !== JSON.stringify(currentProject.value.scenes)) {
+                     currentProject.value.scenes = found.scenes
+                 }
+             }
         }
     } catch (e: any) { 
         if (e.response && e.response.status === 401) return
@@ -301,11 +311,28 @@ const handleOptionSelect = (opt: any) => {
     customInput.value = '' // clear manual input
 }
 
-const loadProject = (p: any) => {
+const loadProject = async (p: any) => {
+    // Prevent accidental switch if generating
+    if (currentProject.value && currentProject.value.status === 'generating' && currentProject.value.id !== p.id) {
+        try {
+            await ElMessageBox.confirm(
+                '当前创意正在生成中，切换项目您将无法实时看到生成进度（任务会在后台继续）。确定要切换吗？',
+                '确认切换',
+                { confirmButtonText: '切换', cancelButtonText: '取消', type: 'warning' }
+            )
+        } catch {
+            return
+        }
+    }
+    
     currentProject.value = p
     drawerOpen.value = false 
+    interaction.value = null
+    
     // Always check state/resume flow
-    if (p.status !== 'completed' && p.status !== 'failed') {
+    if (p.status === 'generating') {
+        loading.value = false // Allow viewing generated content
+    } else if (p.status !== 'completed' && p.status !== 'failed') {
         loading.value = true;
         loadingText.value = "正在恢复进度...";
         analyzeLogline(p.id)
@@ -848,8 +875,9 @@ const copyText = (text: string) => {
                             
                             <!-- Content -->
                             <div class="p-6">
-                                <p class="text-sm text-gray-500 mb-4 bg-yellow-50 p-2 rounded border border-yellow-100">
-                                    <span class="font-bold">梗概：</span> {{ scene.outline }}
+                                <!-- Hide outline if content is generated to avoid redundancy, user can check tabs for full outline -->
+                                <p v-if="!scene.content" class="text-sm text-gray-500 mb-4 bg-yellow-50 p-2 rounded border border-yellow-100">
+                                    <span class="font-bold">本场目标：</span> {{ scene.outline }}
                                 </p>
                                 <div v-if="scene.content" class="whitespace-pre-wrap font-serif leading-relaxed text-slate-800">
                                     {{ scene.content }}

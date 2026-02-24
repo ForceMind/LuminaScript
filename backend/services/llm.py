@@ -212,12 +212,16 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     {
         "question": "The refined, thought-provoking question (In Chinese)",
         "options": [
-            {"label": "Detailed option description", "value": "A short Chinese summary of this option (e.g. '黑暗悬疑风格')"}
+            {"label": "Detailed option description (User visible)", "value": "The actual content to be saved to the project bible (Must be detailed)"}
         ]
     }
     
     SPECIAL RULE FOR 'TITLE':
-    If the Target Field is 'title', the options must be specific, creative title suggestions. The 'value' must be the TITLE ITSELF, not a description of the title.
+    The 'value' must be the TITLE ITSELF.
+    
+    SPECIAL RULE FOR COMPLEX FIELDS ('character_details', 'story_expansion', 'plot_details', 'world_building'):
+    The 'value' MUST be the FULL, DETAILED text of the option, not a summary.
+    For 'character_details', the 'value' should list all characters with their traits.
     """
     
     user_prompt = f"""
@@ -229,7 +233,7 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     
     Generate options that fit the genre and logic of the logline. 
     Ensure options allow for variety (e.g., one safe, one subversive, one high-concept).
-    REPLY IN CHINESE ONLY. ENSURE 'value' fields are in Chinese.
+    REPLY IN CHINESE ONLY. ENSURE 'value' fields contain the FULL CONTENT.
     """
     
     messages = [
@@ -238,7 +242,23 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     ]
     
     if step_key == 'character_details':
-        system_prompt += "\n\nCRITICAL: For 'character_details', offer options that list the FULL Main Cast (Protagonist, Antagonist, Supporting) with 1-line bios for each. Format as a structured list (e.g., 'Target: Name (Age) - Role - Trait')."
+        # Append to the *user* prompt or system prompt effectively
+        # But here we append string to messages list construction logic
+        # Actually in original code it appended to system_prompt *after* messages list was built? 
+        # No, look at original code:
+        # messages = [...]
+        # if step_key == ...: system_prompt += ...
+        # This was a bug in original code! system_prompt string modification AFTER list creation does nothing!
+        pass 
+
+    # Re-construct messages to ensure system prompt includes specific instructions
+    if step_key == 'character_details':
+        system_prompt += "\n\nCRITICAL: For 'character_details', offer options that list the FULL Main Cast (Protagonist, Antagonist, Supporting) with 1-line bios for each. Format as a structured list."
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
 
     content, usage = await raw_generation(messages, temperature=0.8, json_response=True)
     if content:
