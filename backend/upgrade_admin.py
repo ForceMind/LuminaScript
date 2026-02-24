@@ -40,6 +40,13 @@ def upgrade_schema():
     except sqlite3.OperationalError:
         print("Adding 'user_agent' column to login_logs table...")
         cursor.execute("ALTER TABLE login_logs ADD COLUMN user_agent VARCHAR")
+        
+    # 2.2 Add location to login_logs if missing
+    try:
+        cursor.execute("SELECT location FROM login_logs LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Adding 'location' column to login_logs table...")
+        cursor.execute("ALTER TABLE login_logs ADD COLUMN location VARCHAR")
     
     print("Checked 'login_logs' table.")
 
