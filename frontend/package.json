@@ -14,9 +14,11 @@
     "element-plus": "^2.5.0",
     "express": "^5.2.1",
     "http-proxy-middleware": "^3.0.5",
+    "marked": "^17.0.3",
     "vue": "^3.4.0"
   },
   "devDependencies": {
+    "@types/marked": "^5.0.2",
     "@types/node": "^20.0.0",
     "@vitejs/plugin-vue": "^5.0.0",
     "autoprefixer": "^10.4.0",
