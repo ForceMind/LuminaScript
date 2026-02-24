@@ -560,7 +560,7 @@ async def analyze_logline(
                 "context_summary": summary_text,
                 "options": [
                     {"label": "✅ 确定并开始生成", "value": "confirmed"},
-                    {"label": "🔄 我想修改一些内容", "value": "reset"}
+                    {"label": "🔄 重新设定 (清空当前设定重头开始)", "value": "reset"}
                 ]
             })
         }

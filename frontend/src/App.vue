@@ -449,12 +449,35 @@ const sortedContext = computed(() => {
 
 const copyText = (text: string) => {
     if (!text) return
-    if (navigator.clipboard) {
+    
+    // Fallback for secure context issues or older mobiles
+    const unsecuredCopyToClipboard = (val: string) => {
+        const textArea = document.createElement("textarea");
+        textArea.value = val;
+        // Ensure not visible but part of DOM
+        textArea.style.position = "absolute"; 
+        textArea.style.left = "-9999px"; 
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        try {
+            document.execCommand('copy');
+            ElMessage.success('已复制')
+        } catch (err) {
+            console.error('Unable to copy', err);
+            ElMessage.error('复制失败，请长按手动复制')
+        }
+        document.body.removeChild(textArea);
+    }
+
+    if (navigator.clipboard && window.isSecureContext) {
         navigator.clipboard.writeText(text).then(() => {
             ElMessage.success('已复制')
-        }).catch(() => ElMessage.error('复制失败'))
+        }).catch(() => {
+            unsecuredCopyToClipboard(text)
+        })
     } else {
-        ElMessage.warning('浏览器不支持自动复制')
+        unsecuredCopyToClipboard(text)
     }
 }
 </script>
