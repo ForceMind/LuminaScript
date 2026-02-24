@@ -55,6 +55,18 @@ import asyncio
 async def on_startup():
     logger.info("服务器正在启动...")
     await init_db()
+    
+    # Run Schema Upgrade Logic directly on startup to ensure DB is current
+    try:
+        logger.info("Running database schema upgrade check...")
+        import upgrade_admin
+        # Run in threadpool to avoid blocking event loop too much
+        # But for startup, blocking is acceptable or use run_in_executor
+        await asyncio.to_thread(upgrade_admin.upgrade_schema)
+        logger.info("Database schema upgrade check complete.")
+    except Exception as e:
+        logger.error(f"Failed to run schema upgrade: {e}")
+        
     logger.info("数据库初始化完成，服务准备就绪。")
 
 @app.get("/")
