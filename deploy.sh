@@ -123,26 +123,41 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
 
 # ================= 3. 配置文件 (.env) =================
-if [ ! -f "$ENV_FILE" ]; then
-    echo -e "${YELLOW}[配置] 检测到首次运行 (或缺少 .env)，请配置 AI 服务信息:${NC}"
+WANT_ENV="y"
+if [ -f "$ENV_FILE" ]; then
+    echo -e "${YELLOW}检测到现有配置文件 (.env)${NC}"
+    read -p "是否需要重新配置 AI 服务信息? [y/N] " WANT_ENV
+fi
+
+if [[ "$WANT_ENV" =~ ^[Yy]$ ]]; then
+    echo -e "${YELLOW}[配置] 请配置 AI 服务信息:${NC}"
     read -p "请输入 LLM API Key (回车使用默认占位符): " INPUT_KEY
+    read -p "请输入 LLM Base URL (回车使用默认: https://maas-api.cn-huabei-1.xf-yun.com/v2): " INPUT_URL
+    read -p "请输入 LLM 模型 ID (回车使用默认: xopglm47blth2): " INPUT_MODEL
     
-    # Default values suitable for the user's previous context (Xunfei/Spark)
     if [ -z "$INPUT_KEY" ]; then
         INPUT_KEY="your_key_here"
-        echo "未输入 Key，将使用默认占位符。后续请手动编辑 backend/.env 修改。"
+        echo "未输入 Key，将使用默认占位符。后续您可以重新运行部署脚本修改。"
+    fi
+    
+    if [ -z "$INPUT_URL" ]; then
+        INPUT_URL="https://maas-api.cn-huabei-1.xf-yun.com/v2"
+    fi
+    
+    if [ -z "$INPUT_MODEL" ]; then
+        INPUT_MODEL="xopglm47blth2"
     fi
 
     cat > "$ENV_FILE" <<EOF
 DATABASE_URL=sqlite+aiosqlite:///./lumina_v2.db
 LLM_PROVIDER=openai
 LLM_API_KEY=$INPUT_KEY
-LLM_BASE_URL=https://maas-api.cn-huabei-1.xf-yun.com/v2
-LLM_MODEL_ID=xopglm47blth2
+LLM_BASE_URL=$INPUT_URL
+LLM_MODEL_ID=$INPUT_MODEL
 EOF
-    echo -e "${GREEN}配置文件已生成: $ENV_FILE${NC}"
+    echo -e "${GREEN}配置文件 (.env) 已生成或更新。${NC}"
 else
-    echo "检测到现有配置文件 (.env)，跳过配置。"
+    echo "跳过重新配置，保留现有环境配置。"
 fi
 
 # ================= 3.1 管理员账户配置 =================
