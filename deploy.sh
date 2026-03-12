@@ -52,47 +52,71 @@ fi
 echo -e "${YELLOW}[1/6] 检查并安装系统依赖 (Python & Node.js)...${NC}"
 
 OS="Unknown"
+OS_ID=""
+OS_LIKE=""
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    OS=$NAME
+    OS="${NAME:-Unknown}"
+    OS_ID=$(echo "${ID:-}" | tr '[:upper:]' '[:lower:]')
+    OS_LIKE=$(echo "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')
 fi
 echo "当前系统: $OS"
+echo "ID=$OS_ID, ID_LIKE=$OS_LIKE"
 
-install_系统软件() {
-    if [[ "$OS" == *"Alibaba"* ]] || [[ "$OS" == *"CentOS"* ]] || [[ "$OS" == *"Red Hat"* ]]; then
-        # 安装 Node.js 18.x 源
-        if ! command -v node > /dev/null; then
-            echo "添加 Node.js 源..."
-            curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
-        fi
-        
-        sudo yum install -y epel-release 2>/dev/null
-        # 尝试 dnf 或 yum
+get_node_major() {
+    if ! command -v node > /dev/null; then
+        echo 0
+        return
+    fi
+    node -v | sed -E 's/^v([0-9]+).*/\1/'
+}
+
+install_system_packages() {
+    if [[ "$OS_ID" =~ (opencloudos|alinux|centos|rhel|rocky|almalinux|anolis|ol|fedora) ]] || [[ "$OS_LIKE" == *"rhel"* ]] || [[ "$OS_LIKE" == *"fedora"* ]]; then
         PKG_MGR="yum"
         if command -v dnf > /dev/null; then PKG_MGR="dnf"; fi
-        
-        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs lsof
-    elif [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
-        # 安装 Node.js 18.x 源
-        if ! command -v node > /dev/null; then
-             curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+
+        NODE_MAJOR=$(get_node_major)
+        if [ "$NODE_MAJOR" -lt 18 ] || ! command -v npm > /dev/null; then
+            echo "配置 NodeSource Node.js 18.x 仓库..."
+            curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo -E bash -
         fi
+
+        sudo $PKG_MGR install -y epel-release 2>/dev/null || true
+        sudo $PKG_MGR makecache -y 2>/dev/null || true
+        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs lsof
+
+    elif [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]] || [[ "$OS_LIKE" == *"debian"* ]]; then
+        NODE_MAJOR=$(get_node_major)
+        if [ "$NODE_MAJOR" -lt 18 ] || ! command -v npm > /dev/null; then
+            echo "配置 NodeSource Node.js 18.x 仓库..."
+            curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+        fi
+
         sudo apt update -qq
         sudo apt install -y python3 python3-pip python3-venv git nginx bc nodejs lsof -qq
+    else
+        echo -e "${RED}不支持的系统: $OS${NC}"
+        echo "请手动安装: git nginx python3(>=3.10) nodejs(>=18) npm lsof bc"
+        exit 1
     fi
 }
 
-install_系统软件
+install_system_packages
 
-# 验证 Node.js
+# 校验 Node.js (Vite 5 需要 >= 18)
 if command -v node > /dev/null && command -v npm > /dev/null; then
     NODE_VER=$(node -v)
+    NODE_MAJOR=$(get_node_major)
+    if [ "$NODE_MAJOR" -lt 18 ]; then
+        echo -e "${RED}Node.js 版本过低: $NODE_VER (需要 >= 18)${NC}"
+        exit 1
+    fi
     echo -e "${GREEN}Node.js 已就绪: $NODE_VER${NC}"
 else
     echo -e "${RED}Node.js 安装失败，前端无法构建。${NC}"
     exit 1
 fi
-
 # ================= 2. Python 环境配置 =================
 echo -e "${YELLOW}[2/6] 配置 Python 环境...${NC}"
 
