@@ -79,12 +79,22 @@ install_system_packages() {
         NODE_MAJOR=$(get_node_major)
         if [ "$NODE_MAJOR" -lt 18 ] || ! command -v npm > /dev/null; then
             echo "配置 NodeSource Node.js 18.x 仓库..."
-            curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo -E bash -
+            if ! curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo -E bash -; then
+                echo "NodeSource script unsupported here, fallback to distro repo."
+            fi
         fi
 
-        sudo $PKG_MGR install -y epel-release 2>/dev/null || true
         sudo $PKG_MGR makecache -y 2>/dev/null || true
-        sudo $PKG_MGR install -y git nginx python3.11 python3.11-pip python3.11-devel bc nodejs lsof
+        sudo $PKG_MGR install -y git nginx python3 python3-pip bc lsof
+        sudo $PKG_MGR install -y python3-devel 2>/dev/null || sudo $PKG_MGR install -y python3.11-devel 2>/dev/null || true
+        sudo $PKG_MGR install -y nodejs npm 2>/dev/null || sudo $PKG_MGR install -y nodejs 2>/dev/null || true
+        if ! command -v node > /dev/null; then
+            sudo $PKG_MGR module -y enable nodejs:18 2>/dev/null || true
+            sudo $PKG_MGR install -y nodejs npm 2>/dev/null || sudo $PKG_MGR install -y nodejs 2>/dev/null || true
+        fi
+        if ! command -v node > /dev/null && command -v nodejs > /dev/null; then
+            sudo ln -sf "$(command -v nodejs)" /usr/local/bin/node || true
+        fi
 
     elif [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]] || [[ "$OS_LIKE" == *"debian"* ]]; then
         NODE_MAJOR=$(get_node_major)
