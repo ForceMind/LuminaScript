@@ -297,6 +297,7 @@ async def list_projects(
     result = await db.execute(
         select(models.Project)
         .where(models.Project.owner_id == current_user.id)
+        .order_by(models.Project.id.desc())
         .options(selectinload(models.Project.scenes))
     )
     return result.scalars().all()
@@ -346,6 +347,25 @@ async def update_project(
 class InteractionRequest(BaseModel):
     answer: str
     context_key: str
+
+class ContentReviewRequest(BaseModel):
+    text: str
+
+@app.post("/content/review")
+async def review_content(
+    payload: ContentReviewRequest,
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    """
+    Review free user text and return whether it should be rewritten,
+    plus an AI-generated safe rewrite suggestion.
+    """
+    try:
+        result = await llm.review_user_input(payload.text)
+        return result
+    except Exception as e:
+        logger.error(f"Content review failed: {e}")
+        raise HTTPException(status_code=503, detail="Content review service unavailable")
 
 @app.post("/projects/{project_id}/interact")
 async def submit_interaction(

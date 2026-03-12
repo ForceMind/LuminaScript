@@ -39,3 +39,52 @@ body {
   margin-top: 1em;
   margin-bottom: 0.5em;
 }
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 0.75em;
+  font-size: 0.9em;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid #dbe4f0;
+  padding: 0.45em 0.6em;
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose th {
+  background-color: #f8fafc;
+  font-weight: 600;
+}
+
+.prose code {
+  background: #f1f5f9;
+  color: #334155;
+  border-radius: 4px;
+  padding: 0.1em 0.3em;
+}
+
+.prose pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75em;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin-bottom: 0.75em;
+}
+
+.prose pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.prose blockquote {
+  border-left: 3px solid #cbd5e1;
+  margin: 0.75em 0;
+  padding: 0.25em 0 0.25em 0.75em;
+  color: #64748b;
+}

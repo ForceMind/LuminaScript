@@ -2,6 +2,7 @@ from openai import AsyncOpenAI
 import os
 import json
 import logging
+import re
 
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -30,6 +31,35 @@ client = AsyncOpenAI(
 # We initialize it lazily or at module level if we are in an event loop, 
 # but safely we can use a bounded semaphore.
 _sem = asyncio.Semaphore(20)
+
+_PORN_PATTERNS = [
+    r'色情', r'裸聊', r'约炮', r'性奴', r'乱伦', r'援交',
+    r'porn', r'nsfw', r'sex', r'nude', r'erotic'
+]
+
+_HARMFUL_VALUE_PATTERNS = [
+    r'仇恨', r'种族清洗', r'纳粹', r'极端主义', r'恐怖袭击',
+    r'歧视', r'虐杀', r'教唆犯罪', r'鼓吹暴力', r'辱女', r'辱童',
+    r'hate speech', r'terror', r'extremist', r'racist'
+]
+
+def _contains_any_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+def _fallback_rewrite(text: str, categories: list[str]) -> str:
+    rewritten = text
+    if "色情信息" in categories:
+        for p in _PORN_PATTERNS:
+            rewritten = re.sub(p, "情感冲突", rewritten, flags=re.IGNORECASE)
+    if "价值观风险" in categories:
+        for p in _HARMFUL_VALUE_PATTERNS:
+            rewritten = re.sub(p, "价值冲突", rewritten, flags=re.IGNORECASE)
+    if rewritten.strip() == text.strip():
+        rewritten = (
+            "请将该创意调整为积极、健康、合规的剧情方向，"
+            "保留核心冲突但避免色情和极端价值表达。"
+        )
+    return rewritten
 
 @retry(
     stop=stop_after_attempt(3),
@@ -78,6 +108,98 @@ async def raw_generation(messages, temperature=0.7, json_response=False):
                 logger.error(f"💡 提示: 404 错误通常意味着 Base URL ({BASE_URL}) 不正确或模型 ID ({MODEL_ID}) 错误。")
             
             raise e # Raise to trigger retry
+
+async def review_user_input(text: str):
+    """
+    Review user input for policy risks and produce a safe rewrite suggestion.
+    Returns:
+    {
+        "flagged": bool,
+        "categories": [str],
+        "reason": str,
+        "suggested_rewrite": str
+    }
+    """
+    raw_text = (text or "").strip()
+    if not raw_text:
+        return {
+            "flagged": False,
+            "categories": [],
+            "reason": "",
+            "suggested_rewrite": ""
+        }
+
+    categories = []
+    if _contains_any_pattern(raw_text, _PORN_PATTERNS):
+        categories.append("色情信息")
+    if _contains_any_pattern(raw_text, _HARMFUL_VALUE_PATTERNS):
+        categories.append("价值观风险")
+
+    # Fast path for clearly safe text to avoid extra latency and token cost.
+    if not categories:
+        return {
+            "flagged": False,
+            "categories": [],
+            "reason": "",
+            "suggested_rewrite": ""
+        }
+
+    system_prompt = """
+    你是内容审核与改写助手。请判断用户文本是否包含：
+    1) 色情、露骨性暗示
+    2) 极端、歧视、仇恨、鼓吹违法暴力等价值观风险
+
+    如果存在风险，请给出保持创意核心但健康合规的改写版本。
+    必须返回 JSON，且只有 JSON：
+    {
+      "flagged": true,
+      "categories": ["色情信息" 或 "价值观风险" 的数组],
+      "reason": "一句简短说明",
+      "suggested_rewrite": "改写后的文本"
+    }
+    """
+    user_prompt = f"待审核文本：\n{raw_text}"
+
+    try:
+        content, _ = await raw_generation(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2,
+            json_response=True
+        )
+        if content:
+            parsed = json.loads(content)
+            llm_flagged = bool(parsed.get("flagged", False))
+            llm_categories = parsed.get("categories") or categories
+            if isinstance(llm_categories, str):
+                llm_categories = [llm_categories]
+            llm_reason = str(parsed.get("reason", "") or "").strip()
+            llm_suggestion = str(parsed.get("suggested_rewrite", "") or "").strip()
+
+            # Be conservative: if rule-based checks flagged it, keep flagged=true.
+            flagged = llm_flagged or bool(categories)
+            final_categories = list(dict.fromkeys((categories or []) + (llm_categories or [])))
+
+            if not llm_suggestion:
+                llm_suggestion = _fallback_rewrite(raw_text, final_categories)
+
+            return {
+                "flagged": flagged,
+                "categories": final_categories,
+                "reason": llm_reason or "检测到潜在不当内容，建议改写为健康合规表达。",
+                "suggested_rewrite": llm_suggestion
+            }
+    except Exception as e:
+        logger.warning(f"review_user_input fallback due to LLM error: {e}")
+
+    return {
+        "flagged": True,
+        "categories": categories,
+        "reason": "检测到潜在不当内容，建议改写为健康合规表达。",
+        "suggested_rewrite": _fallback_rewrite(raw_text, categories)
+    }
 
 async def analyze_script_requirements(logline: str, project_type: str="movie"):
     """

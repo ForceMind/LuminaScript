@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 import axios from 'axios'
 import {
   Document,
@@ -22,13 +22,33 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import AdminDashboard from './components/AdminDashboard.vue'
 
-// Setup marked options if needed (optional)
-// marked.use({...})
+marked.setOptions({ gfm: true, breaks: true })
 
-const renderMarkdown = (text: string) => {
+const toTextValue = (value: unknown): string => {
+    if (value === null || value === undefined) return ''
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    try {
+        return JSON.stringify(value, null, 2)
+    } catch {
+        return String(value)
+    }
+}
+
+const escapeHtml = (text: string) => {
+    return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;')
+}
+
+const renderMarkdown = (value: unknown) => {
+    const text = toTextValue(value)
     if (!text) return ''
     try {
-        return marked.parse(text)
+        return marked.parse(text) as string
     } catch (e) {
         console.error("Markdown parse error:", e)
         return text
@@ -68,6 +88,58 @@ const progressPercentage = computed(() => {
     return Math.floor((completed / total) * 100)
 })
 
+const sortedProjectList = computed(() => {
+    return [...projectList.value].sort((a, b) => (Number(b?.id) || 0) - (Number(a?.id) || 0))
+})
+
+const getProjectDisplayText = (project: any) => {
+    const raw = (project?.title || project?.logline || '').trim()
+    if (!raw) return 'Untitled'
+    return raw.length > 24 ? `${raw.slice(0, 24)}...` : raw
+}
+
+const getProjectTooltipText = (project: any) => {
+    return (project?.title || project?.logline || '').trim()
+}
+
+const storySynopsis = computed(() => {
+    if (!currentProject.value) {
+        return { brief: '', detailed: '' }
+    }
+
+    const context = currentProject.value.global_context || {}
+    const brief = toTextValue(
+        context.synopsis_brief ||
+        context.brief_synopsis ||
+        context.story_brief ||
+        context.logline ||
+        currentProject.value.logline ||
+        ''
+    )
+
+    let detailed = toTextValue(
+        context.synopsis_detailed ||
+        context.detailed_synopsis ||
+        context.story_detailed ||
+        context.story_expansion ||
+        context.plot_details ||
+        ''
+    )
+
+    if (!detailed) {
+        const sceneOutlines = (currentProject.value.scenes || [])
+            .map((scene: any) => scene?.outline)
+            .filter(Boolean)
+        if (sceneOutlines.length > 0) {
+            detailed = sceneOutlines
+                .map((outline: string, index: number) => `${index + 1}. ${outline}`)
+                .join('\n')
+        }
+    }
+
+    return { brief, detailed }
+})
+
 // --- API Client ---
 const api = axios.create({ baseURL: '/api' })
 
@@ -88,6 +160,54 @@ api.interceptors.response.use(
     return Promise.reject(error)
   }
 )
+
+const reviewAndMaybeRewriteInput = async (rawInput: string, sourceLabel: string) => {
+    const text = (rawInput || '').trim()
+    if (!text) return text
+
+    try {
+        const res = await api.post('/content/review', { text })
+        const review = res.data || {}
+        if (!review.flagged) return text
+
+        const categoryText = Array.isArray(review.categories) && review.categories.length > 0
+            ? review.categories.join('、')
+            : '不当内容'
+        const suggestedText = toTextValue(
+            review.suggested_rewrite || review.suggested_text || ''
+        ).trim()
+        const reasonText = toTextValue(review.reason || '')
+
+        let content = `<p>检测到${escapeHtml(sourceLabel)}中可能包含“${escapeHtml(categoryText)}”。是否使用 AI 改写版本？</p>`
+        if (reasonText) {
+            content += `<p style="margin-top:8px;color:#6b7280;">${escapeHtml(reasonText)}</p>`
+        }
+        if (suggestedText) {
+            content += `<div style="margin-top:12px;padding:10px;border:1px solid #dbeafe;background:#eff6ff;border-radius:8px;color:#1f2937;white-space:pre-wrap;">${escapeHtml(suggestedText)}</div>`
+        } else {
+            content += '<p style="margin-top:8px;color:#9ca3af;">当前未生成改写内容，点击“保留原文”可继续。</p>'
+        }
+
+        try {
+            await ElMessageBox.confirm(content, '内容合规提示', {
+                confirmButtonText: '使用 AI 改写',
+                cancelButtonText: '保留原文',
+                type: 'warning',
+                dangerouslyUseHTMLString: true
+            })
+            if (suggestedText) {
+                ElMessage.success('已应用 AI 改写版本')
+                return suggestedText
+            }
+            return text
+        } catch {
+            return text
+        }
+    } catch (e) {
+        console.error('Content review failed', e)
+        return text
+    }
+}
 
 // --- Logic ---
 const handleAuth = async () => {
@@ -201,12 +321,14 @@ const createProject = async () => {
       ElMessage.warning('请输入您的创意')
       return
   }
+  const reviewedLogline = await reviewAndMaybeRewriteInput(logline.value, '用户输入')
+  logline.value = reviewedLogline
   loading.value = true
   loadingText.value = '正在为您构建故事世界...'
   try {
     // 1. Create Project (Logline Only)
     const res = await api.post('/projects/', {
-      logline: logline.value,
+      logline: reviewedLogline,
       title: "创意草稿 " + new Date().toLocaleDateString(),
       project_type: "pending" // Explicitly mark as pending classification
     })
@@ -276,10 +398,16 @@ const analyzeLogline = async (id: number) => {
 const submitChoice = async () => {
     if (!currentProject.value) return
     
-    const finalAnswer = selectedOption.value || customInput.value
+    let finalAnswer = selectedOption.value || customInput.value
     if (!finalAnswer) {
         ElMessage.warning('请选择一个选项或自行输入')
         return
+    }
+
+    // Only review direct user free text, not AI-provided option values.
+    if (!selectedOption.value && customInput.value) {
+        finalAnswer = await reviewAndMaybeRewriteInput(customInput.value, '用户输入')
+        customInput.value = finalAnswer
     }
 
     loading.value = true
@@ -444,7 +572,21 @@ const sortedContext = computed(() => {
     if (!currentProject.value?.global_context) return []
     const ctx = currentProject.value.global_context
     // Filter out internal keys like final_confirm, logline, etc.
-    const keys = Object.keys(ctx).filter(k => !['logline', 'character_details', 'project_type', 'final_confirm', 'next_step_cache'].includes(k))
+    const keys = Object.keys(ctx).filter(
+        k => ![
+            'logline',
+            'character_details',
+            'project_type',
+            'final_confirm',
+            'next_step_cache',
+            'synopsis_brief',
+            'brief_synopsis',
+            'story_brief',
+            'synopsis_detailed',
+            'detailed_synopsis',
+            'story_detailed'
+        ].includes(k)
+    )
     
     // Sort logic
     return keys.sort((a, b) => {
@@ -458,10 +600,11 @@ const sortedContext = computed(() => {
         if (idxB !== -1) return 1
         // Otherwise alphabetical
         return a.localeCompare(b)
-    }).map(k => ({ key: k, value: ctx[k] }))
+    }).map(k => ({ key: k, value: toTextValue(ctx[k]) }))
 })
 
-const copyText = (text: string) => {
+const copyText = (value: unknown) => {
+    const text = toTextValue(value)
     if (!text) return
     
     // Fallback for secure context issues or older mobiles
@@ -566,15 +709,17 @@ const copyText = (text: string) => {
                     <div class="px-4 pb-4">
                         <div class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 px-2">历史记录</div>
                         <ul class="space-y-1">
-                            <li v-for="p in projectList" :key="p.id" 
+                            <li v-for="p in sortedProjectList" :key="p.id" 
                                 @click="loadProject(p)"
                                 class="px-3 py-3 rounded-lg cursor-pointer transition flex items-center gap-3"
                                 :class="currentProject?.id === p.id ? 'bg-blue-50 text-blue-600 font-medium' : 'text-gray-600 hover:bg-gray-50'">
                                 <el-icon><Document /></el-icon>
-                                <span class="truncate text-sm" :title="p.logline">{{ p.title || '无标题创意' }}</span>
+                                <span class="text-sm min-w-0 flex-1 sidebar-item-text" :title="getProjectTooltipText(p)">
+                                    {{ getProjectDisplayText(p) }}
+                                </span>
                             </li>
                         </ul>
-                        <div v-if="projectList.length === 0" class="text-center text-gray-400 text-sm py-8">
+                        <div v-if="sortedProjectList.length === 0" class="text-center text-gray-400 text-sm py-8">
                             暂无历史
                         </div>
                     </div>
@@ -620,13 +765,15 @@ const copyText = (text: string) => {
                             <div class="p-2">
                                 <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
                             </div>
-                            <li v-for="p in projectList" :key="p.id" 
+                            <li v-for="p in sortedProjectList" :key="p.id" 
                                 @click="loadProject(p)"
-                                class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 truncate shadow-sm active:bg-blue-50">
-                                {{ p.title || p.logline }}
+                                class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 shadow-sm active:bg-blue-50">
+                                <div class="sidebar-item-text text-sm" :title="getProjectTooltipText(p)">
+                                    {{ getProjectDisplayText(p) }}
+                                </div>
                             </li>
                         </ul>
-                        <div v-if="projectList.length === 0" class="text-center text-gray-400 text-sm py-8">
+                        <div v-if="sortedProjectList.length === 0" class="text-center text-gray-400 text-sm py-8">
                             暂无历史
                         </div>
                     </div>
@@ -848,6 +995,26 @@ const copyText = (text: string) => {
                                     </div>
                                     <div v-else class="text-gray-400 text-sm text-center py-4">暂无详细人物设定</div>
                                 </el-tab-pane>
+                                <el-tab-pane label="故事梗概">
+                                    <div class="space-y-4 p-2">
+                                        <div class="bg-gray-50 rounded-lg border border-gray-100 p-4">
+                                            <div class="font-bold text-gray-500 mb-2 flex items-center justify-between">
+                                                <span>简要梗概</span>
+                                                <el-button link size="small" :icon="Document" @click="copyText(storySynopsis.brief)"></el-button>
+                                            </div>
+                                            <div v-if="storySynopsis.brief" class="prose prose-sm text-sm text-gray-700 max-w-none" v-html="renderMarkdown(storySynopsis.brief)"></div>
+                                            <div v-else class="text-sm text-gray-400">暂无简要梗概</div>
+                                        </div>
+                                        <div class="bg-gray-50 rounded-lg border border-gray-100 p-4">
+                                            <div class="font-bold text-gray-500 mb-2 flex items-center justify-between">
+                                                <span>详细梗概</span>
+                                                <el-button link size="small" :icon="Document" @click="copyText(storySynopsis.detailed)"></el-button>
+                                            </div>
+                                            <div v-if="storySynopsis.detailed" class="prose prose-sm text-sm text-gray-700 max-w-none max-h-72 overflow-y-auto custom-scrollbar" v-html="renderMarkdown(storySynopsis.detailed)"></div>
+                                            <div v-else class="text-sm text-gray-400">暂无详细梗概</div>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
                                 <el-tab-pane label="关键设定">
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                                         <div v-if="currentProject.global_context?.logline" class="col-span-full">
@@ -886,8 +1053,8 @@ const copyText = (text: string) => {
                                             
                                             <el-popover placement="top" :width="400" trigger="click">
                                                 <template #reference>
-                                                    <div class="bg-gray-50 p-2 rounded truncate cursor-pointer hover:bg-blue-50 transition border border-transparent hover:border-blue-100" :title="item.value">
-                                                        {{ item.value }}
+                                                    <div class="bg-gray-50 p-2 rounded cursor-pointer hover:bg-blue-50 transition border border-transparent hover:border-blue-100 key-setting-preview-wrapper" :title="item.value">
+                                                        <div class="prose prose-sm text-sm text-gray-600 max-w-none key-setting-preview" v-html="renderMarkdown(item.value)"></div>
                                                     </div>
                                                 </template>
                                                 <div class="p-2">
@@ -990,5 +1157,25 @@ const copyText = (text: string) => {
 }
 .animate-fade-in-up {
     animation: fade-in-up 0.6s ease-out forwards;
+}
+.sidebar-item-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-all;
+}
+.key-setting-preview-wrapper {
+    max-height: 4.75rem;
+    overflow: hidden;
+}
+.key-setting-preview {
+    max-height: 4rem;
+    overflow: hidden;
+}
+.key-setting-preview p,
+.key-setting-preview ul,
+.key-setting-preview ol {
+    margin: 0 !important;
 }
 </style>
