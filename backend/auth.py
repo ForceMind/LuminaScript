@@ -8,6 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import User
 from database import get_db
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 # --- Config ---
 # In production, these should be in .env

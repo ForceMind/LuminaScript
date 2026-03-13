@@ -3,13 +3,17 @@ import os
 import json
 import logging
 import re
+from pathlib import Path
 
 import asyncio
+from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Configure Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # Load Config
 API_KEY = os.getenv("LLM_API_KEY")

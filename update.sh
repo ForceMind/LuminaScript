@@ -173,7 +173,9 @@ cd "$PROJECT_DIR"
 
 if [ -x "$VENV_DIR/bin/uvicorn" ]; then
     pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+    cd "$BACKEND_DIR"
     nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port 8000 >> "$PROJECT_DIR/backend.log" 2>&1 &
+    cd "$PROJECT_DIR"
     echo "后端已重启: 8000"
 else
     echo -e "${YELLOW}未找到 uvicorn，已跳过后端重启。${NC}"
