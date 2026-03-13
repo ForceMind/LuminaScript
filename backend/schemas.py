@@ -31,18 +31,21 @@ class ProjectCreate(ProjectBase):
 class ProjectUpdate(BaseModel):
     project_type: Optional[str] = None
 
-class ProjectResponse(ProjectBase):
+class ProjectListResponse(ProjectBase):
     id: int
     genre: Optional[str] = None
     project_type: Optional[str] = "movie"
     global_context: Dict[str, Any] = {}
-    scenes: List[SceneResponse] = []
     owner_id: int
     total_tokens: int = 0
     status: ProcessingStatus = ProcessingStatus.PENDING
 
     class Config:
         from_attributes = True
+
+
+class ProjectResponse(ProjectListResponse):
+    scenes: List[SceneResponse] = []
 
 # --- Auth Schemas ---
 class UserCreate(BaseModel):

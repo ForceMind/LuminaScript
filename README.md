@@ -8,10 +8,10 @@
 
 ## 🛠️ 技术栈
 
-*   **前端**: Vue 3, Vite, Tailwind CSS, Element Plus
-*   **后端**: Python 3.10+, FastAPI, SQLAlchemy (Async)
-*   **数据库**: SQLite (默认) / PostgreSQL
-*   **AI**: OpenAI API / DeepSeek 兼容接口
+* **前端**: Vue 3, Vite, Tailwind CSS, Element Plus
+* **后端**: Python 3.10+, FastAPI, SQLAlchemy (Async)
+* **数据库**: SQLite (默认) / PostgreSQL
+* **AI**: OpenAI API / DeepSeek 兼容接口
 
 ---
 
@@ -22,16 +22,18 @@
 我们提供了一键启动脚本，自动为您准备环境并运行服务。
 
 **前置要求**:
-*   Python 3.10+
-*   Node.js 18+
+
+* Python 3.10+
+* Node.js 18+
 
 **启动步骤**:
-1.  进入项目根目录。
-2.  双击运行 `start.bat`。
-    *   **首次运行**: 脚本会自动生成默认配置 `backend/.env`。请打开该文件填入您的 API Key。
-3.  脚本将自动打开两个服务：
-    *   **后端 API**: 运行在 `http://127.0.0.1:8000`
-    *   **前端 UI**: 运行在 `http://localhost:5173`
+
+1. 进入项目根目录。
+2. 双击运行 `start.bat`。
+   * **首次运行**: 脚本会自动生成默认配置 `backend/.env`。请打开该文件填入您的 API Key。
+3. 脚本将自动打开两个服务：
+   * **后端 API**: 运行在 `http://127.0.0.1:8000`
+   * **前端 UI**: 运行在 `http://localhost:5173`
 
 ### 2. 服务器部署 (Linux)
 
@@ -39,26 +41,34 @@
 脚本 (`deploy.sh`) 支持环境自检、自动端口避让及 Python 版本自动搜索。
 
 **使用方法**:
-1.  将项目上传至服务器。
-2.  赋予脚本执行权限：
-    ```bash
-    chmod +x deploy.sh
-    ```
-3.  运行部署脚本：
-    ```bash
-    ./deploy.sh
-    ```
-    *   **Python 版本自动兼容**: 如果您的系统默认是 Python 3.6，脚本会自动查找已安装的 `python3.8`, `python3.9` 等更高版本来创建虚拟环境，**不会影响系统默认设置**。
-    *   **自动端口选择**: 若默认 8000 端口被占用，将自动尝试 8001, 8002... 并告知您最终端口。
-    *   **灵活构建**: 若服务器未安装 Node.js，脚本会自动跳过前端构建，请确保您已手动上传 `frontend/dist` 目录。
-4.  (可选) 如果脚本提示找不到合适 Python，请安装一个新版（例如在 CentOS 上）：
-    ```bash
-    sudo yum install python39
-    # 之后再次运行 ./deploy.sh 即可
-    ```
 
-    *   **首次运行**: 会提示输入 API 配置。
-    *   移除 PM2 依赖，使用 `nohup` 自动在后台运行后端服务。
+1. 将项目上传至服务器。
+
+2. 赋予脚本执行权限：
+   
+   ```bash
+   chmod +x deploy.sh
+   ```
+
+3. 运行部署脚本：
+   
+   ```bash
+   ./deploy.sh
+   ```
+   
+   * **Python 版本自动兼容**: 如果您的系统默认是 Python 3.6，脚本会自动查找已安装的 `python3.8`, `python3.9` 等更高版本来创建虚拟环境，**不会影响系统默认设置**。
+   * **自动端口选择**: 若默认 8000 端口被占用，将自动尝试 8001, 8002... 并告知您最终端口。
+   * **灵活构建**: 若服务器未安装 Node.js，脚本会自动跳过前端构建，请确保您已手动上传 `frontend/dist` 目录。
+
+4. (可选) 如果脚本提示找不到合适 Python，请安装一个新版（例如在 CentOS 上）：
+   
+   ```bash
+   sudo yum install python39
+   # 之后再次运行 ./deploy.sh 即可
+   ```
+   
+   * **首次运行**: 会提示输入 API 配置。
+   * 移除 PM2 依赖，使用 `nohup` 自动在后台运行后端服务。
 
 ---
 
@@ -78,7 +88,3 @@ LuminaScript/
 ├── deploy.sh           # Linux 部署脚本
 └── README.md           # 项目文档
 ```
-
-## ⚖️ License
-
-MIT License

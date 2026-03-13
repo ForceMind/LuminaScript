@@ -810,7 +810,7 @@ async def create_project(
     )
     return result.scalars().first()
 
-@app.get("/projects/", response_model=List[schemas.ProjectResponse])
+@app.get("/projects/", response_model=List[schemas.ProjectListResponse])
 async def list_projects(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
@@ -819,7 +819,6 @@ async def list_projects(
         select(models.Project)
         .where(models.Project.owner_id == current_user.id)
         .order_by(models.Project.id.desc())
-        .options(selectinload(models.Project.scenes))
     )
     projects = result.scalars().all()
     title_updated = False
@@ -831,6 +830,33 @@ async def list_projects(
         await db.commit()
 
     return projects
+
+
+@app.get("/projects/{project_id}", response_model=schemas.ProjectResponse)
+async def get_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    result = await db.execute(
+        select(models.Project)
+        .where(models.Project.id == project_id)
+        .where(models.Project.owner_id == current_user.id)
+        .options(selectinload(models.Project.scenes))
+    )
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    normalized = False
+    if normalize_project_title(project):
+        normalized = True
+    if normalize_project_context(project):
+        normalized = True
+    if normalized:
+        await db.commit()
+
+    return project
 
 
 @app.delete("/projects/{project_id}")

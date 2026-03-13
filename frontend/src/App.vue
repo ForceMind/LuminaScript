@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import {
   Document,
@@ -77,6 +77,50 @@ const loadingText = ref('AI 正在思考中...')
 const projectList = ref<any[]>([])
 const pollTimer = ref<any>(null)
 const isStarted = ref(false)
+
+const pollRequestInFlight = ref(false)
+const ACTIVE_PROJECT_POLL_INTERVAL_MS = 8000
+const BACKGROUND_LIST_POLL_INTERVAL_MS = 45000
+
+const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible'
+
+const isSceneGenerationActive = (project: any) => {
+    if (!project) return false
+    if (String(project.status || '') === 'generating') return true
+    const scenes = Array.isArray(project.scenes) ? project.scenes : []
+    return scenes.some((scene: any) => ['pending', 'generating'].includes(String(scene?.status || '')))
+}
+
+const upsertProjectListItem = (project: any) => {
+    if (!project?.id) return
+
+    const { scenes, ...summary } = project
+    const index = projectList.value.findIndex((item: any) => item.id === summary.id)
+    if (index === -1) {
+        projectList.value = [summary, ...projectList.value]
+        return
+    }
+
+    const nextList = [...projectList.value]
+    nextList[index] = { ...nextList[index], ...summary }
+    projectList.value = nextList
+}
+
+const syncCurrentProjectSummary = (project: any) => {
+    if (!currentProject.value || !project || currentProject.value.id !== project.id) return
+    currentProject.value = {
+        ...currentProject.value,
+        ...project,
+        scenes: currentProject.value.scenes || []
+    }
+}
+
+const hasBackgroundGeneratingProjects = () => {
+    return projectList.value.some((project: any) => {
+        if (!project || project.id === currentProject.value?.id) return false
+        return String(project.status || '') === 'generating'
+    })
+}
 
 // Project Sidebar Data
 const projectContext = computed(() => {
@@ -308,7 +352,7 @@ const handleAuth = async () => {
             
             // Fetch data in background so we don't block the UI transition
             fetchUser()
-            fetchProjects()
+            await fetchProjects()
             startPolling()
         } else {
             await api.post('/auth/register', authForm.value)
@@ -340,27 +384,11 @@ const fetchProjects = async () => {
     try {
         const res = await api.get('/projects/')
         projectList.value = res.data
-        // Update current project status if active (Incremental only)
         if (currentProject.value) {
-             const found = projectList.value.find(p => p.id === currentProject.value.id)
-             if (found) {
-                 // Only update generation-critical fields to avoid UI reset
-                 if (found.title !== currentProject.value.title) currentProject.value.title = found.title
-                 if (found.logline !== currentProject.value.logline) currentProject.value.logline = found.logline
-                 if (found.genre !== currentProject.value.genre) currentProject.value.genre = found.genre
-                 if (found.project_type !== currentProject.value.project_type) currentProject.value.project_type = found.project_type
-                 if (found.status !== currentProject.value.status) currentProject.value.status = found.status
-                 if (found.total_tokens !== currentProject.value.total_tokens) currentProject.value.total_tokens = found.total_tokens
-                 if (JSON.stringify(found.global_context || {}) !== JSON.stringify(currentProject.value.global_context || {})) {
-                     currentProject.value.global_context = found.global_context || {}
-                 }
-                 
-                 // For scenes, we do a careful check before replacement to avoid jitter
-                 // However, since scenes are nested, we rely on backend sending them.
-                 if (found.scenes && JSON.stringify(found.scenes) !== JSON.stringify(currentProject.value.scenes)) {
-                     currentProject.value.scenes = found.scenes
-                 }
-             }
+            const found = projectList.value.find((p: any) => p.id === currentProject.value.id)
+            if (found) {
+                syncCurrentProjectSummary(found)
+            }
         }
     } catch (e: any) { 
         if (e.response && e.response.status === 401) return
@@ -368,16 +396,83 @@ const fetchProjects = async () => {
     }
 }
 
+const fetchProjectDetail = async (projectId: number) => {
+    if (!token.value || !projectId) return null
+    try {
+        const res = await api.get(`/projects/${projectId}`)
+        const project = res.data
+        upsertProjectListItem(project)
+        if (currentProject.value?.id === projectId) {
+            currentProject.value = {
+                ...(currentProject.value || {}),
+                ...project
+            }
+        }
+        return project
+    } catch (e: any) {
+        if (e.response?.status === 404) {
+            projectList.value = projectList.value.filter((item: any) => item.id !== projectId)
+            if (currentProject.value?.id === projectId) currentProject.value = null
+            return null
+        }
+        if (e.response?.status !== 401) {
+            console.error(e)
+        }
+        return null
+    }
+}
+
+const runPollingCycle = async () => {
+    if (!token.value || !isDocumentVisible()) return
+    if (pollRequestInFlight.value) return
+
+    pollRequestInFlight.value = true
+    try {
+        if (currentProject.value?.id && isSceneGenerationActive(currentProject.value)) {
+            await fetchProjectDetail(currentProject.value.id)
+            return
+        }
+        if (hasBackgroundGeneratingProjects()) {
+            await fetchProjects()
+        }
+    } finally {
+        pollRequestInFlight.value = false
+    }
+}
+
 const startPolling = () => {
     stopPolling()
-    pollTimer.value = setInterval(fetchProjects, 3000)
+    if (!token.value || !isDocumentVisible()) return
+
+    let delay = 0
+    if (currentProject.value?.id && isSceneGenerationActive(currentProject.value)) {
+        delay = ACTIVE_PROJECT_POLL_INTERVAL_MS
+    } else if (hasBackgroundGeneratingProjects()) {
+        delay = BACKGROUND_LIST_POLL_INTERVAL_MS
+    }
+
+    if (!delay) return
+
+    pollTimer.value = window.setTimeout(async () => {
+        await runPollingCycle()
+        startPolling()
+    }, delay)
 }
 
 const stopPolling = () => {
     if (pollTimer.value) {
-        clearInterval(pollTimer.value)
+        clearTimeout(pollTimer.value)
         pollTimer.value = null
     }
+}
+
+const handleVisibilityChange = () => {
+    if (!token.value) return
+    if (isDocumentVisible()) {
+        startPolling()
+        return
+    }
+    stopPolling()
 }
 
 const logout = () => {
@@ -395,11 +490,21 @@ const logout = () => {
 // Start polling if token exists on load
 if (token.value) {
     fetchUser()
-    fetchProjects()
-    startPolling()
+    fetchProjects().finally(() => startPolling())
 } 
 
-onUnmounted(() => stopPolling())
+onMounted(() => {
+    if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', handleVisibilityChange)
+    }
+})
+
+onUnmounted(() => {
+    stopPolling()
+    if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+})
 
 const createProject = async () => {
   if (!logline.value) {
@@ -423,6 +528,7 @@ const createProject = async () => {
     // 2. Trigger analysis (which will now ask for Type first)
     await analyzeLogline(res.data.id)
     await fetchProjects()
+    startPolling()
   } catch (e) {
       ElMessage.error('创建失败，请稍后重试')
       console.error(e)
@@ -465,11 +571,11 @@ const analyzeLogline = async (id: number) => {
             }
         )
         
-        await fetchProjects()
+        await fetchProjectDetail(id)
     } else {
         interaction.value = null
-        if (currentProject.value) {
-            fetchProjects()
+        if (currentProject.value?.id) {
+            await fetchProjectDetail(currentProject.value.id)
         }
     }
     } catch (e: any) { 
@@ -477,6 +583,7 @@ const analyzeLogline = async (id: number) => {
         ElMessage.error(e.response?.data?.detail || '分析失败，请检查网络或后端日志')
     } finally {
       loading.value = false
+      startPolling()
   }
 }
 
@@ -571,21 +678,32 @@ const loadProject = async (p: any) => {
         }
     }
     
-    currentProject.value = p
+    currentProject.value = {
+        ...p,
+        scenes: Array.isArray(p?.scenes) ? p.scenes : []
+    }
     drawerOpen.value = false 
     interaction.value = null
     
+    const detailedProject = await fetchProjectDetail(p.id)
+    if (detailedProject) {
+        currentProject.value = detailedProject
+        upsertProjectListItem(detailedProject)
+    }
+    
     // Always check state/resume flow
-    if (p.status === 'generating') {
+    const activeProject = detailedProject || currentProject.value
+    if (activeProject.status === 'generating') {
         loading.value = false // Allow viewing generated content
-    } else if (p.status !== 'completed' && p.status !== 'failed') {
+    } else if (activeProject.status !== 'completed' && activeProject.status !== 'failed') {
         loading.value = true;
         loadingText.value = "正在恢复进度...";
-        analyzeLogline(p.id)
+        analyzeLogline(activeProject.id)
     }
-    if (p.status === 'pending' || !p.scenes || p.scenes.length === 0) {
+    if (activeProject.status === 'pending' || !activeProject.scenes || activeProject.scenes.length === 0) {
         // Additional checks if needed
     }
+    startPolling()
 }
 
 const deleteProject = async () => {
@@ -606,6 +724,7 @@ const deleteProject = async () => {
         ElMessage.success('已删除')
         currentProject.value = null
         await fetchProjects()
+        startPolling()
     } catch (e) {
         if (e !== 'cancel') {
             console.error(e)
@@ -625,6 +744,7 @@ const regenerateScene = async (sceneId: number, sceneIndex: number) => {
             s.status = 'pending'
             s.content = ''
         }
+        await fetchProjectDetail(currentProject.value.id)
         startPolling()
     } catch(e) { console.error(e); ElMessage.error('重试请求失败') }
 }
