@@ -123,11 +123,136 @@ const hasBackgroundGeneratingProjects = () => {
 }
 
 // Project Sidebar Data
-const projectContext = computed(() => {
+const normalizeContextKey = (rawKey: unknown): string => {
+    const text = toTextValue(rawKey).trim()
+    if (!text) return ''
+    return text
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/[\s-]+/g, '_')
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '')
+}
+
+const projectTypeLabelMap: Record<string, string> = {
+    movie: '电影剧本',
+    tv: '剧集剧本',
+    short: '短剧剧本',
+    short_video: '短视频',
+    pending: '待确定'
+}
+
+const contextFieldLabelMap: Record<string, string> = {
+    title: '故事题目',
+    project_type: '剧本类型',
+    logline: '故事梗概',
+    synopsis_brief: '简要梗概',
+    synopsis_detailed: '详细梗概',
+    brief_synopsis: '简要梗概',
+    detailed_synopsis: '详细梗概',
+    story_brief: '简要梗概',
+    story_detailed: '详细梗概',
+    movie_duration: '电影时长',
+    scene_count_target: '目标场次',
+    episode_count: '集数',
+    episode_duration: '单集时长',
+    video_duration_seconds: '总时长（秒）',
+    tone: '基调',
+    time_period: '时代背景',
+    story_expansion: '剧情大纲',
+    character_details: '人物设定',
+    plot_details: '关键设定',
+    theme: '主题',
+    visual_style: '视觉风格',
+    user_notes: '补充说明',
+    protagonist_core: '主角核心',
+    antagonist_obstacle: '反派/阻碍',
+    central_conflict: '核心冲突',
+    target_audience: '目标受众'
+}
+
+const extractFirstNumber = (text: string) => {
+    const match = text.match(/\d+/)
+    return match?.[0] || ''
+}
+
+const formatProjectTypeText = (value: unknown) => {
+    const raw = toTextValue(value).trim()
+    if (!raw) return ''
+    const normalized = normalizeContextKey(raw)
+    return projectTypeLabelMap[normalized] || raw
+}
+
+const formatContextDisplayValue = (rawKey: unknown, rawValue: unknown) => {
+    const key = normalizeContextKey(rawKey)
+    const rawText = toTextValue(rawValue).trim()
+    if (!rawText) return ''
+
+    if (key === 'project_type') {
+        return formatProjectTypeText(rawText)
+    }
+
+    if (rawText.toLowerCase() === 'pending') {
+        return '待确定'
+    }
+
+    if (key === 'movie_duration' || key === 'episode_duration') {
+        if (rawText.includes('分钟')) return rawText
+        const n = extractFirstNumber(rawText)
+        return n ? `${n} 分钟` : rawText
+    }
+
+    if (key === 'video_duration_seconds') {
+        if (rawText.includes('秒')) return rawText
+        const n = extractFirstNumber(rawText)
+        return n ? `${n} 秒` : rawText
+    }
+
+    if (key === 'scene_count_target') {
+        const n = extractFirstNumber(rawText)
+        return n ? `${n} 场` : rawText
+    }
+
+    if (key === 'episode_count') {
+        const n = extractFirstNumber(rawText)
+        return n ? `${n} 集` : rawText
+    }
+
+    return rawText
+}
+
+const getContextFieldLabel = (rawKey: unknown) => {
+    const normalized = normalizeContextKey(rawKey)
+    return contextFieldLabelMap[normalized] || toTextValue(rawKey)
+}
+
+const interactionContextHiddenKeys = new Set([
+    'project_type',
+    'final_confirm',
+    'next_step_cache',
+    'synopsis_brief',
+    'brief_synopsis',
+    'story_brief',
+    'synopsis_detailed',
+    'detailed_synopsis',
+    'story_detailed'
+])
+
+const interactionContextEntries = computed(() => {
     const ctx = currentProject.value?.global_context || {}
-    return Object.fromEntries(
-        Object.entries(ctx).filter(([key]) => !key.startsWith('_'))
-    )
+    return Object.entries(ctx)
+        .filter(([rawKey]) => !toTextValue(rawKey).startsWith('_'))
+        .map(([rawKey, rawValue]) => {
+            const normalizedKey = normalizeContextKey(rawKey)
+            return {
+                rawKey: toTextValue(rawKey),
+                normalizedKey,
+                label: getContextFieldLabel(rawKey),
+                value: formatContextDisplayValue(rawKey, rawValue)
+            }
+        })
+        .filter(item => item.normalizedKey && !interactionContextHiddenKeys.has(item.normalizedKey) && !!item.value)
 })
 
 const progressPercentage = computed(() => {
@@ -190,6 +315,17 @@ const getProjectTooltipText = (project: any) => {
 
 const currentProjectTitle = computed(() => {
     return getProjectTitle(currentProject.value) || 'Untitled'
+})
+
+const currentProjectTypeDisplay = computed(() => {
+    const projectType = toTextValue(currentProject.value?.project_type || '').trim()
+    const contextType = toTextValue(currentProject.value?.global_context?.project_type || '').trim()
+
+    const preferredType = projectType && normalizeContextKey(projectType) !== 'pending'
+        ? projectType
+        : (contextType || projectType || 'pending')
+
+    return formatProjectTypeText(preferredType) || '待确定'
 })
 
 const isValidCharacterDetailsText = (value: unknown) => {
@@ -781,36 +917,46 @@ const keySettingsOrder = [
 const sortedContext = computed(() => {
     if (!currentProject.value?.global_context) return []
     const ctx = currentProject.value.global_context
-    // Filter out internal keys like final_confirm, logline, etc.
-    const keys = Object.keys(ctx).filter(
-        k => ![
-            'logline',
-            'character_details',
-            'project_type',
-            'final_confirm',
-            'next_step_cache',
-            'synopsis_brief',
-            'brief_synopsis',
-            'story_brief',
-            'synopsis_detailed',
-            'detailed_synopsis',
-            'story_detailed'
-        ].includes(k) && !k.startsWith('_')
-    )
-    
-    // Sort logic
-    return keys.sort((a, b) => {
-        const idxA = keySettingsOrder.indexOf(a)
-        const idxB = keySettingsOrder.indexOf(b)
-        // If both in list, sort by index
+    const hiddenKeys = new Set([
+        'logline',
+        'character_details',
+        'project_type',
+        'final_confirm',
+        'next_step_cache',
+        'synopsis_brief',
+        'brief_synopsis',
+        'story_brief',
+        'synopsis_detailed',
+        'detailed_synopsis',
+        'story_detailed'
+    ])
+
+    const entries = Object.entries(ctx)
+        .filter(([rawKey]) => {
+            const keyText = toTextValue(rawKey)
+            if (!keyText || keyText.startsWith('_')) return false
+            const normalizedKey = normalizeContextKey(rawKey)
+            return !!normalizedKey && !hiddenKeys.has(normalizedKey)
+        })
+        .map(([rawKey, rawValue]) => {
+            const normalizedKey = normalizeContextKey(rawKey)
+            return {
+                key: toTextValue(rawKey),
+                normalizedKey,
+                label: getContextFieldLabel(rawKey),
+                value: formatContextDisplayValue(rawKey, rawValue)
+            }
+        })
+        .filter(item => !!item.value)
+
+    return entries.sort((a, b) => {
+        const idxA = keySettingsOrder.indexOf(a.normalizedKey)
+        const idxB = keySettingsOrder.indexOf(b.normalizedKey)
         if (idxA !== -1 && idxB !== -1) return idxA - idxB
-        // If a in list, it goes first
         if (idxA !== -1) return -1
-        // If b in list, it goes first
         if (idxB !== -1) return 1
-        // Otherwise alphabetical
-        return a.localeCompare(b)
-    }).map(k => ({ key: k, value: toTextValue(ctx[k]) }))
+        return a.label.localeCompare(b.label, 'zh-Hans-CN')
+    })
 })
 
 const copyText = (value: unknown) => {
@@ -1045,11 +1191,11 @@ const copyText = (value: unknown) => {
                              <div class="space-y-3 text-sm">
                                  <div>
                                      <div class="text-gray-500">类型</div>
-                                     <div class="font-medium truncate">{{ currentProject.project_type || '未定' }}</div>
+                                     <div class="font-medium truncate">{{ currentProjectTypeDisplay }}</div>
                                  </div>
-                                  <div v-for="(value, key) in projectContext" :key="key">
-                                     <div class="text-gray-500 capitalize">{{ key }}</div>
-                                     <div class="font-medium line-clamp-2">{{ value }}</div>
+                                  <div v-for="item in interactionContextEntries" :key="item.rawKey">
+                                     <div class="text-gray-500">{{ item.label }}</div>
+                                     <div class="font-medium line-clamp-2">{{ item.value }}</div>
                                  </div>
                              </div>
                         </div>
@@ -1236,29 +1382,9 @@ const copyText = (value: unknown) => {
                                                 {{ currentProject.global_context.logline }}
                                             </div>
                                         </div>
-                                        <div v-for="item in sortedContext" :key="item.key">
+                                        <div v-for="item in sortedContext" :key="`${item.key}-${item.normalizedKey}`">
                                             <div class="font-bold text-gray-500 mb-1 capitalize flex items-center justify-between">
-                                                <span>{{ 
-                                                    item.key === 'tone' ? '基调' : 
-                                                    item.key === 'time_period' ? '时代背景' : 
-                                                    item.key === 'title' ? '标题' : 
-                                                    item.key === 'protagonist_core' ? '主角核心' : 
-                                                    item.key === 'antagonist_obstacle' ? '反派/阻碍' : 
-                                                    item.key === 'central_conflict' ? '核心冲突' : 
-                                                    item.key === 'theme' ? '主题' : 
-                                                    item.key === 'visual_style' ? '视觉风格' : 
-                                                    item.key === 'target_audience' ? '目标受众' : 
-                                                    item.key === 'episode_count' ? '集数' :
-                                                    item.key === 'episode_duration' ? '单集时长' :
-                                                    item.key === 'movie_duration' ? '电影时长' :
-                                                    item.key === 'video_duration_seconds' ? '总时长（秒）' :
-                                                    item.key === 'scene_count_target' ? '预期场次' :
-                                                    item.key === 'plot_details' ? '关键剧情' :
-                                                    item.key === 'story_expansion' ? '故事深化' :
-                                                    item.key === 'character_details' ? '角色设定' :
-                                                    item.key === 'user_notes' ? '补充说明' :
-                                                    item.key 
-                                                }}</span>
+                                                <span>{{ item.label }}</span>
                                                 <el-button link size="small" :icon="Document" @click="copyText(item.value)"></el-button>
                                             </div>
                                             
