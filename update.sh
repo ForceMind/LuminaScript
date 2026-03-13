@@ -73,7 +73,7 @@ is_runtime_data_path() {
 is_auto_restore_path() {
     local path="$1"
     case "$path" in
-        frontend/server.cjs|frontend/package-lock.json)
+        frontend/server.cjs|frontend/package-lock.json|miaobi|update.sh|uninstall.sh)
             return 0
             ;;
         *)
@@ -87,7 +87,6 @@ install_miaobi() {
         return
     fi
 
-    chmod +x "$PROJECT_DIR/miaobi" "$PROJECT_DIR/update.sh" "$PROJECT_DIR/uninstall.sh" 2>/dev/null || true
     rm -f /usr/local/bin/miaobi 2>/dev/null || true
 
     if command -v install >/dev/null 2>&1; then
@@ -242,7 +241,6 @@ echo -e "${YELLOW}[6/6] 重启当前服务...${NC}"
 cd "$PROJECT_DIR"
 
 if [ -f "$PROJECT_DIR/miaobi" ]; then
-    chmod +x "$PROJECT_DIR/miaobi" "$PROJECT_DIR/update.sh" "$PROJECT_DIR/uninstall.sh" 2>/dev/null || true
     bash "$PROJECT_DIR/miaobi" restart
 else
     restart_services_fallback

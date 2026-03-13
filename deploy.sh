@@ -402,9 +402,11 @@ BACKEND_LOG=$PROJECT_DIR/backend.log
 FRONTEND_LOG=$PROJECT_DIR/frontend.log
 EOF
 
-    chmod +x "$PROJECT_DIR/miaobi" "$PROJECT_DIR/update.sh" "$PROJECT_DIR/uninstall.sh"
     rm -f /usr/local/bin/miaobi
-    install -m 755 "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi 2>/dev/null || cp -f "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi
+    install -m 755 "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi 2>/dev/null || {
+        cp -f "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi
+        chmod 755 /usr/local/bin/miaobi
+    }
     
     echo -e "\n${GREEN}====== 闂備緡鍠撻崝搴ｆ媼閺屻儱绠ｉ柟閭﹀墮椤?======${NC}"
     echo -e "闂佸憡鎸哥粔鍫曨敂椤掑倹濯奸柛褎顨嗛敍鏍煕閿旇姤绶叉繛?  http://$IP:$FRONTEND_PORT"
