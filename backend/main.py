@@ -87,6 +87,50 @@ SUMMARY_ORDER = [
     "user_notes"
 ]
 
+SETUP_FLOW_STEPS = [
+    {"key": "project_type", "question": "您想创作哪种类型的剧本？", "default_options": [
+        {"label": "🎥 电影剧本", "value": "movie"},
+        {"label": "📺 剧集剧本", "value": "tv"},
+        {"label": "📱 短剧剧本", "value": "short"}
+    ]},
+    {"key": "movie_duration", "question": "电影预计时长是多少分钟？", "movie_only": True},
+    {"key": "scene_count_target", "question": "您希望生成多少场戏？（电影通常 40-100 场，越多越细）", "movie_only": True},
+    {"key": "episode_count", "question": "您计划创作多少集？", "tv_short_only": True},
+    {"key": "episode_duration", "question": "每一集的大致时长是？", "tv_short_only": True},
+    {"key": "tone", "question": "这部作品的基调是什么？"},
+    {"key": "time_period", "question": "故事发生在什么时代背景？"},
+    {"key": "story_expansion", "question": "我们需要基于目前构思扩展出完整的剧情大纲，您有什么特别想法吗？"},
+    {"key": "character_details", "question": "主要角色的性格、外貌、关系或背景有什么特别设定？"},
+    {"key": "plot_details", "question": "有哪些一定要发生的关键情节、转折或高潮？"},
+    {"key": "title", "question": "现在请为这个故事确定一个题目，最好直接给出书名号里的名字。"},
+    {"key": "theme", "question": "您想通过这个故事探讨什么主题？"},
+    {"key": "visual_style", "question": "视觉风格偏向于什么？"},
+    {"key": "user_notes", "question": "还有什么补充内容，或者特别要求吗？"},
+    {"key": "final_confirm", "question": "以上是剧本的完整设定，请确认是否可以开始生成分场大纲？", "is_confirmation": True}
+]
+
+FINAL_CONFIRM_EDIT_TARGETS = [
+    ("story_expansion", "返回修改剧情大纲"),
+    ("character_details", "返回修改人物设定"),
+    ("plot_details", "返回修改关键设定"),
+    ("title", "返回修改故事题目"),
+]
+
+FINAL_CONFIRM_ALLOWED_VALUES = {"confirmed", "reset"} | {f"edit:{key}" for key, _ in FINAL_CONFIRM_EDIT_TARGETS}
+RETRY_INTERACTION_FIELD = "retry_current_step"
+
+
+def get_relevant_setup_steps(project_type: str) -> List[Dict[str, Any]]:
+    p_type = project_type or "movie"
+    relevant_steps = []
+    for step in SETUP_FLOW_STEPS:
+        if step.get("movie_only") and p_type != "movie":
+            continue
+        if step.get("tv_short_only") and p_type == "movie":
+            continue
+        relevant_steps.append(step)
+    return relevant_steps
+
 TITLE_PATTERNS = [
     re.compile(r"《\s*([^《》\n]{1,60}?)\s*》"),
     re.compile(r"〈\s*([^〈〉\n]{1,60}?)\s*〉"),
@@ -160,6 +204,137 @@ def normalize_project_title(project: models.Project) -> bool:
         updated_context["title"] = clean_title
         project.global_context = updated_context
     return True
+
+
+def is_valid_character_details(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+
+    if text in {"经典叙事风格", "带有反转的剧情", "大胆的实验性风格"}:
+        return False
+
+    if any(keyword in text for keyword in ("叙事风格", "实验风格", "镜头语言")) and not any(
+        keyword in text for keyword in ("主角", "角色", "配角", "反派", "人物", "身份", "关系", "秘密")
+    ):
+        return False
+
+    if len(text) < 12 and not any(keyword in text for keyword in ("主角", "角色", "配角", "人物")):
+        return False
+
+    return True
+
+
+def normalize_project_context(project: models.Project) -> bool:
+    if not isinstance(project.global_context, dict):
+        return False
+
+    updated_context = dict(project.global_context)
+    changed = False
+
+    if "character_details" in updated_context and not is_valid_character_details(updated_context.get("character_details")):
+        updated_context.pop("character_details", None)
+        changed = True
+
+    if changed:
+        project.global_context = updated_context
+
+    return changed
+
+
+def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[str, Any] | None = None) -> bool:
+    if not isinstance(cache_payload, dict):
+        return False
+
+    payload = cache_payload.get("payload")
+    if not isinstance(payload, dict):
+        return False
+
+    field = payload.get("field")
+    options = payload.get("options")
+
+    if field == "final_confirm":
+        if not isinstance(options, list):
+            return True
+        if not any(isinstance(option, dict) and str(option.get("value", "")).startswith("edit:") for option in options):
+            return True
+
+    if field == "title":
+        current_context = current_context or {}
+        if any(key not in current_context for key in ("story_expansion", "character_details", "plot_details")):
+            return True
+
+    if field not in {"character_details", "story_expansion", "plot_details"}:
+        return False
+    if not isinstance(options, list) or len(options) < 3:
+        return True
+
+    generic_values = {"经典叙事风格", "带有反转的剧情", "大胆的实验性风格"}
+
+    if field == "character_details":
+        for option in options:
+            if not isinstance(option, dict):
+                return True
+            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
+            if any(value in option_text for value in generic_values):
+                return True
+            if not any(keyword in option_text for keyword in ("主角", "角色", "配角", "反派", "人物", "关系", "秘密")):
+                return True
+
+    if field == "story_expansion":
+        for option in options:
+            if not isinstance(option, dict):
+                return True
+            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
+            if any(value in option_text for value in generic_values):
+                return True
+            if not any(keyword in option_text for keyword in ("第一幕", "第二幕", "第三幕", "开端", "高潮")):
+                return True
+
+    if field == "plot_details":
+        for option in options:
+            if not isinstance(option, dict):
+                return True
+            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
+            if any(value in option_text for value in generic_values):
+                return True
+            if not any(keyword in option_text for keyword in ("关键", "转折", "冲突", "危机", "真相", "高潮")):
+                return True
+
+    return False
+
+
+def rewind_project_setup(project: models.Project, target_key: str) -> Dict[str, Any]:
+    current_context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    project_type = project.project_type if project.project_type and project.project_type != "pending" else current_context.get("project_type", "movie")
+    relevant_steps = get_relevant_setup_steps(project_type)
+
+    clear_from_here = False
+    for step in relevant_steps:
+        key = step["key"]
+        if key == target_key:
+            clear_from_here = True
+        if not clear_from_here or key == "project_type":
+            continue
+
+        current_context.pop(key, None)
+        if key == "title":
+            project.title = ""
+
+    for derived_key in (
+        "synopsis_brief",
+        "synopsis_detailed",
+        "brief_synopsis",
+        "detailed_synopsis",
+        "story_brief",
+        "story_detailed",
+        "final_confirm",
+    ):
+        current_context.pop(derived_key, None)
+
+    project.global_context = current_context
+    project.next_step_cache = None
+    return current_context
 
 
 def format_summary_value(key: str, value: Any) -> str:
@@ -513,6 +688,7 @@ async def list_projects(
     title_updated = False
     for project in projects:
         title_updated = normalize_project_title(project) or title_updated
+        title_updated = normalize_project_context(project) or title_updated
 
     if title_updated:
         await db.commit()
@@ -616,6 +792,19 @@ async def submit_interaction(
         await db.commit()
         return {"status": "reset", "context": {}}
 
+    if interaction.context_key == 'final_confirm' and answer_text.startswith('edit:'):
+        target_key = answer_text.split(':', 1)[1].strip()
+        rewind_project_setup(project, target_key)
+        await db.commit()
+        return {
+            "status": "rewind",
+            "context": project.global_context,
+            "title": project.title or previous_title or "",
+        }
+
+    if interaction.context_key == 'final_confirm' and answer_text not in FINAL_CONFIRM_ALLOWED_VALUES:
+        raise HTTPException(status_code=400, detail="请直接点击下方按钮选择确认操作，再重新发起。")
+
     # Ensure project_type is synced if that was the key (legacy support)
     if interaction.context_key == 'project_type':
         project.project_type = answer_text
@@ -663,52 +852,26 @@ async def analyze_logline(
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    normalized = False
     if normalize_project_title(project):
+        normalized = True
+    if normalize_project_context(project):
+        normalized = True
+    if normalized:
         await db.commit()
 
     # Check Cache First (For resuming sessions)
     if project.next_step_cache:
-        logger.info(f"项目 {project_id} 命中缓存，直接返回之前的提问。")
-        return project.next_step_cache
+        if should_invalidate_cached_question(project.next_step_cache, project.global_context or {}):
+            project.next_step_cache = None
+            await db.commit()
+        else:
+            logger.info(f"项目 {project_id} 命中缓存，直接返回之前的提问。")
+            return project.next_step_cache
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
     context = project.global_context or {}
-    
-    # --- Definition of the 10-Step Setup Flow ---
-    # Follow Snowflake Method concepts: Logline -> Expansion -> Characters -> Detailed Plot -> Confirmation
-    REQUIRED_STEPS = [
-        {"key": "project_type", "question": "您想创作哪种类型的剧本？", "default_options": [
-             {"label": "🎥 电影剧本 (Movie)", "value": "movie"},
-             {"label": "📺 电视剧 (TV Series)", "value": "tv"},
-             {"label": "📱 现代短剧 (Short Drama)", "value": "short"}
-        ]},
-        # Dynamic steps based on Project Type
-        {"key": "movie_duration", "question": "电影预期的时长是多少分钟？", "movie_only": True},
-        {"key": "scene_count_target", "question": "您希望生成多少场戏？(电影通常40-100场，精细剧本可能更多)", "movie_only": True},
-        {"key": "episode_count", "question": "您计划创作多少集？", "tv_short_only": True},
-        {"key": "episode_duration", "question": "每一集的大致时长是？", "tv_short_only": True},
-        
-        {"key": "tone", "question": "这部作品的基调是什么？"},
-        {"key": "time_period", "question": "故事发生在什么时代背景？"},
-        {"key": "title", "question": "不管是暂定还是正式，给这个故事起个名字吧？"},
-        
-        # Snowflake Step 2 & 4: Expansion
-        {"key": "story_expansion", "question": "我们需要基于目前的构思扩展出一个完整的三幕式大纲，您有什么特别的想法吗？"},
-        
-        # Snowflake Step 3 & 5: Character focus
-        {"key": "character_details", "question": "主要角色的性格、外貌或背景有什么特别设定？"},
-        
-        # Detailed plot
-        {"key": "plot_details", "question": "有哪些一定要发生的关键情节或转折？"},
-        
-        {"key": "theme", "question": "您想通过这个故事探讨什么主题？"},
-        {"key": "visual_style", "question": "视觉风格偏向于什么？"},
-        {"key": "user_notes", "question": "还有什么补充的内容，或者特别的要求吗？"},
-        
-        # Final confirmation
-        {"key": "final_confirm", "question": "以上是剧本的完整设定，请确认是否可以开始生成分场大纲？", "is_confirmation": True}
-    ]
 
     # 1. Check which steps are missing
     # Important: 'project_type' is stored in column, others in global_context
@@ -717,13 +880,8 @@ async def analyze_logline(
         normalized_context['project_type'] = project.project_type
     
     # Calculate Total Steps (Dynamic based on Type)
-    relevant_steps = []
     p_type = normalized_context.get("project_type", "movie")
-    for step in REQUIRED_STEPS:
-         # Filter based on type
-         if step.get("movie_only") and p_type != "movie": continue
-         if step.get("tv_short_only") and p_type == "movie": continue
-         relevant_steps.append(step)
+    relevant_steps = get_relevant_setup_steps(p_type)
 
     next_step = None
     next_step_index = 0
@@ -837,6 +995,10 @@ async def analyze_logline(
                 "context_summary": summary_text,
                 "options": [
                     {"label": "✅ 确定并开始生成", "value": "confirmed"},
+                    *[
+                        {"label": label, "value": f"edit:{target_key}"}
+                        for target_key, label in FINAL_CONFIRM_EDIT_TARGETS
+                    ],
                     {"label": "🔄 重新设定 (清空当前设定重头开始)", "value": "reset"}
                 ]
             })
@@ -872,10 +1034,17 @@ async def analyze_logline(
         )
     except Exception as e:
         logger.error(f"LLM 交互生成失败: {e}")
-        raise HTTPException(
-            status_code=503, 
-            detail=f"AI 服务暂时不可用，请检查 API Key 配置或稍后重试 ({str(e)})"
-        )
+        retry_label = SUMMARY_LABELS.get(next_step["key"], next_step["question"])
+        return {
+            "type": "interaction_required",
+            "payload": add_progress({
+                "field": RETRY_INTERACTION_FIELD,
+                "question": f"AI 暂时没能生成“{retry_label}”这一轮提问，请点击下方按钮重新发起。",
+                "options": [
+                    {"label": "重新发起当前问题", "value": RETRY_INTERACTION_FIELD}
+                ]
+            })
+        }
     
     # Update Token Usage
     project.total_tokens += usage

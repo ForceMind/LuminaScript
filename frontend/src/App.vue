@@ -143,6 +143,40 @@ const currentProjectTitle = computed(() => {
     return getProjectTitle(currentProject.value) || 'Untitled'
 })
 
+const isValidCharacterDetailsText = (value: unknown) => {
+    const text = toTextValue(value).trim()
+    if (!text) return false
+    if (['经典叙事风格', '带有反转的剧情', '大胆的实验性风格'].includes(text)) return false
+    if (/(叙事风格|实验风格|镜头语言)/.test(text) && !/(主角|角色|配角|反派|人物|身份|关系|秘密)/.test(text)) {
+        return false
+    }
+    if (text.length < 12 && !/(主角|角色|配角|人物)/.test(text)) return false
+    return true
+}
+
+const characterDetailsText = computed(() => {
+    const raw = currentProject.value?.global_context?.character_details || ''
+    return isValidCharacterDetailsText(raw) ? toTextValue(raw) : ''
+})
+
+const isControlInteractionField = (field: string) => {
+    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration', 'retry_current_step'].includes(field)
+}
+
+const canUseCustomInput = computed(() => {
+    const field = toTextValue(interaction.value?.field || '').trim()
+    if (!field) return true
+    return !isControlInteractionField(field)
+})
+
+const shouldShowOptionValue = (opt: any) => {
+    const label = toTextValue(opt?.label).trim()
+    const value = toTextValue(opt?.value).trim()
+    if (!value || value === label) return false
+    if (value.length <= 24 && /^(movie|tv|short|\d+|confirmed|reset|retry_current_step|edit:)/.test(value)) return false
+    return true
+}
+
 const storySynopsis = computed(() => {
     if (!currentProject.value) {
         return { brief: '', detailed: '' }
@@ -450,6 +484,20 @@ const submitChoice = async () => {
         return
     }
 
+    if (interaction.value?.field === 'retry_current_step' || finalAnswer === 'retry_current_step') {
+        loading.value = true
+        loadingText.value = '正在重新发起当前问题...'
+        try {
+            interaction.value = null
+            await analyzeLogline(currentProject.value.id)
+        } catch (e) {
+            console.error(e)
+        } finally {
+            loading.value = false
+        }
+        return
+    }
+
     // Only review direct user free text, not AI-provided option values.
     if (!selectedOption.value && customInput.value) {
         finalAnswer = await reviewAndMaybeRewriteInput(customInput.value, '用户输入')
@@ -493,7 +541,10 @@ const submitChoice = async () => {
         // Trigger next step immediately
         await analyzeLogline(currentProject.value.id)
         
-    } catch (e) { console.error(e) } finally { loading.value = false }
+    } catch (e: any) {
+        console.error(e)
+        ElMessage.error(e.response?.data?.detail || '提交失败，请稍后重试')
+    } finally { loading.value = false }
 }
 
 const handleOptionSelect = (opt: any) => {
@@ -932,7 +983,7 @@ const copyText = (value: unknown) => {
                                 >
                                     <div>
                                         <div class="font-medium text-base">{{ opt.label }}</div>
-                                        <div v-if="opt.value && opt.value !== opt.label" class="text-sm text-gray-500 mt-1 font-light">{{ opt.value }}</div>
+                                        <div v-if="shouldShowOptionValue(opt)" class="text-sm text-gray-500 mt-1 font-light">{{ opt.value }}</div>
                                     </div>
                                     <div v-if="selectedOption === opt.value" class="w-5 h-5 bg-blue-500 rounded-full flex items-center justify-center shrink-0">
                                         <div class="w-2 h-2 bg-white rounded-full"></div>
@@ -941,7 +992,7 @@ const copyText = (value: unknown) => {
                             </div>
                             
                             <!-- Custom Input -->
-                             <div class="relative">
+                             <div v-if="canUseCustomInput" class="relative">
                                 <div class="absolute -top-3 left-2 px-1 bg-white text-xs font-bold text-gray-400">或者自行输入</div>
                                 <el-input 
                                     v-model="customInput"
@@ -952,7 +1003,7 @@ const copyText = (value: unknown) => {
                              </div>
 
                             <div class="mt-8">
-                                <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput" :loading="loading">
+                                <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput && interaction?.field !== 'retry_current_step'" :loading="loading">
                                     下一步
                                 </el-button>
                             </div>
@@ -1026,10 +1077,10 @@ const copyText = (value: unknown) => {
                                     </div>
                                 </el-tab-pane>
                                 <el-tab-pane label="人物设定">
-                                    <div v-if="currentProject.global_context?.character_details" class="p-2">
+                                    <div v-if="characterDetailsText" class="p-2">
                                         <!-- Attempt to parse list format if present -->
-                                        <div v-if="currentProject.global_context.character_details.includes('\n-')" class="space-y-3">
-                                            <div v-for="(line, idx) in currentProject.global_context.character_details.split('\n')" :key="idx">
+                                        <div v-if="characterDetailsText.includes('\n-')" class="space-y-3">
+                                            <div v-for="(line, idx) in characterDetailsText.split('\n')" :key="idx">
                                                 <div v-if="line.trim().startsWith('-')" class="bg-gray-50 p-3 rounded-lg border border-gray-100 shadow-sm flex gap-3">
                                                     <div class="w-1 h-full bg-blue-400 rounded-full shrink-0 mt-1"></div>
                                                     <div class="text-sm text-gray-700 leading-relaxed prose prose-sm max-w-none" v-html="renderMarkdown(line.replace(/^-/, '').trim())"></div>
@@ -1039,7 +1090,7 @@ const copyText = (value: unknown) => {
                                                 </div>
                                             </div>
                                         </div>
-                                        <div v-else class="text-sm text-gray-600 leading-relaxed prose prose-sm max-w-none" v-html="renderMarkdown(currentProject.global_context.character_details)"></div>
+                                        <div v-else class="text-sm text-gray-600 leading-relaxed prose prose-sm max-w-none" v-html="renderMarkdown(characterDetailsText)"></div>
                                     </div>
                                     <div v-else class="text-gray-400 text-sm text-center py-4">暂无详细人物设定</div>
                                 </el-tab-pane>

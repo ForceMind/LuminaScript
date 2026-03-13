@@ -65,6 +65,128 @@ def _fallback_rewrite(text: str, categories: list[str]) -> str:
         )
     return rewritten
 
+
+def _build_interaction_fallback(step_key: str, base_question: str):
+    if step_key == "character_details":
+        return {
+            "question": base_question,
+            "options": [
+                {
+                    "label": "单主角对抗型",
+                    "value": "- 主角：一个被异常事件卷入的普通人，外表克制，内心倔强，核心目标是查清真相并保护自己最在乎的人。\n- 对手：掌握规则和资源的强势人物，表面理性克制，实则把主角当成可替换的工具。\n- 关键配角：与主角关系最亲近的同伴，既提供帮助，也会在关键时刻因为恐惧或利益产生动摇。"
+                },
+                {
+                    "label": "双主角互补型",
+                    "value": "- 主角A：行动力强，敢于冒险，但容易冲动做决定。\n- 主角B：理性谨慎，擅长分析，却长期压抑真实情感。\n- 对手：熟悉系统规则的操盘者，最擅长利用两位主角之间的不信任。\n- 配角：负责提供线索与情感支点，推动两位主角从互相试探走向真正结盟。"
+                },
+                {
+                    "label": "群像关系型",
+                    "value": "- 核心人物：一个看似最普通的人，却意外成为所有冲突的交汇点。\n- 对立人物：代表既有秩序和现实压力的人物，始终试图让故事回到可控范围。\n- 关键配角1：拥有重要秘密，表面沉默，实际掌握破局线索。\n- 关键配角2：情感立场摇摆不定，既可能帮助主角，也可能成为压垮局面的导火索。"
+                }
+            ]
+        }
+
+    if step_key == "story_expansion":
+        return {
+            "question": base_question,
+            "options": [
+                {
+                    "label": "经典三幕推进",
+                    "value": "第一幕：主角在日常秩序中暴露核心困境，被迫卷入异常事件，并在第一次失败后意识到自己无法回头。\n第二幕：主角不断追查真相，结识盟友也树立敌人，表面上逐步接近答案，实际上被更大的局操控。\n第三幕：主角在失去关键依靠后完成反击，用新的认知直面终极冲突，并以带有代价的胜利完成人物弧光。"
+                },
+                {
+                    "label": "悬念递进型",
+                    "value": "第一幕：抛出一个强悬念，让主角因偶然发现进入危险局面。\n第二幕：每次推进都会揭开更大一层误导，真相与主角最初理解完全相反，人物关系也随之重组。\n第三幕：主角识破核心谎言，在极限处境中做出关键选择，既解决表层危机，也揭示故事真正命题。"
+                },
+                {
+                    "label": "情感反噬型",
+                    "value": "第一幕：主角出于个人情感或现实欲望踏出第一步，以为自己只是在解决一个具体问题。\n第二幕：事件不断升级，主角与亲密关系逐渐撕裂，最初的选择开始反噬自己。\n第三幕：主角必须在自我保全与情感承担之间做出抉择，最终结局让人物完成真正意义上的成长或崩塌。"
+                }
+            ]
+        }
+
+    if step_key == "plot_details":
+        return {
+            "question": base_question,
+            "options": [
+                {
+                    "label": "三次转折加强",
+                    "value": "关键情节一：主角发现看似偶然的事件背后有明确操控痕迹。\n关键情节二：主角最信任的人突然站到对立面，迫使其独自承担后果。\n关键情节三：在高潮前夕，主角意识到自己一直追逐的答案本身就是陷阱。"
+                },
+                {
+                    "label": "秘密逐层揭开",
+                    "value": "前段通过一条不起眼的线索埋下秘密。\n中段让主角不断接近真相，但每次接近都会付出更大代价。\n高潮前把秘密与主角个人创伤绑定，使终极冲突既是外部危机，也是内部清算。"
+                },
+                {
+                    "label": "关系驱动冲突",
+                    "value": "先让主角与关键角色形成暂时联盟，再通过利益冲突与价值观分歧打破联盟。\n中段加入一次误判导致的严重后果。\n结尾处让人物必须在情感、责任和生存之间做出不可逆选择。"
+                }
+            ]
+        }
+
+    return {
+        "question": base_question,
+        "options": [
+            {"label": "保守推进", "value": "沿着当前设定继续深化，保持逻辑稳定与情绪连贯。"},
+            {"label": "冲突升级", "value": "在现有设定基础上提高人物代价与故事张力，让核心冲突更尖锐。"},
+            {"label": "反常规处理", "value": "保留故事核心，但加入更出人意料的设定转向或人物选择。"}
+        ]
+    }
+
+
+def _option_text(option: dict) -> str:
+    label = str(option.get("label", "") or "").strip()
+    value = str(option.get("value", "") or "").strip()
+    return f"{label}\n{value}".strip()
+
+
+def _is_relevant_interaction_option(step_key: str, option: dict) -> bool:
+    text = _option_text(option)
+    if not text:
+        return False
+
+    if step_key == "character_details":
+        return (
+            len(text) >= 20
+            and any(keyword in text for keyword in ("主角", "角色", "配角", "反派", "人物", "身份", "关系", "秘密", "目标"))
+            and not any(keyword in text for keyword in ("叙事风格", "实验风格", "镜头语言"))
+        )
+
+    if step_key == "story_expansion":
+        return len(text) >= 40 and any(keyword in text for keyword in ("第一幕", "第二幕", "第三幕", "开端", "中段", "高潮"))
+
+    if step_key == "plot_details":
+        return len(text) >= 20 and any(keyword in text for keyword in ("关键", "转折", "冲突", "危机", "真相", "高潮", "结局"))
+
+    return True
+
+
+def _normalize_interaction_payload(step_key: str, base_question: str, payload: dict):
+    if not isinstance(payload, dict):
+        return _build_interaction_fallback(step_key, base_question)
+
+    question = str(payload.get("question", "") or "").strip() or base_question
+    raw_options = payload.get("options")
+    if not isinstance(raw_options, list):
+        return _build_interaction_fallback(step_key, question)
+
+    options = []
+    for option in raw_options:
+        if not isinstance(option, dict):
+            continue
+        label = str(option.get("label", "") or "").strip()
+        value = str(option.get("value", "") or "").strip()
+        if not label or not value:
+            continue
+        normalized_option = {"label": label, "value": value}
+        if _is_relevant_interaction_option(step_key, normalized_option):
+            options.append(normalized_option)
+
+    if len(options) < 3:
+        return _build_interaction_fallback(step_key, question)
+
+    return {"question": question, "options": options[:4]}
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -453,18 +575,13 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     ]
 
     content, usage = await raw_generation(messages, temperature=0.8, json_response=True)
-    if content:
-        try:
-            return json.loads(content), usage
-        except:
-            pass
-            
-    # Fallback
-    return {
-        "question": base_question,
-        "options": [
-            {"label": "经典模式", "value": "经典叙事风格"},
-            {"label": "反转模式", "value": "带有反转的剧情"},
-            {"label": "实验风格", "value": "大胆的实验性风格"}
-        ]
-    }, usage
+    if not content:
+        raise ValueError(f"Empty interaction payload for step: {step_key}")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        logger.warning(f"generate_interaction_options JSON parse failed for {step_key}: {content[:500]}")
+        raise ValueError(f"Invalid JSON interaction payload for step: {step_key}") from exc
+
+    return _normalize_interaction_payload(step_key, base_question, parsed), usage
