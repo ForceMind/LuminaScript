@@ -112,8 +112,6 @@ const storySynopsis = computed(() => {
         context.synopsis_brief ||
         context.brief_synopsis ||
         context.story_brief ||
-        context.logline ||
-        currentProject.value.logline ||
         ''
     )
 

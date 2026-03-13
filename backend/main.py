@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any
 from pydantic import BaseModel 
 import json
+import re
 
 from database import init_db, get_db
 import models
@@ -40,6 +41,159 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("lumina_backend")
+
+PROJECT_TYPE_LABELS = {
+    "movie": "电影剧本",
+    "tv": "剧集剧本",
+    "short": "短剧剧本",
+    "pending": "待确定"
+}
+
+SUMMARY_LABELS = {
+    "title": "故事题目",
+    "project_type": "剧本类型",
+    "logline": "核心概念",
+    "synopsis_brief": "故事梗概",
+    "movie_duration": "电影时长",
+    "scene_count_target": "目标场次",
+    "episode_count": "集数",
+    "episode_duration": "单集时长",
+    "tone": "基调",
+    "time_period": "时代背景",
+    "story_expansion": "剧情大纲",
+    "character_details": "人物设定",
+    "plot_details": "关键设定",
+    "theme": "主题",
+    "visual_style": "视觉风格",
+    "user_notes": "补充说明"
+}
+
+SUMMARY_ORDER = [
+    "title",
+    "project_type",
+    "logline",
+    "synopsis_brief",
+    "movie_duration",
+    "scene_count_target",
+    "episode_count",
+    "episode_duration",
+    "tone",
+    "time_period",
+    "story_expansion",
+    "character_details",
+    "plot_details",
+    "theme",
+    "visual_style",
+    "user_notes"
+]
+
+TITLE_PATTERN = re.compile(r"《\s*([^《》\n]{1,60}?)\s*》")
+TITLE_BREAK_PATTERN = re.compile(r"[，。！？：；,.!?;:\n]")
+
+
+def extract_story_title(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+
+    marked_title = TITLE_PATTERN.search(text)
+    if marked_title:
+        return marked_title.group(1).strip()
+
+    short_title = TITLE_BREAK_PATTERN.split(text, maxsplit=1)[0].strip(" \t\r\n\"'“”‘’《》")
+    if short_title and len(short_title) <= 30:
+        return short_title
+
+    return ""
+
+
+def format_summary_value(key: str, value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, (list, dict)):
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+    else:
+        text = str(value).strip()
+
+    if not text:
+        return ""
+
+    if key == "project_type":
+        return PROJECT_TYPE_LABELS.get(text, text)
+
+    if key in {"movie_duration", "episode_duration"}:
+        if "分钟" in text:
+            return text
+        duration_match = re.search(r"\d+", text)
+        if duration_match:
+            return f"{duration_match.group(0)} 分钟"
+
+    if key == "scene_count_target" and re.fullmatch(r"\d+", text):
+        return f"{text} 场"
+
+    if key == "episode_count" and re.fullmatch(r"\d+", text):
+        return f"{text} 集"
+
+    return text
+
+
+def build_context_summary(project: models.Project, context: Dict[str, Any]) -> str:
+    summary_context = dict(context or {})
+    if project.logline:
+        summary_context.setdefault("logline", project.logline)
+
+    lines: List[str] = []
+    for key in SUMMARY_ORDER:
+        if key not in summary_context:
+            continue
+
+        label = SUMMARY_LABELS.get(key)
+        if not label:
+            continue
+
+        display_value = format_summary_value(key, summary_context.get(key))
+        if not display_value:
+            continue
+
+        if "\n" in display_value:
+            lines.append(f"- {label}：")
+            lines.append(display_value)
+        else:
+            lines.append(f"- {label}：{display_value}")
+
+    return "\n".join(lines)
+
+
+async def ensure_story_synopsis(project: models.Project, context: Dict[str, Any]) -> Dict[str, Any]:
+    enriched_context = dict(context or {})
+    has_brief = bool(str(enriched_context.get("synopsis_brief", "") or "").strip())
+    has_detailed = bool(str(enriched_context.get("synopsis_detailed", "") or "").strip())
+    if has_brief and has_detailed:
+        return enriched_context
+
+    try:
+        synopsis = await llm.generate_story_synopsis(
+            logline=project.logline or "",
+            context=enriched_context,
+            project_type=project.project_type or "movie"
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to generate story synopsis for project {project.id}: {exc}")
+        return enriched_context
+
+    brief = str(synopsis.get("brief", "") or "").strip()
+    detailed = str(synopsis.get("detailed", "") or "").strip()
+
+    if brief:
+        enriched_context["synopsis_brief"] = brief
+    if detailed:
+        enriched_context["synopsis_detailed"] = detailed
+
+    if enriched_context != (project.global_context or {}):
+        project.global_context = enriched_context
+
+    return enriched_context
 
 # Initialize App
 app = FastAPI(title="LuminaScript API", version="0.1.0")
@@ -389,7 +543,8 @@ async def submit_interaction(
     current_context = dict(project.global_context) if project.global_context else {}
     
     # Special Handling: Reset
-    if interaction.context_key == 'final_confirm' and interaction.answer == 'reset':
+    answer_text = (interaction.answer or "").strip()
+    if interaction.context_key == 'final_confirm' and answer_text == 'reset':
         logger.info(f"项目 {project_id} 收到重置请求，清空上下文重新开始设定流程")
         project.global_context = {}
         project.next_step_cache = None
@@ -397,24 +552,26 @@ async def submit_interaction(
         await db.commit()
         return {"status": "reset", "context": {}}
 
-    current_context[interaction.context_key] = interaction.answer
-    project.global_context = current_context
-
     # Ensure project_type is synced if that was the key (legacy support)
     if interaction.context_key == 'project_type':
-        project.project_type = interaction.answer
+        project.project_type = answer_text
     
     # Handle Title Update specifically
     if interaction.context_key == 'title':
-        logger.info(f"Checking title update. Proposed Title: '{interaction.answer}'")
-        # Ensure we don't accidentally set the title to the question string if logic failed somewhere
-        # Simple heuristic: If it ends with '?', it's likely a mistake.
-        if interaction.answer and not interaction.answer.strip().endswith('?'):
-            project.title = interaction.answer
+        logger.info(f"Checking title update. Proposed Title: '{answer_text}'")
+        clean_title = extract_story_title(answer_text)
+        if clean_title:
+            current_context[interaction.context_key] = clean_title
+            project.title = clean_title
             logger.info(f"Project Title Updated to: {project.title}")
         else:
-             logger.warning(f"Ignored suspicious title update: {interaction.answer}")
-        
+             current_context.pop(interaction.context_key, None)
+             logger.warning(f"Ignored suspicious title update: {answer_text}")
+    else:
+        current_context[interaction.context_key] = answer_text
+
+    project.global_context = current_context
+
     # Clear the cache because state has changed
     project.next_step_cache = None
 
@@ -595,11 +752,12 @@ async def analyze_logline(
         }
     
     if next_step.get("is_confirmation"):
-        # Format a summary for confirmation
-        summary_lines = []
-        for k, v in normalized_context.items():
-             summary_lines.append(f"- {k}: {v}")
-        summary_text = "\n".join(summary_lines)
+        normalized_context = await ensure_story_synopsis(project, normalized_context)
+        if project.project_type and project.project_type != "pending":
+            normalized_context["project_type"] = project.project_type
+
+        summary_text = build_context_summary(project, normalized_context)
+        await db.commit()
         return {
             "type": "interaction_required",
             "payload": add_progress({
@@ -685,15 +843,16 @@ async def generate_scenes(
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
     
+    c = await ensure_story_synopsis(project, project.global_context or {})
+    project.global_context = c
+
     # Use selected_option if string generic, or fallback to stored context values
     style_context = selected_option
     if not style_context:
         # Construct summary from context
-        c = project.global_context or {}
         style_context = f"Genre: {project.project_type}, Tone: {c.get('tone')}, Style: {c.get('visual_style')}"
 
     # Extract target episode count / scene count from context
-    c = project.global_context or {}
     target_count = 5
     
     # Priority for Movie: scene_count_target

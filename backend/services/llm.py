@@ -201,6 +201,72 @@ async def review_user_input(text: str):
         "suggested_rewrite": _fallback_rewrite(raw_text, categories)
     }
 
+async def generate_story_synopsis(logline: str, context: dict | None = None, project_type: str = "movie"):
+    """
+    Generate AI-written brief and detailed synopses from the current project setup.
+    Returns:
+    {
+        "brief": str,
+        "detailed": str
+    }
+    """
+    clean_logline = (logline or "").strip()
+    context = context or {}
+    if not clean_logline and not context:
+        return {"brief": "", "detailed": ""}
+
+    type_label = {
+        "movie": "电影剧本",
+        "tv": "剧集剧本",
+        "short": "短剧剧本"
+    }.get(project_type, "剧本")
+
+    system_prompt = """
+    你是专业编剧策划，请根据故事设定输出两版中文梗概。
+
+    要求：
+    1. 只返回 JSON，不要输出任何额外说明。
+    2. brief：120-180 字，必须是重新组织后的简要梗概，不能直接照抄用户输入的一句话。
+    3. detailed：300-500 字，交代主角目标、核心冲突、关键转折和整体走向。
+    4. 全部使用简体中文，语言凝练、具有影视策划感。
+
+    返回格式：
+    {
+      "brief": "简要梗概",
+      "detailed": "详细梗概"
+    }
+    """
+
+    user_prompt = f"""
+    项目类型：{type_label}
+    故事原始设想：{clean_logline}
+    当前设定：{json.dumps(context, ensure_ascii=False)}
+
+    请基于以上信息生成两个版本的故事梗概。
+    """
+
+    content, _ = await raw_generation(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.7,
+        json_response=True
+    )
+
+    if not content:
+        return {"brief": "", "detailed": ""}
+
+    try:
+        parsed = json.loads(content)
+        return {
+            "brief": str(parsed.get("brief", "") or "").strip(),
+            "detailed": str(parsed.get("detailed", "") or "").strip()
+        }
+    except Exception:
+        logger.warning("generate_story_synopsis failed to parse JSON response")
+        return {"brief": "", "detailed": ""}
+
 async def analyze_script_requirements(logline: str, project_type: str="movie"):
     """
     Step 1: Analyze logline and ask user for direction.
