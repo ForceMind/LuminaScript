@@ -71,6 +71,12 @@ def upgrade_schema():
         )
     """)
     for column_name, column_sql in (
+        ("project_id", "ALTER TABLE ai_logs ADD COLUMN project_id INTEGER"),
+        ("action", "ALTER TABLE ai_logs ADD COLUMN action VARCHAR"),
+        ("prompt", "ALTER TABLE ai_logs ADD COLUMN prompt TEXT"),
+        ("response", "ALTER TABLE ai_logs ADD COLUMN response TEXT"),
+        ("tokens", "ALTER TABLE ai_logs ADD COLUMN tokens INTEGER DEFAULT 0"),
+        ("timestamp", "ALTER TABLE ai_logs ADD COLUMN timestamp VARCHAR"),
         ("status", "ALTER TABLE ai_logs ADD COLUMN status VARCHAR DEFAULT 'success'"),
         ("step_key", "ALTER TABLE ai_logs ADD COLUMN step_key VARCHAR"),
         ("error_type", "ALTER TABLE ai_logs ADD COLUMN error_type VARCHAR"),

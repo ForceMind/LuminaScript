@@ -3,6 +3,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import OperationalError
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel 
 import json
@@ -735,26 +736,37 @@ async def admin_list_ai_logs(
     db: AsyncSession = Depends(get_db),
     admin: models.User = Depends(check_admin)
 ):
-    offset = (page - 1) * page_size
-    
-    # 1. Get Total Count
-    count_query = select(func.count()).select_from(models.AIInteractionLog)
-    total_result = await db.execute(count_query)
-    total = int(total_result.scalar() or 0)
+    async def _fetch_ai_logs_page() -> Dict[str, Any]:
+        offset = (page - 1) * page_size
 
-    # 2. Get Items
-    result = await db.execute(
-        select(models.AIInteractionLog, models.User.username)
-        .join(models.User, models.AIInteractionLog.user_id == models.User.id)
-        .order_by(models.AIInteractionLog.timestamp.desc())
-        .offset(offset)
-        .limit(page_size)
-    )
-    logs = []
-    for log, username in result:
-        logs.append(_serialize_admin_ai_log(log, username or ""))
-        
-    return {"total": total, "items": logs}
+        count_query = select(func.count()).select_from(models.AIInteractionLog)
+        total_result = await db.execute(count_query)
+        total = int(total_result.scalar() or 0)
+
+        result = await db.execute(
+            select(models.AIInteractionLog, models.User.username)
+            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+            .order_by(models.AIInteractionLog.timestamp.desc())
+            .offset(offset)
+            .limit(page_size)
+        )
+        logs = []
+        for log, username in result:
+            logs.append(_serialize_admin_ai_log(log, username or ""))
+
+        return {"total": total, "items": logs}
+
+    try:
+        return await _fetch_ai_logs_page()
+    except OperationalError as exc:
+        logger.error(f"AI 日志查询失败，尝试自动修复表结构: {exc}")
+        try:
+            import upgrade_admin
+            await asyncio.to_thread(upgrade_admin.upgrade_schema)
+            return await _fetch_ai_logs_page()
+        except Exception as retry_exc:
+            logger.error(f"AI 日志自动修复后仍失败: {retry_exc}")
+            raise HTTPException(status_code=500, detail="AI日志表结构异常，请执行更新脚本后重试。")
 
 
 def _serialize_admin_scene(scene: models.Scene) -> Dict[str, Any]:
@@ -793,31 +805,45 @@ def _serialize_admin_login_log(log: models.LoginLog, username: str) -> Dict[str,
     return {
         "id": log.id,
         "user_id": log.user_id,
-        "user_name": username,
-        "ip_address": log.ip_address,
-        "user_agent": log.user_agent,
-        "location": log.location,
-        "status": log.status,
-        "timestamp": log.timestamp,
+        "user_name": str(username or ""),
+        "ip_address": str(log.ip_address or ""),
+        "user_agent": str(log.user_agent or ""),
+        "location": str(log.location or ""),
+        "status": str(log.status or ""),
+        "timestamp": str(log.timestamp or ""),
     }
 
 
 def _serialize_admin_ai_log(log: models.AIInteractionLog, username: str) -> Dict[str, Any]:
+    def _safe_text(value: Any, default: str = "") -> str:
+        if value is None:
+            return default
+        try:
+            return str(value)
+        except Exception:
+            return default
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
     return {
         "id": log.id,
         "user_id": log.user_id,
-        "user_name": username,
+        "user_name": _safe_text(username),
         "project_id": log.project_id,
-        "action": log.action,
-        "prompt": log.prompt,
-        "response": log.response,
-        "tokens": log.tokens,
-        "status": log.status or "success",
-        "step_key": log.step_key,
-        "error_type": log.error_type,
-        "error_message": log.error_message,
-        "attempt": log.attempt or 1,
-        "timestamp": log.timestamp,
+        "action": _safe_text(log.action),
+        "prompt": _safe_text(log.prompt),
+        "response": _safe_text(log.response),
+        "tokens": _safe_int(log.tokens, 0),
+        "status": _safe_text(log.status, "success") or "success",
+        "step_key": _safe_text(log.step_key),
+        "error_type": _safe_text(log.error_type),
+        "error_message": _safe_text(log.error_message),
+        "attempt": _safe_int(log.attempt, 1),
+        "timestamp": _safe_text(log.timestamp),
     }
 
 

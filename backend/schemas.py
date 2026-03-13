@@ -77,17 +77,17 @@ class AIInteractionLogResponse(BaseModel):
     id: int
     user_id: int
     user_name: Optional[str] = None
-    project_id: Optional[int]
-    action: str
-    prompt: str
-    response: str
-    tokens: int
-    status: str = "success"
+    project_id: Optional[int] = None
+    action: Optional[str] = ""
+    prompt: Optional[str] = ""
+    response: Optional[str] = ""
+    tokens: Optional[int] = 0
+    status: Optional[str] = "success"
     step_key: Optional[str] = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     attempt: int = 1
-    timestamp: str
+    timestamp: Optional[str] = ""
 
     class Config:
         from_attributes = True
