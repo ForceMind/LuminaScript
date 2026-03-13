@@ -14,11 +14,21 @@ FRONTEND_DIR="$PROJECT_DIR/frontend"
 BACKUP_DIR="$PROJECT_DIR/backups/update_$(date +%Y%m%d_%H%M%S)"
 VENV_DIR="$BACKEND_DIR/venv"
 FRONTEND_SERVER_FILE="$FRONTEND_DIR/server.cjs"
+RUNTIME_FILE="$PROJECT_DIR/.lumina_runtime"
+BACKEND_PORT="8000"
+FRONTEND_PORT="8600"
+BACKEND_LOG="$PROJECT_DIR/backend.log"
+FRONTEND_LOG="$PROJECT_DIR/frontend.log"
+
+if [ -f "$RUNTIME_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$RUNTIME_FILE"
+fi
+
+mkdir -p "$BACKUP_DIR"
 
 echo -e "${BLUE}====== 妙笔流光一键更新脚本 ======${NC}"
 echo "项目目录: $PROJECT_DIR"
-
-mkdir -p "$BACKUP_DIR"
 
 backup_if_exists() {
     local source_path="$1"
@@ -43,7 +53,7 @@ backup_if_exists() {
 is_runtime_data_path() {
     local path="$1"
     case "$path" in
-        backend/.env|*.db|*.sqlite|*.sqlite3|*.log|frontend/dist/*|frontend/node_modules/*|backend/venv/*|backend/__pycache__/*|node_modules/*|backups/*)
+        backend/.env|.lumina_runtime|*.db|*.sqlite|*.sqlite3|*.log|frontend/dist/*|frontend/node_modules/*|backend/venv/*|backend/__pycache__/*|node_modules/*|backups/*)
             return 0
             ;;
         *)
@@ -64,12 +74,12 @@ is_auto_restore_path() {
     esac
 }
 
+echo -e "${YELLOW}[1/6] 检查当前代码状态...${NC}"
 if [ ! -d "$PROJECT_DIR/.git" ]; then
     echo -e "${RED}当前目录不是 Git 仓库，无法执行更新。${NC}"
     exit 1
 fi
 
-echo -e "${YELLOW}[1/6] 检查当前代码状态...${NC}"
 AUTO_RESTORE_PATHS=()
 BLOCKING_CHANGES=()
 
@@ -114,6 +124,7 @@ if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "HEAD" ]; then
     echo -e "${RED}当前不在有效分支上，无法安全拉取更新。${NC}"
     exit 1
 fi
+
 echo "当前分支: $CURRENT_BRANCH"
 
 echo -e "${YELLOW}[2/6] 备份用户数据和配置...${NC}"
@@ -123,6 +134,7 @@ backup_if_exists "$BACKEND_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/backend.log"
 backup_if_exists "$PROJECT_DIR/frontend.log"
+backup_if_exists "$RUNTIME_FILE"
 
 echo -e "${YELLOW}[3/6] 拉取最新代码...${NC}"
 git fetch origin
@@ -149,7 +161,6 @@ fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
-
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PIP" install -r "$BACKEND_DIR/requirements.txt"
 
@@ -163,6 +174,7 @@ if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
 else
     npm install
 fi
+
 if ! npm run build; then
     echo -e "${YELLOW}检测到 npm run build 不可用，自动回退到 vite build。${NC}"
     npx vite build
@@ -171,25 +183,40 @@ fi
 echo -e "${YELLOW}[6/6] 重启当前服务...${NC}"
 cd "$PROJECT_DIR"
 
-if [ -x "$VENV_DIR/bin/uvicorn" ]; then
-    pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
-    cd "$BACKEND_DIR"
-    nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port 8000 >> "$PROJECT_DIR/backend.log" 2>&1 &
-    cd "$PROJECT_DIR"
-    echo "后端已重启: 8000"
+if [ -x "$PROJECT_DIR/miaobi" ]; then
+    chmod +x "$PROJECT_DIR/miaobi" "$PROJECT_DIR/update.sh" "$PROJECT_DIR/uninstall.sh"
+    "$PROJECT_DIR/miaobi" restart
 else
-    echo -e "${YELLOW}未找到 uvicorn，已跳过后端重启。${NC}"
+    echo -e "${YELLOW}未找到 miaobi，使用兼容模式重启服务。${NC}"
+
+    if [ -x "$VENV_DIR/bin/uvicorn" ]; then
+        pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+        cd "$BACKEND_DIR"
+        nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
+        cd "$PROJECT_DIR"
+    fi
+
+    if [ -f "$FRONTEND_SERVER_FILE" ]; then
+        fpid="$(lsof -t -i:$FRONTEND_PORT 2>/dev/null || true)"
+        if [ -n "${fpid:-}" ]; then
+            kill -9 "$fpid" 2>/dev/null || true
+        fi
+        nohup node "$FRONTEND_SERVER_FILE" >> "$FRONTEND_LOG" 2>&1 &
+    fi
 fi
 
-if [ -f "$FRONTEND_SERVER_FILE" ]; then
-    fpid="$(lsof -t -i:8600 2>/dev/null || true)"
-    if [ -n "${fpid:-}" ]; then
-        kill -9 "$fpid" 2>/dev/null || true
-    fi
-    nohup node "$FRONTEND_SERVER_FILE" >> "$PROJECT_DIR/frontend.log" 2>&1 &
-    echo "前端已重启: 8600"
-else
-    echo -e "${YELLOW}未找到 server.cjs，已完成代码更新和前端构建。${NC}"
-fi
+cat > "$RUNTIME_FILE" <<EOF
+PROJECT_DIR=$PROJECT_DIR
+BACKEND_DIR=$BACKEND_DIR
+FRONTEND_DIR=$FRONTEND_DIR
+VENV_DIR=$VENV_DIR
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+BACKEND_LOG=$BACKEND_LOG
+FRONTEND_LOG=$FRONTEND_LOG
+EOF
+
+ln -sf "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi 2>/dev/null || true
 
 echo -e "${GREEN}更新完成。备份目录: $BACKUP_DIR${NC}"
+echo "停止服务命令: miaobi stop"

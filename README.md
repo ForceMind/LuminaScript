@@ -1,90 +1,128 @@
-# 妙笔流光 (LuminaScript) - 自动化 AI 剧本工场
+# 妙笔流光 (LuminaScript)
 
-**LuminaScript** 是一个 AI 辅助剧本创作平台。它通过解决 Context Window 限制问题，实现了从“一句话灵感”到“长篇剧本”的自动化生成。
+妙笔流光是一个 AI 辅助剧本创作平台，支持从创意输入、设定补全、分场大纲生成，到逐场剧本内容创作的完整流程。
 
-项目采用 "Human-in-the-loop"（人工策划）+ "Rolling Summary"（滚动摘要）的技术架构。
+## 技术栈
+- 前端：Vue 3、Vite、Element Plus、Tailwind CSS
+- 后端：FastAPI、SQLAlchemy Async、SQLite
+- AI：兼容 OpenAI 接口的模型服务
 
----
-
-## 🛠️ 技术栈
-
-* **前端**: Vue 3, Vite, Tailwind CSS, Element Plus
-* **后端**: Python 3.10+, FastAPI, SQLAlchemy (Async)
-* **数据库**: SQLite (默认) / PostgreSQL
-* **AI**: OpenAI API / DeepSeek 兼容接口
-
----
-
-## 🚀 快速开始
-
-### 1. 本地开发 (Windows)
-
-我们提供了一键启动脚本，自动为您准备环境并运行服务。
-
-**前置要求**:
-
-* Python 3.10+
-* Node.js 18+
-
-**启动步骤**:
-
-1. 进入项目根目录。
-2. 双击运行 `start.bat`。
-   * **首次运行**: 脚本会自动生成默认配置 `backend/.env`。请打开该文件填入您的 API Key。
-3. 脚本将自动打开两个服务：
-   * **后端 API**: 运行在 `http://127.0.0.1:8000`
-   * **前端 UI**: 运行在 `http://localhost:5173`
-
-### 2. 服务器部署 (Linux)
-
-我们提供了智能部署脚本，支持 Ubuntu, Debian, CentOS 等主流发行版。
-脚本 (`deploy.sh`) 支持环境自检、自动端口避让及 Python 版本自动搜索。
-
-**使用方法**:
-
-1. 将项目上传至服务器。
-
-2. 赋予脚本执行权限：
-   
-   ```bash
-   chmod +x deploy.sh
-   ```
-
-3. 运行部署脚本：
-   
-   ```bash
-   ./deploy.sh
-   ```
-   
-   * **Python 版本自动兼容**: 如果您的系统默认是 Python 3.6，脚本会自动查找已安装的 `python3.8`, `python3.9` 等更高版本来创建虚拟环境，**不会影响系统默认设置**。
-   * **自动端口选择**: 若默认 8000 端口被占用，将自动尝试 8001, 8002... 并告知您最终端口。
-   * **灵活构建**: 若服务器未安装 Node.js，脚本会自动跳过前端构建，请确保您已手动上传 `frontend/dist` 目录。
-
-4. (可选) 如果脚本提示找不到合适 Python，请安装一个新版（例如在 CentOS 上）：
-   
-   ```bash
-   sudo yum install python39
-   # 之后再次运行 ./deploy.sh 即可
-   ```
-   
-   * **首次运行**: 会提示输入 API 配置。
-   * 移除 PM2 依赖，使用 `nohup` 自动在后台运行后端服务。
-
----
-
-## 📂 项目结构
-
-```
+## 目录结构
+```text
 LuminaScript/
-├── backend/            # Python FastAPI 后端
-│   ├── main.py         # 入口文件 & 核心逻辑
-│   ├── models.py       # 数据库模型
-│   ├── schemas.py      # Pydantic 数据验证 & 交互协议
-│   └── database.py     # 数据库连接
-├── frontend/           # Vue 3 前端
-│   ├── src/            # 页面源码
-│   └── vite.config.ts  # 构建配置
-├── dev.ps1             # Windows 开发启动脚本
-├── deploy.sh           # Linux 部署脚本
-└── README.md           # 项目文档
+├─ backend/                     后端服务
+├─ frontend/                    前端应用
+├─ deploy.sh                    Linux 一键部署脚本
+├─ update.sh                    Linux 一键更新脚本
+├─ uninstall.sh                 Linux 卸载脚本
+├─ miaobi                       终端运维命令
+├─ README.md                    使用说明
+└─ API.md                       API 与管理端接口说明
 ```
+
+## 本地开发
+### Windows
+1. 安装 Python 3.10+ 和 Node.js 18+
+2. 在项目根目录运行 `start.bat`
+3. 首次运行后补充 `backend/.env` 中的模型配置
+
+默认地址：
+- 前端：`http://localhost:5173`
+- 后端：`http://127.0.0.1:8000`
+
+## 服务器部署
+### 首次部署
+```bash
+cd /root/LuminaScript
+chmod +x deploy.sh update.sh uninstall.sh miaobi
+sudo bash deploy.sh
+```
+
+部署完成后会自动：
+- 安装依赖
+- 构建前端
+- 启动前后端服务
+- 写入运行信息文件 `.lumina_runtime`
+- 安装全局运维命令 `miaobi`
+
+## 日常运维
+### 推荐入口
+```bash
+miaobi
+```
+
+这会打开中文终端运维面板。
+
+### 常用命令
+```bash
+miaobi status          # 查看前后端状态与端口
+miaobi start           # 启动服务
+miaobi stop            # 停止服务
+miaobi restart         # 重启服务
+miaobi logs backend    # 查看后端日志
+miaobi logs frontend   # 查看前端日志
+miaobi update          # 执行更新脚本
+miaobi uninstall       # 执行卸载脚本
+```
+
+### 停止服务命令
+```bash
+miaobi stop
+```
+
+## 更新
+```bash
+cd /root/LuminaScript
+bash update.sh
+```
+
+更新脚本会：
+- 检查 Git 工作区，避免覆盖人工改动
+- 自动备份数据库、环境变量、日志和运行信息
+- 拉取最新代码
+- 更新后端依赖
+- 重新构建前端
+- 重启服务
+- 重新安装 `miaobi`
+
+## 卸载
+```bash
+cd /root/LuminaScript
+bash uninstall.sh
+```
+
+卸载脚本会：
+- 先备份数据库、环境变量和日志
+- 停止前后端服务
+- 移除 `miaobi` 命令入口
+- 按提示决定是否删除虚拟环境、前端构建产物、日志、数据库和配置文件
+
+默认不会直接删除整个项目目录，也不会强制删除用户数据。
+
+## 管理后台
+管理员登录后可进入“管理后台”，支持：
+- 用户列表查看
+- 登录日志查看
+- AI 审计日志查看
+- 一键导出全部用户数据
+
+### 一键导出全部用户数据
+管理员面板中的“导出全部用户数据”会下载一个 ZIP，包含：
+- `manifest.json`
+- `users.json`
+- `projects.json`
+- `login_logs.json`
+- `ai_logs.json`
+- 数据库文件备份（如果当前环境是 SQLite）
+
+## 运行文件说明
+- `.lumina_runtime`：运行信息文件，记录当前前后端端口、日志路径、项目目录
+- `backend.log`：后端运行日志
+- `frontend.log`：前端运行日志
+- `backups/`：更新、卸载前的自动备份目录
+
+## 安全建议
+- 尽快修改管理员默认账号密码
+- 生产环境请设置强随机 `SECRET_KEY`
+- 定期执行管理员数据导出并离线备份
+- 对外开放端口前，确认安全组和防火墙规则

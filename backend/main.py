@@ -7,6 +7,8 @@ from typing import List, Dict, Any
 from pydantic import BaseModel 
 import json
 import re
+import zipfile
+from pathlib import Path
 
 from database import init_db, get_db
 import models
@@ -711,6 +713,189 @@ async def admin_list_ai_logs(
         logs.append(log_dict)
         
     return {"total": total, "items": logs}
+
+
+def _serialize_admin_scene(scene: models.Scene) -> Dict[str, Any]:
+    return {
+        "id": scene.id,
+        "scene_index": scene.scene_index,
+        "outline": scene.outline,
+        "content": scene.content,
+        "summary": scene.summary,
+        "status": str(scene.status),
+    }
+
+
+def _serialize_admin_project(project: models.Project, owner_lookup: Dict[int, str]) -> Dict[str, Any]:
+    return {
+        "id": project.id,
+        "owner_id": project.owner_id,
+        "owner_username": owner_lookup.get(project.owner_id, ""),
+        "title": project.title,
+        "logline": project.logline,
+        "project_type": project.project_type,
+        "genre": project.genre,
+        "status": str(project.status),
+        "total_tokens": project.total_tokens,
+        "global_context": project.global_context or {},
+        "global_summary": project.global_summary,
+        "scene_count": len(project.scenes or []),
+        "scenes": [
+            _serialize_admin_scene(scene)
+            for scene in sorted(project.scenes or [], key=lambda item: item.scene_index)
+        ],
+    }
+
+
+def _serialize_admin_login_log(log: models.LoginLog, username: str) -> Dict[str, Any]:
+    return {
+        "id": log.id,
+        "user_id": log.user_id,
+        "user_name": username,
+        "ip_address": log.ip_address,
+        "user_agent": log.user_agent,
+        "location": log.location,
+        "status": log.status,
+        "timestamp": log.timestamp,
+    }
+
+
+def _serialize_admin_ai_log(log: models.AIInteractionLog, username: str) -> Dict[str, Any]:
+    return {
+        "id": log.id,
+        "user_id": log.user_id,
+        "user_name": username,
+        "project_id": log.project_id,
+        "action": log.action,
+        "prompt": log.prompt,
+        "response": log.response,
+        "tokens": log.tokens,
+        "timestamp": log.timestamp,
+    }
+
+
+def _iter_export_database_paths() -> List[Path]:
+    candidates: List[Path] = []
+    sqlite_prefix = "sqlite+aiosqlite:///"
+    if database.DATABASE_URL.startswith(sqlite_prefix):
+        candidates.append(Path(database.DATABASE_URL[len(sqlite_prefix):]))
+
+    backend_dir = Path(__file__).resolve().parent
+    project_dir = backend_dir.parent
+    candidates.extend([
+        backend_dir / "lumina_v2.db",
+        backend_dir / "lumina.db",
+        project_dir / "lumina_v2.db",
+        project_dir / "lumina.db",
+    ])
+
+    unique_paths: List[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        key = candidate.as_posix()
+        if key in seen or not candidate.exists():
+            continue
+        seen.add(key)
+        unique_paths.append(candidate)
+    return unique_paths
+
+
+@app.get("/admin/export/all")
+async def admin_export_all_data(
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(check_admin)
+):
+    users_result = await db.execute(select(models.User).order_by(models.User.id.asc()))
+    users = users_result.scalars().all()
+    owner_lookup = {user.id: user.username for user in users}
+
+    projects_result = await db.execute(
+        select(models.Project)
+        .options(selectinload(models.Project.scenes))
+        .order_by(models.Project.id.asc())
+    )
+    projects = projects_result.scalars().all()
+
+    login_logs_result = await db.execute(
+        select(models.LoginLog)
+        .order_by(models.LoginLog.timestamp.desc(), models.LoginLog.id.desc())
+    )
+    login_logs = login_logs_result.scalars().all()
+
+    ai_logs_result = await db.execute(
+        select(models.AIInteractionLog)
+        .order_by(models.AIInteractionLog.timestamp.desc(), models.AIInteractionLog.id.desc())
+    )
+    ai_logs = ai_logs_result.scalars().all()
+
+    export_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_name = f"luminascript_admin_export_{export_time}.zip"
+
+    manifest = {
+        "exported_at": datetime.now().isoformat(),
+        "exported_by": admin.username,
+        "counts": {
+            "users": len(users),
+            "projects": len(projects),
+            "login_logs": len(login_logs),
+            "ai_logs": len(ai_logs),
+        },
+        "database_files": [path.name for path in _iter_export_database_paths()],
+    }
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        archive.writestr(
+            "users.json",
+            json.dumps(
+                [
+                    {
+                        "id": user.id,
+                        "username": user.username,
+                        "is_admin": bool(user.is_admin),
+                    }
+                    for user in users
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        archive.writestr(
+            "projects.json",
+            json.dumps(
+                [_serialize_admin_project(project, owner_lookup) for project in projects],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        archive.writestr(
+            "login_logs.json",
+            json.dumps(
+                [_serialize_admin_login_log(log, owner_lookup.get(log.user_id, "")) for log in login_logs],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        archive.writestr(
+            "ai_logs.json",
+            json.dumps(
+                [_serialize_admin_ai_log(log, owner_lookup.get(log.user_id, "")) for log in ai_logs],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+        for db_path in _iter_export_database_paths():
+            archive.write(db_path, arcname=f"database/{db_path.name}")
+
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(archive_name)}"}
+    )
 
 # --- Auth Routes ---
 

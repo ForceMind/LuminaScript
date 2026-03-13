@@ -2,18 +2,18 @@
 import { ref, onMounted, watch } from 'vue'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
-import { User, Timer, DataLine } from '@element-plus/icons-vue'
+import { DataLine, Download } from '@element-plus/icons-vue'
 
 const props = defineProps<{ token: string }>()
 const emit = defineEmits(['close'])
 
 const activeTab = ref('users')
-const users = ref([])
-const loginLogs = ref([])
-const aiLogs = ref([])
+const users = ref<any[]>([])
+const loginLogs = ref<any[]>([])
+const aiLogs = ref<any[]>([])
 const loading = ref(false)
+const exportLoading = ref(false)
 
-// Pagination State
 const loginPage = ref(1)
 const loginPageSize = ref(20)
 const loginTotal = ref(0)
@@ -45,12 +45,11 @@ const fetchLoginLogs = async () => {
     try {
         const res = await api.get(`/admin/logs/login?page=${loginPage.value}&page_size=${loginPageSize.value}`)
         if (res.data.items) {
-             loginLogs.value = res.data.items
-             loginTotal.value = res.data.total
+            loginLogs.value = res.data.items
+            loginTotal.value = res.data.total
         } else {
-             // Fallback for old API just in case
-             loginLogs.value = res.data
-             loginTotal.value = res.data.length
+            loginLogs.value = res.data
+            loginTotal.value = res.data.length
         }
     } catch (e) {
         ElMessage.error('无法获取登录日志')
@@ -71,9 +70,37 @@ const fetchAiLogs = async () => {
             aiTotal.value = res.data.length
         }
     } catch (e) {
-        ElMessage.error('无法获取AI日志')
+        ElMessage.error('无法获取 AI 日志')
     } finally {
         loading.value = false
+    }
+}
+
+const downloadAllUserData = async () => {
+    exportLoading.value = true
+    try {
+        const response = await api.get('/admin/export/all', { responseType: 'blob' })
+        const blobUrl = window.URL.createObjectURL(new Blob([response.data], { type: 'application/zip' }))
+        const link = document.createElement('a')
+        link.href = blobUrl
+
+        const contentDisposition = response.headers['content-disposition'] || ''
+        const fileNameMatch = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
+        const fileName = fileNameMatch?.[1]
+            ? decodeURIComponent(fileNameMatch[1])
+            : `luminascript_admin_export_${Date.now()}.zip`
+
+        link.setAttribute('download', fileName)
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+        window.URL.revokeObjectURL(blobUrl)
+        ElMessage.success('已开始下载全部用户数据')
+    } catch (e) {
+        console.error(e)
+        ElMessage.error('导出全部用户数据失败')
+    } finally {
+        exportLoading.value = false
     }
 }
 
@@ -89,7 +116,6 @@ const handleTabChange = () => {
     }
 }
 
-// Watchers for pagination
 watch(loginPage, () => fetchLoginLogs())
 watch(aiPage, () => fetchAiLogs())
 
@@ -101,12 +127,17 @@ onMounted(() => {
 <template>
 <div class="fixed inset-0 bg-white z-50 overflow-y-auto">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div class="flex items-center justify-between mb-8">
+        <div class="flex items-center justify-between mb-8 gap-4 flex-wrap">
             <h1 class="text-2xl font-bold text-gray-900 flex items-center gap-2">
                 <el-icon><DataLine /></el-icon>
                 系统后台管理
             </h1>
-            <el-button @click="$emit('close')">返回创作室</el-button>
+            <div class="flex items-center gap-3 flex-wrap">
+                <el-button type="primary" :icon="Download" :loading="exportLoading" @click="downloadAllUserData">
+                    导出全部用户数据
+                </el-button>
+                <el-button @click="$emit('close')">返回创作室</el-button>
+            </div>
         </div>
 
         <el-tabs v-model="activeTab" @tab-change="handleTabChange" type="card">
@@ -132,11 +163,11 @@ onMounted(() => {
                         </template>
                     </el-table-column>
                     <el-table-column prop="user_name" label="用户" width="120" />
-                    <el-table-column prop="ip_address" label="IP 地址" width="140" />
-                    <el-table-column prop="user_agent" label="设备信息" min-width="180">
-                         <template #default="scope">
-                             <span class="text-xs text-gray-500 break-words">{{ scope.row.user_agent || 'Unknown' }}</span>
-                         </template>
+                    <el-table-column prop="ip_address" label="IP 地址" width="160" />
+                    <el-table-column prop="user_agent" label="设备信息" min-width="220">
+                        <template #default="scope">
+                            <span class="text-xs text-gray-500 break-words">{{ scope.row.user_agent || 'Unknown' }}</span>
+                        </template>
                     </el-table-column>
                     <el-table-column label="状态" width="100">
                         <template #default="scope">
@@ -147,37 +178,37 @@ onMounted(() => {
                     </el-table-column>
                 </el-table>
                 <div class="mt-4 flex justify-center">
-                    <el-pagination 
-                        v-model:current-page="loginPage" 
-                        layout="total, prev, pager, next" 
-                        :total="loginTotal" 
-                        :page-size="loginPageSize" 
+                    <el-pagination
+                        v-model:current-page="loginPage"
+                        layout="total, prev, pager, next"
+                        :total="loginTotal"
+                        :page-size="loginPageSize"
                         background
                     />
                 </div>
             </el-tab-pane>
 
-            <el-tab-pane label="AI 交互审计" name="ai">
-                 <el-table :data="aiLogs" stripe v-loading="loading">
+            <el-tab-pane label="AI 审计日志" name="ai">
+                <el-table :data="aiLogs" stripe v-loading="loading">
                     <el-table-column prop="timestamp" label="时间" width="180" />
                     <el-table-column prop="user_name" label="用户" width="120" />
                     <el-table-column prop="action" label="操作" width="150" />
                     <el-table-column prop="tokens" label="Tokens" width="100" />
-                    <el-table-column label="Prompt (摘要)">
+                    <el-table-column label="Prompt 摘要">
                         <template #default="scope">
                             <el-popover placement="top" :width="400" trigger="hover">
                                 <template #reference>
-                                <div class="truncate w-40 cursor-pointer text-gray-500">{{ scope.row.prompt }}</div>
+                                    <div class="truncate w-40 cursor-pointer text-gray-500">{{ scope.row.prompt }}</div>
                                 </template>
                                 <div class="whitespace-pre-wrap text-xs h-60 overflow-y-auto">{{ scope.row.prompt }}</div>
                             </el-popover>
                         </template>
                     </el-table-column>
-                    <el-table-column label="Response (摘要)">
+                    <el-table-column label="Response 摘要">
                         <template #default="scope">
-                             <el-popover placement="top" :width="400" trigger="hover">
+                            <el-popover placement="top" :width="400" trigger="hover">
                                 <template #reference>
-                                <div class="truncate w-40 cursor-pointer text-blue-500">{{ scope.row.response }}</div>
+                                    <div class="truncate w-40 cursor-pointer text-blue-500">{{ scope.row.response }}</div>
                                 </template>
                                 <div class="whitespace-pre-wrap text-xs h-60 overflow-y-auto">{{ scope.row.response }}</div>
                             </el-popover>
@@ -185,11 +216,11 @@ onMounted(() => {
                     </el-table-column>
                 </el-table>
                 <div class="mt-4 flex justify-center">
-                    <el-pagination 
-                        v-model:current-page="aiPage" 
-                        layout="total, prev, pager, next" 
-                        :total="aiTotal" 
-                        :page-size="aiPageSize" 
+                    <el-pagination
+                        v-model:current-page="aiPage"
+                        layout="total, prev, pager, next"
+                        :total="aiTotal"
+                        :page-size="aiPageSize"
                         background
                     />
                 </div>

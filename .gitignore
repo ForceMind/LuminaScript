@@ -13,6 +13,7 @@
 # Sensitive
 .env
 .env.*
+.lumina_runtime
 
 # OS
 .DS_Store
