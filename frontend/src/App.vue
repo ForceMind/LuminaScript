@@ -79,7 +79,12 @@ const pollTimer = ref<any>(null)
 const isStarted = ref(false)
 
 // Project Sidebar Data
-const projectContext = computed(() => currentProject.value?.global_context || {})
+const projectContext = computed(() => {
+    const ctx = currentProject.value?.global_context || {}
+    return Object.fromEntries(
+        Object.entries(ctx).filter(([key]) => !key.startsWith('_'))
+    )
+})
 
 const progressPercentage = computed(() => {
     if (!currentProject.value || !currentProject.value.scenes || currentProject.value.scenes.length === 0) return 0
@@ -684,7 +689,7 @@ const sortedContext = computed(() => {
             'synopsis_detailed',
             'detailed_synopsis',
             'story_detailed'
-        ].includes(k)
+        ].includes(k) && !k.startsWith('_')
     )
     
     // Sort logic

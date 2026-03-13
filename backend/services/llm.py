@@ -393,6 +393,84 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
         logger.warning("generate_story_synopsis failed to parse JSON response")
         return {"brief": "", "detailed": ""}
 
+
+async def extract_setup_from_long_input(long_input: str):
+    """
+    Extract high-confidence setup fields from a long user story description.
+    Returns:
+    {
+        "project_type": "movie|tv|short|",
+        "movie_duration": str,
+        "scene_count_target": str,
+        "episode_count": str,
+        "episode_duration": str,
+        "tone": str,
+        "time_period": str,
+        "title": str,
+        "story_expansion": str,
+        "character_details": str,
+        "plot_details": str,
+        "theme": str,
+        "visual_style": str,
+        "user_notes": str
+    }, usage
+    """
+    clean_input = (long_input or "").strip()
+    if not clean_input:
+        return {}, 0
+
+    system_prompt = """
+    你是剧本策划助理。请从用户给出的长篇故事设定中，提取已经明确写出的项目设定。
+
+    规则：
+    1. 只返回 JSON，不要输出任何额外说明。
+    2. 只填写高置信、文本中已经明确出现的信息；不明确的字段必须留空字符串。
+    3. 不要为了凑字段而编造设定。
+    4. project_type 只能是 movie、tv、short 或空字符串。
+    5. title 如果文本里有书名号标题，就只提取书名号里的标题；没有就留空。
+    6. story_expansion、character_details、plot_details 只有在文本已经提供了较完整信息时才填写，否则留空。
+
+    返回格式：
+    {
+      "project_type": "",
+      "movie_duration": "",
+      "scene_count_target": "",
+      "episode_count": "",
+      "episode_duration": "",
+      "tone": "",
+      "time_period": "",
+      "title": "",
+      "story_expansion": "",
+      "character_details": "",
+      "plot_details": "",
+      "theme": "",
+      "visual_style": "",
+      "user_notes": ""
+    }
+    """
+
+    user_prompt = f"待提取文本：\n{clean_input}"
+
+    content, usage = await raw_generation(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.2,
+        json_response=True
+    )
+
+    if not content:
+        raise ValueError("Empty extraction payload for long input")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        logger.warning(f"extract_setup_from_long_input JSON parse failed: {content[:500]}")
+        raise ValueError("Invalid JSON extraction payload for long input") from exc
+
+    return parsed, usage
+
 async def analyze_script_requirements(logline: str, project_type: str="movie"):
     """
     Step 1: Analyze logline and ask user for direction.

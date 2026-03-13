@@ -118,6 +118,24 @@ FINAL_CONFIRM_EDIT_TARGETS = [
 
 FINAL_CONFIRM_ALLOWED_VALUES = {"confirmed", "reset"} | {f"edit:{key}" for key, _ in FINAL_CONFIRM_EDIT_TARGETS}
 RETRY_INTERACTION_FIELD = "retry_current_step"
+AUTO_PREFILL_MIN_LENGTH = 120
+AUTO_PREFILL_FLAG = "_auto_prefill_attempted"
+AUTO_PREFILL_FIELDS = [
+    "project_type",
+    "movie_duration",
+    "scene_count_target",
+    "episode_count",
+    "episode_duration",
+    "tone",
+    "time_period",
+    "title",
+    "story_expansion",
+    "character_details",
+    "plot_details",
+    "theme",
+    "visual_style",
+    "user_notes",
+]
 
 
 def get_relevant_setup_steps(project_type: str) -> List[Dict[str, Any]]:
@@ -242,6 +260,111 @@ def normalize_project_context(project: models.Project) -> bool:
     return changed
 
 
+def build_normalized_context(project: models.Project) -> Dict[str, Any]:
+    context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    if project.project_type and project.project_type != "pending":
+        context["project_type"] = project.project_type
+    return context
+
+
+def has_setup_value(project: models.Project, context: Dict[str, Any], key: str) -> bool:
+    if key == "project_type":
+        value = project.project_type if project.project_type and project.project_type != "pending" else context.get("project_type")
+    elif key == "title":
+        value = context.get("title") or project.title
+    else:
+        value = context.get(key)
+
+    if isinstance(value, str):
+        value = value.strip()
+
+    return value not in (None, "", "pending")
+
+
+def normalize_extracted_setup_value(key: str, value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    if key == "project_type":
+        normalized = text.lower()
+        return normalized if normalized in {"movie", "tv", "short"} else ""
+
+    if key == "title":
+        return extract_story_title(text)
+
+    if key in {"movie_duration", "scene_count_target", "episode_count"}:
+        match = re.search(r"\d+", text)
+        return match.group(0) if match else ""
+
+    if key == "episode_duration":
+        match = re.search(r"\d+", text)
+        return f"{match.group(0)}mins" if match else ""
+
+    if key == "character_details":
+        return text if is_valid_character_details(text) else ""
+
+    if key == "story_expansion":
+        return text if len(text) >= 24 else ""
+
+    if key == "plot_details":
+        return text if len(text) >= 12 else ""
+
+    if key in {"tone", "time_period", "theme", "visual_style", "user_notes"}:
+        return text if len(text) >= 2 else ""
+
+    return text
+
+
+def should_auto_prefill_from_logline(project: models.Project, context: Dict[str, Any]) -> bool:
+    if not isinstance(context, dict):
+        return False
+    if context.get(AUTO_PREFILL_FLAG):
+        return False
+
+    clean_logline = re.sub(r"\s+", "", str(project.logline or ""))
+    return len(clean_logline) >= AUTO_PREFILL_MIN_LENGTH
+
+
+def apply_auto_prefill(project: models.Project, extracted_payload: Dict[str, Any] | None) -> tuple[List[str], bool]:
+    current_context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    extracted_payload = extracted_payload if isinstance(extracted_payload, dict) else {}
+    changed = False
+    filled_fields: List[str] = []
+
+    if not current_context.get(AUTO_PREFILL_FLAG):
+        current_context[AUTO_PREFILL_FLAG] = True
+        changed = True
+
+    for key in AUTO_PREFILL_FIELDS:
+        if has_setup_value(project, current_context, key):
+            continue
+
+        if key == "title":
+            raw_value = extracted_payload.get(key) or project.logline or ""
+        else:
+            raw_value = extracted_payload.get(key)
+
+        normalized_value = normalize_extracted_setup_value(key, raw_value)
+        if not normalized_value:
+            continue
+
+        if key == "project_type":
+            project.project_type = normalized_value
+
+        if key == "title":
+            project.title = normalized_value
+
+        current_context[key] = normalized_value
+        filled_fields.append(key)
+        changed = True
+
+    if changed:
+        project.global_context = current_context
+
+    return filled_fields, changed
+
+
 def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[str, Any] | None = None) -> bool:
     if not isinstance(cache_payload, dict):
         return False
@@ -252,6 +375,21 @@ def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[
 
     field = payload.get("field")
     options = payload.get("options")
+    current_context = current_context or {}
+
+    if field == "project_type":
+        current_value = current_context.get("project_type")
+        if isinstance(current_value, str):
+            current_value = current_value.strip()
+        if current_value not in (None, "", "pending"):
+            return True
+
+    if field and field not in {"final_confirm", RETRY_INTERACTION_FIELD, "project_type"}:
+        current_value = current_context.get(field)
+        if isinstance(current_value, str):
+            current_value = current_value.strip()
+        if current_value not in (None, ""):
+            return True
 
     if field == "final_confirm":
         if not isinstance(options, list):
@@ -260,7 +398,6 @@ def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[
             return True
 
     if field == "title":
-        current_context = current_context or {}
         if any(key not in current_context for key in ("story_expansion", "character_details", "plot_details")):
             return True
 
@@ -860,9 +997,45 @@ async def analyze_logline(
     if normalized:
         await db.commit()
 
+    normalized_context = build_normalized_context(project)
+
+    if should_auto_prefill_from_logline(project, normalized_context):
+        filled_fields: List[str] = []
+        prefill_changed = False
+        prefill_usage = 0
+        extracted_setup: Dict[str, Any] = {}
+
+        try:
+            extracted_setup, prefill_usage = await llm.extract_setup_from_long_input(project.logline or "")
+            filled_fields, prefill_changed = apply_auto_prefill(project, extracted_setup)
+        except Exception as exc:
+            logger.warning(f"Failed to auto-prefill setup from long logline for project {project_id}: {exc}")
+            filled_fields, prefill_changed = apply_auto_prefill(project, {})
+
+        if prefill_usage:
+            project.total_tokens += prefill_usage
+            background_tasks.add_task(
+                log_ai_action,
+                user_id=current_user.id,
+                project_id=project_id,
+                action="auto_prefill_setup",
+                prompt=project.logline or "",
+                response=json.dumps(extracted_setup, ensure_ascii=False),
+                tokens=prefill_usage
+            )
+
+        if filled_fields:
+            logger.info(f"项目 {project_id} 已从长输入自动补全字段: {', '.join(filled_fields)}")
+            project.next_step_cache = None
+
+        if prefill_changed or prefill_usage:
+            await db.commit()
+
+        normalized_context = build_normalized_context(project)
+
     # Check Cache First (For resuming sessions)
     if project.next_step_cache:
-        if should_invalidate_cached_question(project.next_step_cache, project.global_context or {}):
+        if should_invalidate_cached_question(project.next_step_cache, normalized_context):
             project.next_step_cache = None
             await db.commit()
         else:
@@ -871,13 +1044,11 @@ async def analyze_logline(
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
-    context = project.global_context or {}
+    context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
 
     # 1. Check which steps are missing
     # Important: 'project_type' is stored in column, others in global_context
-    normalized_context = context.copy()
-    if project.project_type and project.project_type != "pending":
-        normalized_context['project_type'] = project.project_type
+    normalized_context = build_normalized_context(project)
     
     # Calculate Total Steps (Dynamic based on Type)
     p_type = normalized_context.get("project_type", "movie")
