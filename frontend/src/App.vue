@@ -209,7 +209,7 @@ const characterDetailsText = computed(() => {
 })
 
 const isControlInteractionField = (field: string) => {
-    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration'].includes(field)
+    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration', 'video_duration_seconds'].includes(field)
 }
 
 const canUseCustomInput = computed(() => {
@@ -222,7 +222,7 @@ const shouldShowOptionValue = (opt: any) => {
     const label = toTextValue(opt?.label).trim()
     const value = toTextValue(opt?.value).trim()
     if (!value || value === label) return false
-    if (value.length <= 24 && /^(movie|tv|short|\d+|confirmed|reset|edit:)/.test(value)) return false
+    if (value.length <= 24 && /^(movie|tv|short|short_video|\d+|confirmed|reset|edit:)/.test(value)) return false
     return true
 }
 
@@ -621,7 +621,7 @@ const submitChoice = async () => {
         // WE NEED TO UPDATE BACKEND to accept generic Q&A.
         
         // Temporary Hybrid:
-        if (['movie', 'tv', 'short'].includes(finalAnswer) && !interaction.value.field) {
+        if (['movie', 'tv', 'short', 'short_video'].includes(finalAnswer) && !interaction.value.field) {
              // Backward compatible "Type" selection
              await api.patch(`/projects/${currentProject.value.id}`, { project_type: finalAnswer })
         } else {
@@ -774,7 +774,7 @@ const keySettingsOrder = [
     'title', 'theme', 'tone', 'time_period', 
     'protagonist_core', 'antagonist_obstacle', 'central_conflict',
     'visual_style', 'target_audience', 
-    'episode_count', 'episode_duration', 'movie_duration', 'scene_count_target',
+    'episode_count', 'episode_duration', 'movie_duration', 'video_duration_seconds', 'scene_count_target',
     'plot_details', 'story_expansion', 'user_notes'
 ]
 
@@ -1251,6 +1251,7 @@ const copyText = (value: unknown) => {
                                                     item.key === 'episode_count' ? '集数' :
                                                     item.key === 'episode_duration' ? '单集时长' :
                                                     item.key === 'movie_duration' ? '电影时长' :
+                                                    item.key === 'video_duration_seconds' ? '总时长（秒）' :
                                                     item.key === 'scene_count_target' ? '预期场次' :
                                                     item.key === 'plot_details' ? '关键剧情' :
                                                     item.key === 'story_expansion' ? '故事深化' :

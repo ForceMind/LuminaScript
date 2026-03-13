@@ -420,7 +420,8 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
     type_label = {
         "movie": "电影剧本",
         "tv": "剧集剧本",
-        "short": "短剧剧本"
+        "short": "短剧剧本",
+        "short_video": "短视频"
     }.get(project_type, "剧本")
 
     system_prompt = """
@@ -475,11 +476,12 @@ async def extract_setup_from_long_input(long_input: str):
     Extract high-confidence setup fields from a long user story description.
     Returns:
     {
-        "project_type": "movie|tv|short|",
+        "project_type": "movie|tv|short|short_video|",
         "movie_duration": str,
         "scene_count_target": str,
         "episode_count": str,
         "episode_duration": str,
+        "video_duration_seconds": str,
         "tone": str,
         "time_period": str,
         "title": str,
@@ -502,7 +504,7 @@ async def extract_setup_from_long_input(long_input: str):
     1. 只返回 JSON，不要输出任何额外说明。
     2. 只填写高置信、文本中已经明确出现的信息；不明确的字段必须留空字符串。
     3. 不要为了凑字段而编造设定。
-    4. project_type 只能是 movie、tv、short 或空字符串。
+    4. project_type 只能是 movie、tv、short、short_video 或空字符串。
     5. title 如果文本里有书名号标题，就只提取书名号里的标题；没有就留空。
     6. story_expansion、character_details、plot_details 只有在文本已经提供了较完整信息时才填写，否则留空。
 
@@ -513,6 +515,7 @@ async def extract_setup_from_long_input(long_input: str):
       "scene_count_target": "",
       "episode_count": "",
       "episode_duration": "",
+      "video_duration_seconds": "",
       "tone": "",
       "time_period": "",
       "title": "",
@@ -554,6 +557,7 @@ async def analyze_script_requirements(logline: str, project_type: str="movie"):
     type_context = "电影"
     if project_type == "tv": type_context = "电视剧"
     if project_type == "short": type_context = "现代短剧"
+    if project_type == "short_video": type_context = "短视频"
 
     system_prompt = f"""
     You are an expert Script Development Executive ({type_context} expert).
@@ -594,9 +598,9 @@ async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, e
     count = end_idx - start_idx + 1
     system_prompt = f"""
     You are a professional Screenwriter.
-    Create a scene-by-scene outline for scenes #{start_idx} to #{end_idx}.
-    Total Scenes in Movie: {total_target}.
-    This Batch: {count} scenes.
+    Create a scene-by-scene outline for items #{start_idx} to #{end_idx}.
+    Total Items in Project: {total_target}.
+    This Batch: {count} items.
     
     Context: {logline}
     Style/Settings: {style_guide}
@@ -656,6 +660,76 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
     ]
     
     return await raw_generation(messages, temperature=0.8)
+
+
+async def write_short_video_prompt(
+    logline: str,
+    style_guide: str,
+    current_scene_outline: str,
+    clip_index: int,
+    previous_context: str = "",
+):
+    """
+    Generate a single 15-second short-video prompt block.
+    Returns (content, usage).
+    """
+    system_prompt = f"""
+    你是短视频分镜提示词专家。请基于剧情信息，输出“第{clip_index}条 15秒提示词”。
+
+    项目核心设定：
+    - Logline: {logline}
+    - 风格与设定: {style_guide}
+    - 前文衔接: {previous_context}
+    - 本条剧情目标: {current_scene_outline}
+
+    运镜术语库（优先从下列术语中选择并组合）：
+    - 推镜头 / 慢推
+    - 拉镜头 / 后拉
+    - 左摇 / 右摇
+    - 上摇 / 下摇
+    - 跟随镜头 / 跟拍
+    - 环绕镜头
+    - 一镜到底
+    - 希区柯克变焦
+    - 鱼眼镜头
+    - 低角度仰拍
+    - 俯拍 / 鸟瞰
+    - 第一人称主观视角
+    - 快速摇镜
+    - 机械臂跟随
+    - 极致特写
+    - 面部特写
+    - 中近景
+    - 中景
+    - 全景
+    - 远景 / 建立镜头
+
+    输出要求：
+    1. 必须使用简体中文。
+    2. 只输出正文，不要解释、不要 Markdown 代码块。
+    3. 严格按以下结构输出，每个字段都要有内容：
+    [主体/人物设定]：
+    [场景/环境]：
+    [动作/运动描述]：
+    [运镜语言]：
+    [分时段描述]：
+    0–3秒：[开场画面描述、运镜、动作]
+    3–6秒：[中段发展]
+    6–10秒：[高潮或关键动作]
+    10–15秒：[收尾、定格画面、品牌文字]
+    [转场/特效]：
+    [音频/音效设计]：
+    [风格/氛围]：
+
+    4. 内容必须具有连续剧情推进，避免与前一条完全重复。
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "请生成这一条15秒短视频提示词。"}
+    ]
+
+    return await raw_generation(messages, temperature=0.7)
 
 async def generate_interaction_options(step_key: str, base_question: str, context_str: str):
     """

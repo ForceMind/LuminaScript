@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel 
 import json
+import math
 import re
 import zipfile
 from pathlib import Path
@@ -48,6 +49,7 @@ PROJECT_TYPE_LABELS = {
     "movie": "电影剧本",
     "tv": "剧集剧本",
     "short": "短剧剧本",
+    "short_video": "短视频",
     "pending": "待确定"
 }
 
@@ -60,6 +62,7 @@ SUMMARY_LABELS = {
     "scene_count_target": "目标场次",
     "episode_count": "集数",
     "episode_duration": "单集时长",
+    "video_duration_seconds": "总时长",
     "tone": "基调",
     "time_period": "时代背景",
     "story_expansion": "剧情大纲",
@@ -79,6 +82,7 @@ SUMMARY_ORDER = [
     "scene_count_target",
     "episode_count",
     "episode_duration",
+    "video_duration_seconds",
     "tone",
     "time_period",
     "story_expansion",
@@ -93,12 +97,14 @@ SETUP_FLOW_STEPS = [
     {"key": "project_type", "question": "您想创作哪种类型的剧本？", "default_options": [
         {"label": "🎥 电影剧本", "value": "movie"},
         {"label": "📺 剧集剧本", "value": "tv"},
-        {"label": "📱 短剧剧本", "value": "short"}
+        {"label": "📱 短剧剧本", "value": "short"},
+        {"label": "🎬 短视频", "value": "short_video"}
     ]},
     {"key": "movie_duration", "question": "电影预计时长是多少分钟？", "movie_only": True},
     {"key": "scene_count_target", "question": "您希望生成多少场戏？（电影通常 40-100 场，越多越细）", "movie_only": True},
     {"key": "episode_count", "question": "您计划创作多少集？", "tv_short_only": True},
     {"key": "episode_duration", "question": "每一集的大致时长是？", "tv_short_only": True},
+    {"key": "video_duration_seconds", "question": "短视频总时长是多少秒？系统会自动按每 15 秒拆分。", "short_video_only": True},
     {"key": "tone", "question": "这部作品的基调是什么？"},
     {"key": "time_period", "question": "故事发生在什么时代背景？"},
     {"key": "story_expansion", "question": "我们需要基于目前构思扩展出完整的剧情大纲，您有什么特别想法吗？"},
@@ -127,6 +133,7 @@ AUTO_PREFILL_FIELDS = [
     "scene_count_target",
     "episode_count",
     "episode_duration",
+    "video_duration_seconds",
     "tone",
     "time_period",
     "title",
@@ -145,7 +152,9 @@ def get_relevant_setup_steps(project_type: str) -> List[Dict[str, Any]]:
     for step in SETUP_FLOW_STEPS:
         if step.get("movie_only") and p_type != "movie":
             continue
-        if step.get("tv_short_only") and p_type == "movie":
+        if step.get("tv_short_only") and p_type not in {"tv", "short"}:
+            continue
+        if step.get("short_video_only") and p_type != "short_video":
             continue
         relevant_steps.append(step)
     return relevant_steps
@@ -298,12 +307,12 @@ def normalize_extracted_setup_value(key: str, value: Any) -> str:
 
     if key == "project_type":
         normalized = text.lower()
-        return normalized if normalized in {"movie", "tv", "short"} else ""
+        return normalized if normalized in {"movie", "tv", "short", "short_video"} else ""
 
     if key == "title":
         return extract_story_title(text)
 
-    if key in {"movie_duration", "scene_count_target", "episode_count"}:
+    if key in {"movie_duration", "scene_count_target", "episode_count", "video_duration_seconds"}:
         match = re.search(r"\d+", text)
         return match.group(0) if match else ""
 
@@ -509,6 +518,13 @@ def format_summary_value(key: str, value: Any) -> str:
         duration_match = re.search(r"\d+", text)
         if duration_match:
             return f"{duration_match.group(0)} 分钟"
+
+    if key == "video_duration_seconds":
+        if "秒" in text:
+            return text
+        duration_match = re.search(r"\d+", text)
+        if duration_match:
+            return f"{duration_match.group(0)} 秒"
 
     if key == "scene_count_target" and re.fullmatch(r"\d+", text):
         return f"{text} 场"
@@ -1418,6 +1434,23 @@ async def analyze_logline(
                 ]
             })
         }
+
+    if next_step["key"] == "video_duration_seconds":
+         return {
+            "type": "interaction_required",
+            "payload": add_progress({
+                "field": "video_duration_seconds",
+                "question": next_step["question"],
+                "options": [
+                    {"label": "15秒（1条提示词）", "value": "15"},
+                    {"label": "30秒（2条提示词）", "value": "30"},
+                    {"label": "45秒（3条提示词）", "value": "45"},
+                    {"label": "60秒（4条提示词）", "value": "60"},
+                    {"label": "90秒（6条提示词）", "value": "90"},
+                    {"label": "120秒（8条提示词）", "value": "120"}
+                ]
+            })
+        }
     
     # 3.4 Check Prompt Richness (Optimization)
     # If the user's initial logline is very long (> 100 chars) and detailed,
@@ -1539,10 +1572,13 @@ async def generate_scenes(
 
     # Extract target episode count / scene count from context
     target_count = 5
+    duration_seconds = 0
     
     # Priority for Movie: scene_count_target
     if project.project_type == "movie":
         raw_count = c.get("scene_count_target")
+    elif project.project_type == "short_video":
+        raw_count = c.get("video_duration_seconds")
     else:
         raw_count = c.get("episode_count")
 
@@ -1558,6 +1594,16 @@ async def generate_scenes(
                     target_count = int(digits[0])
         except Exception as e:
             logger.warning(f"Error parsing count: {e}")
+
+    if project.project_type == "short_video":
+        if raw_count:
+            try:
+                duration_seconds = int(re.findall(r"\d+", str(raw_count))[0])
+            except Exception:
+                duration_seconds = 0
+        if duration_seconds <= 0:
+            duration_seconds = 60
+        target_count = max(1, math.ceil(duration_seconds / 15))
             
     # If movie duration is set but scene count isn't, estimate
     if project.project_type == "movie" and not c.get("scene_count_target"):
@@ -1573,6 +1619,12 @@ async def generate_scenes(
     # Force clearing of any old scenes from a previous attempt
     await db.execute(delete(models.Scene).where(models.Scene.project_id == project_id))
     await db.commit()
+
+    if project.project_type == "short_video":
+        style_context = (
+            f"{style_context}; 模式:短视频15秒分段提示词; 总时长:{duration_seconds}秒;"
+            f" 需要生成{target_count}条15秒提示词"
+        )
 
     logger.info(f"启动后台任务生成大纲... (Style: {style_context}, Count: {target_count})")
     
@@ -1857,12 +1909,21 @@ async def run_generation_loop(project_id: int):
             await db.commit()
             
             # 2. Call LLM to Write Scene
-            generated_content, usage = await llm.write_scene_content(
-                logline=project.logline,
-                style_guide=project.genre,
-                current_scene_outline=scene.outline,
-                previous_context=cumulative_context
-            )
+            if project.project_type == "short_video":
+                generated_content, usage = await llm.write_short_video_prompt(
+                    logline=project.logline,
+                    style_guide=project.genre,
+                    current_scene_outline=scene.outline,
+                    clip_index=scene.scene_index,
+                    previous_context=cumulative_context
+                )
+            else:
+                generated_content, usage = await llm.write_scene_content(
+                    logline=project.logline,
+                    style_guide=project.genre,
+                    current_scene_outline=scene.outline,
+                    previous_context=cumulative_context
+                )
             
             project.total_tokens += usage
 
