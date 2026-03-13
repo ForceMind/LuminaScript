@@ -87,14 +87,8 @@ install_miaobi() {
         return
     fi
 
-    rm -f /usr/local/bin/miaobi 2>/dev/null || true
-
-    if command -v install >/dev/null 2>&1; then
-        install -m 755 "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi
-    else
-        cp -f "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi
-        chmod 755 /usr/local/bin/miaobi
-    fi
+    chmod 755 "$PROJECT_DIR/miaobi" || true
+    ln -sfn "$PROJECT_DIR/miaobi" /usr/local/bin/miaobi
 }
 
 write_runtime_file() {
