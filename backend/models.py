@@ -44,6 +44,11 @@ class AIInteractionLog(Base):
     prompt = Column(Text)
     response = Column(Text)
     tokens = Column(Integer, default=0)
+    status = Column(String, default="success")
+    step_key = Column(String, nullable=True)
+    error_type = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    attempt = Column(Integer, default=1)
     timestamp = Column(String) # ISO format
 
     user = relationship("User", back_populates="ai_logs")

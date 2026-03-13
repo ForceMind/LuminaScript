@@ -134,6 +134,67 @@ def _build_interaction_fallback(step_key: str, base_question: str):
     }
 
 
+def _strip_markdown_code_fence(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _remove_json_trailing_commas(text: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _iter_json_candidates(text: str) -> list[str]:
+    cleaned = _strip_markdown_code_fence(text)
+    if not cleaned:
+        return []
+
+    candidates: list[str] = [cleaned]
+    for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+        match = re.search(pattern, cleaned)
+        if match:
+            candidate = match.group(0).strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates
+
+
+def _load_json_payload(text: str):
+    for candidate in _iter_json_candidates(text):
+        for normalized in (candidate, _remove_json_trailing_commas(candidate)):
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(parsed, dict):
+                return parsed
+
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        return item
+
+            if isinstance(parsed, str):
+                nested = parsed.strip()
+                if nested and nested != normalized:
+                    nested_payload = _load_json_payload(nested)
+                    if nested_payload is not None:
+                        return nested_payload
+
+    return None
+
+
+class InteractionGenerationError(Exception):
+    def __init__(self, message: str, *, raw_content: str = "", error_type: str = ""):
+        super().__init__(message)
+        self.raw_content = str(raw_content or "")
+        self.error_type = str(error_type or "interaction_generation_error")
+
+
 def _option_text(option: dict) -> str:
     label = str(option.get("label", "") or "").strip()
     value = str(option.get("value", "") or "").strip()
@@ -161,13 +222,23 @@ def _is_relevant_interaction_option(step_key: str, option: dict) -> bool:
     return True
 
 
-def _normalize_interaction_payload(step_key: str, base_question: str, payload: dict):
+def _normalize_interaction_payload(step_key: str, base_question: str, payload: dict, *, strict: bool = False):
     if not isinstance(payload, dict):
+        if strict:
+            raise InteractionGenerationError(
+                f"Interaction payload for step '{step_key}' is not a JSON object",
+                error_type="invalid_payload_shape"
+            )
         return _build_interaction_fallback(step_key, base_question)
 
     question = str(payload.get("question", "") or "").strip() or base_question
     raw_options = payload.get("options")
     if not isinstance(raw_options, list):
+        if strict:
+            raise InteractionGenerationError(
+                f"Interaction payload for step '{step_key}' is missing options list",
+                error_type="invalid_options_shape"
+            )
         return _build_interaction_fallback(step_key, question)
 
     options = []
@@ -183,6 +254,11 @@ def _normalize_interaction_payload(step_key: str, base_question: str, payload: d
             options.append(normalized_option)
 
     if len(options) < 3:
+        if strict:
+            raise InteractionGenerationError(
+                f"Interaction payload for step '{step_key}' has insufficient valid options",
+                error_type="insufficient_valid_options"
+            )
         return _build_interaction_fallback(step_key, question)
 
     return {"question": question, "options": options[:4]}
@@ -599,6 +675,10 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     - If the 'Target Field' is 'character_details', suggest specific character arcs or hidden secrets.
     
     IMPORTANT: The entire output MUST be in Chinese (Simplified).
+    RETURN A JSON OBJECT ONLY.
+    DO NOT wrap the JSON in markdown fences.
+    DO NOT add any explanation before or after the JSON.
+    USE double quotes for all keys and string values.
     
     Output Format (JSON):
     {
@@ -626,6 +706,7 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     Generate options that fit the genre and logic of the logline. 
     Ensure options allow for variety (e.g., one safe, one subversive, one high-concept).
     REPLY IN CHINESE ONLY. ENSURE 'value' fields contain the FULL CONTENT.
+    OUTPUT JSON ONLY. NO markdown fences. NO explanatory text.
     """
     
     messages = [
@@ -652,14 +733,27 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
         {"role": "user", "content": user_prompt}
     ]
 
-    content, usage = await raw_generation(messages, temperature=0.8, json_response=True)
+    content, usage = await raw_generation(messages, temperature=0.3, json_response=True)
     if not content:
-        raise ValueError(f"Empty interaction payload for step: {step_key}")
+        raise InteractionGenerationError(
+            f"Empty interaction payload for step: {step_key}",
+            error_type="empty_payload"
+        )
+
+    parsed = _load_json_payload(content)
+    if parsed is None:
+        logger.warning(f"generate_interaction_options JSON parse failed for {step_key}: {content[:500]}")
+        raise InteractionGenerationError(
+            f"Invalid JSON interaction payload for step: {step_key}",
+            raw_content=content,
+            error_type="json_parse_failed"
+        )
 
     try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        logger.warning(f"generate_interaction_options JSON parse failed for {step_key}: {content[:500]}")
-        raise ValueError(f"Invalid JSON interaction payload for step: {step_key}") from exc
+        normalized_payload = _normalize_interaction_payload(step_key, base_question, parsed, strict=True)
+    except InteractionGenerationError as exc:
+        if not exc.raw_content:
+            exc.raw_content = content
+        raise
 
-    return _normalize_interaction_payload(step_key, base_question, parsed), usage
+    return normalized_payload, usage

@@ -60,11 +60,28 @@ def upgrade_schema():
             prompt TEXT,
             response TEXT,
             tokens INTEGER,
+            status VARCHAR,
+            step_key VARCHAR,
+            error_type VARCHAR,
+            error_message TEXT,
+            attempt INTEGER,
             timestamp VARCHAR,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(project_id) REFERENCES projects(id)
         )
     """)
+    for column_name, column_sql in (
+        ("status", "ALTER TABLE ai_logs ADD COLUMN status VARCHAR DEFAULT 'success'"),
+        ("step_key", "ALTER TABLE ai_logs ADD COLUMN step_key VARCHAR"),
+        ("error_type", "ALTER TABLE ai_logs ADD COLUMN error_type VARCHAR"),
+        ("error_message", "ALTER TABLE ai_logs ADD COLUMN error_message TEXT"),
+        ("attempt", "ALTER TABLE ai_logs ADD COLUMN attempt INTEGER DEFAULT 1"),
+    ):
+        try:
+            cursor.execute(f"SELECT {column_name} FROM ai_logs LIMIT 1")
+        except sqlite3.OperationalError:
+            print(f"Adding '{column_name}' column to ai_logs table...")
+            cursor.execute(column_sql)
     print("Checked 'ai_logs' table.")
 
     # 4. Enforce Single Admin Policy

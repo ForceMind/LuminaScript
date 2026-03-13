@@ -209,7 +209,7 @@ const characterDetailsText = computed(() => {
 })
 
 const isControlInteractionField = (field: string) => {
-    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration', 'retry_current_step'].includes(field)
+    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration'].includes(field)
 }
 
 const canUseCustomInput = computed(() => {
@@ -222,7 +222,7 @@ const shouldShowOptionValue = (opt: any) => {
     const label = toTextValue(opt?.label).trim()
     const value = toTextValue(opt?.value).trim()
     if (!value || value === label) return false
-    if (value.length <= 24 && /^(movie|tv|short|\d+|confirmed|reset|retry_current_step|edit:)/.test(value)) return false
+    if (value.length <= 24 && /^(movie|tv|short|\d+|confirmed|reset|edit:)/.test(value)) return false
     return true
 }
 
@@ -545,7 +545,7 @@ const analyzeLogline = async (id: number) => {
   try {
     interaction.value = null // Clear previous to show loading state if needed
     loading.value = true
-    loadingText.value = 'AI 正在阅读您的创意并构思问题...'
+    loadingText.value = 'AI 正在阅读您的创意并构思问题，如遇波动系统会自动重试...'
     
     const res = await api.post(`/projects/${id}/analyze`)
     
@@ -593,20 +593,6 @@ const submitChoice = async () => {
     let finalAnswer = selectedOption.value || customInput.value
     if (!finalAnswer) {
         ElMessage.warning('请选择一个选项或自行输入')
-        return
-    }
-
-    if (interaction.value?.field === 'retry_current_step' || finalAnswer === 'retry_current_step') {
-        loading.value = true
-        loadingText.value = '正在重新发起当前问题...'
-        try {
-            interaction.value = null
-            await analyzeLogline(currentProject.value.id)
-        } catch (e) {
-            console.error(e)
-        } finally {
-            loading.value = false
-        }
         return
     }
 
@@ -1128,7 +1114,7 @@ const copyText = (value: unknown) => {
                              </div>
 
                             <div class="mt-8">
-                                <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput && interaction?.field !== 'retry_current_step'" :loading="loading">
+                                <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput" :loading="loading">
                                     下一步
                                 </el-button>
                             </div>

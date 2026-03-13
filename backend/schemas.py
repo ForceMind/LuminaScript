@@ -82,6 +82,11 @@ class AIInteractionLogResponse(BaseModel):
     prompt: str
     response: str
     tokens: int
+    status: str = "success"
+    step_key: Optional[str] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    attempt: int = 1
     timestamp: str
 
     class Config:

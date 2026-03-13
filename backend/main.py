@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel 
 import json
 import re
@@ -119,7 +119,6 @@ FINAL_CONFIRM_EDIT_TARGETS = [
 ]
 
 FINAL_CONFIRM_ALLOWED_VALUES = {"confirmed", "reset"} | {f"edit:{key}" for key, _ in FINAL_CONFIRM_EDIT_TARGETS}
-RETRY_INTERACTION_FIELD = "retry_current_step"
 AUTO_PREFILL_MIN_LENGTH = 120
 AUTO_PREFILL_FLAG = "_auto_prefill_attempted"
 AUTO_PREFILL_FIELDS = [
@@ -263,10 +262,19 @@ def normalize_project_context(project: models.Project) -> bool:
 
 
 def build_normalized_context(project: models.Project) -> Dict[str, Any]:
-    context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    raw_context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    context = {
+        key: value
+        for key, value in raw_context.items()
+        if not str(key).startswith("_")
+    }
     if project.project_type and project.project_type != "pending":
         context["project_type"] = project.project_type
     return context
+
+
+def get_internal_project_context(project: models.Project) -> Dict[str, Any]:
+    return dict(project.global_context) if isinstance(project.global_context, dict) else {}
 
 
 def has_setup_value(project: models.Project, context: Dict[str, Any], key: str) -> bool:
@@ -321,7 +329,8 @@ def normalize_extracted_setup_value(key: str, value: Any) -> str:
 def should_auto_prefill_from_logline(project: models.Project, context: Dict[str, Any]) -> bool:
     if not isinstance(context, dict):
         return False
-    if context.get(AUTO_PREFILL_FLAG):
+    raw_context = get_internal_project_context(project)
+    if raw_context.get(AUTO_PREFILL_FLAG):
         return False
 
     clean_logline = re.sub(r"\s+", "", str(project.logline or ""))
@@ -386,7 +395,10 @@ def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[
         if current_value not in (None, "", "pending"):
             return True
 
-    if field and field not in {"final_confirm", RETRY_INTERACTION_FIELD, "project_type"}:
+    if field == "retry_current_step":
+        return True
+
+    if field and field not in {"final_confirm", "project_type"}:
         current_value = current_context.get(field)
         if isinstance(current_value, str):
             current_value = current_value.strip()
@@ -628,7 +640,20 @@ async def log_login(user_id: int, ip: str, status: str, user_agent_str: str = ''
         db.add(log)
         await db.commit()
 
-async def log_ai_action(user_id: int, project_id: int, action: str, prompt: str, response: str, tokens: int):
+async def log_ai_action(
+    user_id: int,
+    project_id: Optional[int],
+    action: str,
+    prompt: str,
+    response: str,
+    tokens: int,
+    *,
+    status: str = "success",
+    step_key: Optional[str] = None,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
+    attempt: int = 1,
+):
     async with SessionLocal() as db:
         log = models.AIInteractionLog(
             user_id=user_id,
@@ -637,6 +662,11 @@ async def log_ai_action(user_id: int, project_id: int, action: str, prompt: str,
             prompt=prompt[:5000],  # Truncate if too long to save generic DB space
             response=response[:5000],
             tokens=tokens,
+            status=(status or "success")[:50],
+            step_key=(step_key or "")[:100] or None,
+            error_type=(error_type or "")[:100] or None,
+            error_message=(error_message or "")[:5000] or None,
+            attempt=max(1, int(attempt or 1)),
             timestamp=datetime.now().isoformat()
         )
         db.add(log)
@@ -678,9 +708,7 @@ async def admin_list_login_logs(
     
     logs = []
     for log, username in result:
-        log_dict = log.__dict__
-        log_dict['user_name'] = username
-        logs.append(log_dict)
+        logs.append(_serialize_admin_ai_log(log, username))
         
     return {"total": total, "items": logs}
 
@@ -770,6 +798,11 @@ def _serialize_admin_ai_log(log: models.AIInteractionLog, username: str) -> Dict
         "prompt": log.prompt,
         "response": log.response,
         "tokens": log.tokens,
+        "status": log.status or "success",
+        "step_key": log.step_key,
+        "error_type": log.error_type,
+        "error_message": log.error_message,
+        "attempt": log.attempt or 1,
         "timestamp": log.timestamp,
     }
 
@@ -1398,35 +1431,60 @@ async def analyze_logline(
     logger.info(f"正在调用 LLM 为步骤 {next_step['key']} 生成选项...")
     
     # 3.2 For other steps, use LLM to generate context-aware options
-    try:
-        question_data, usage = await llm.generate_interaction_options(
-            step_key=next_step["key"],
-            base_question=next_step["question"],
-            context_str=prompt_context
-        )
-        # Log AI action
-        background_tasks.add_task(
-            log_ai_action,
-            user_id=current_user.id,
-            project_id=project_id,
-            action=f"analyze_step_{next_step['key']}",
-            prompt=prompt_context,
-            response=str(question_data),
-            tokens=usage
-        )
-    except Exception as e:
-        logger.error(f"LLM 交互生成失败: {e}")
-        retry_label = SUMMARY_LABELS.get(next_step["key"], next_step["question"])
-        return {
-            "type": "interaction_required",
-            "payload": add_progress({
-                "field": RETRY_INTERACTION_FIELD,
-                "question": f"AI 暂时没能生成“{retry_label}”这一轮提问，请点击下方按钮重新发起。",
-                "options": [
-                    {"label": "重新发起当前问题", "value": RETRY_INTERACTION_FIELD}
-                ]
-            })
-        }
+    attempt = 0
+    question_data = None
+    usage = 0
+    while True:
+        attempt += 1
+        try:
+            question_data, usage = await llm.generate_interaction_options(
+                step_key=next_step["key"],
+                base_question=next_step["question"],
+                context_str=prompt_context
+            )
+            background_tasks.add_task(
+                log_ai_action,
+                user_id=current_user.id,
+                project_id=project_id,
+                action=f"analyze_step_{next_step['key']}",
+                prompt=prompt_context,
+                response=str(question_data),
+                tokens=usage,
+                status="success",
+                step_key=next_step["key"],
+                attempt=attempt,
+            )
+            break
+        except Exception as e:
+            raw_content = str(getattr(e, "raw_content", "") or "")
+            error_type = str(getattr(e, "error_type", type(e).__name__) or type(e).__name__)
+            error_message = str(e)
+            wait_seconds = min(30, 2 * attempt)
+
+            logger.error(
+                f"LLM 交互生成失败: step={next_step['key']} attempt={attempt} "
+                f"error_type={error_type} error={error_message}"
+            )
+
+            await log_ai_action(
+                user_id=current_user.id,
+                project_id=project_id,
+                action=f"analyze_step_{next_step['key']}",
+                prompt=prompt_context,
+                response=raw_content,
+                tokens=0,
+                status="failed",
+                step_key=next_step["key"],
+                error_type=error_type,
+                error_message=error_message,
+                attempt=attempt,
+            )
+
+            logger.warning(
+                f"项目 {project_id} 的步骤 {next_step['key']} 第 {attempt} 次生成失败，"
+                f"{wait_seconds} 秒后自动重试。"
+            )
+            await asyncio.sleep(wait_seconds)
     
     # Update Token Usage
     project.total_tokens += usage

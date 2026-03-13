@@ -28,6 +28,10 @@ api.interceptors.request.use((config) => {
     return config
 })
 
+const getAiStatusType = (status?: string) => {
+    return status === 'failed' ? 'danger' : 'success'
+}
+
 const fetchUsers = async () => {
     loading.value = true
     try {
@@ -192,8 +196,38 @@ onMounted(() => {
                 <el-table :data="aiLogs" stripe v-loading="loading">
                     <el-table-column prop="timestamp" label="时间" width="180" />
                     <el-table-column prop="user_name" label="用户" width="120" />
+                    <el-table-column label="状态" width="100">
+                        <template #default="scope">
+                            <el-tag :type="getAiStatusType(scope.row.status)">
+                                {{ scope.row.status || 'success' }}
+                            </el-tag>
+                        </template>
+                    </el-table-column>
                     <el-table-column prop="action" label="操作" width="150" />
+                    <el-table-column prop="step_key" label="步骤" width="140">
+                        <template #default="scope">
+                            <span>{{ scope.row.step_key || '-' }}</span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="attempt" label="重试次数" width="100" />
+                    <el-table-column prop="error_type" label="错误类型" width="150">
+                        <template #default="scope">
+                            <span class="text-xs break-words">{{ scope.row.error_type || '-' }}</span>
+                        </template>
+                    </el-table-column>
                     <el-table-column prop="tokens" label="Tokens" width="100" />
+                    <el-table-column label="失败原因" min-width="220">
+                        <template #default="scope">
+                            <el-popover placement="top" :width="420" trigger="hover">
+                                <template #reference>
+                                    <div class="truncate w-52 cursor-pointer text-red-500">
+                                        {{ scope.row.error_message || '-' }}
+                                    </div>
+                                </template>
+                                <div class="whitespace-pre-wrap text-xs h-60 overflow-y-auto">{{ scope.row.error_message || '无' }}</div>
+                            </el-popover>
+                        </template>
+                    </el-table-column>
                     <el-table-column label="Prompt 摘要">
                         <template #default="scope">
                             <el-popover placement="top" :width="400" trigger="hover">
@@ -208,9 +242,11 @@ onMounted(() => {
                         <template #default="scope">
                             <el-popover placement="top" :width="400" trigger="hover">
                                 <template #reference>
-                                    <div class="truncate w-40 cursor-pointer text-blue-500">{{ scope.row.response }}</div>
+                                    <div class="truncate w-40 cursor-pointer" :class="scope.row.status === 'failed' ? 'text-red-500' : 'text-blue-500'">
+                                        {{ scope.row.response || '-' }}
+                                    </div>
                                 </template>
-                                <div class="whitespace-pre-wrap text-xs h-60 overflow-y-auto">{{ scope.row.response }}</div>
+                                <div class="whitespace-pre-wrap text-xs h-60 overflow-y-auto">{{ scope.row.response || '无' }}</div>
                             </el-popover>
                         </template>
                     </el-table-column>
