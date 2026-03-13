@@ -92,15 +92,56 @@ const sortedProjectList = computed(() => {
     return [...projectList.value].sort((a, b) => (Number(b?.id) || 0) - (Number(a?.id) || 0))
 })
 
+const titlePatterns = [
+    /《\s*([^《》\n]{1,60}?)\s*》/,
+    /〈\s*([^〈〉\n]{1,60}?)\s*〉/,
+    /「\s*([^「」\n]{1,60}?)\s*」/,
+    /『\s*([^『』\n]{1,60}?)\s*』/
+]
+
+const titleBreakPattern = /[，。！？：；,.!?;:\n]|--+|——|—|-/
+
+const extractStoryTitleText = (value: unknown): string => {
+    const text = toTextValue(value).trim()
+    if (!text) return ''
+
+    for (const pattern of titlePatterns) {
+        const match = text.match(pattern)
+        if (match?.[1]) return match[1].trim()
+    }
+
+    const shortTitle = text
+        .split(titleBreakPattern, 1)[0]
+        .trim()
+        .replace(/^["'“”‘’《》〈〉「」『』]+|["'“”‘’《》〈〉「」『』]+$/g, '')
+
+    if (shortTitle && shortTitle.length <= 30) return shortTitle
+    return text
+}
+
+const getProjectTitle = (project: any) => {
+    const contextTitle = extractStoryTitleText(project?.global_context?.title || '')
+    if (contextTitle) return contextTitle
+
+    const projectTitle = extractStoryTitleText(project?.title || '')
+    if (projectTitle) return projectTitle
+
+    return toTextValue(project?.logline || '').trim()
+}
+
 const getProjectDisplayText = (project: any) => {
-    const raw = (project?.title || project?.logline || '').trim()
+    const raw = getProjectTitle(project)
     if (!raw) return 'Untitled'
     return raw.length > 24 ? `${raw.slice(0, 24)}...` : raw
 }
 
 const getProjectTooltipText = (project: any) => {
-    return (project?.title || project?.logline || '').trim()
+    return getProjectTitle(project)
 }
+
+const currentProjectTitle = computed(() => {
+    return getProjectTitle(currentProject.value) || 'Untitled'
+})
 
 const storySynopsis = computed(() => {
     if (!currentProject.value) {
@@ -265,8 +306,15 @@ const fetchProjects = async () => {
              const found = projectList.value.find(p => p.id === currentProject.value.id)
              if (found) {
                  // Only update generation-critical fields to avoid UI reset
+                 if (found.title !== currentProject.value.title) currentProject.value.title = found.title
+                 if (found.logline !== currentProject.value.logline) currentProject.value.logline = found.logline
+                 if (found.genre !== currentProject.value.genre) currentProject.value.genre = found.genre
+                 if (found.project_type !== currentProject.value.project_type) currentProject.value.project_type = found.project_type
                  if (found.status !== currentProject.value.status) currentProject.value.status = found.status
                  if (found.total_tokens !== currentProject.value.total_tokens) currentProject.value.total_tokens = found.total_tokens
+                 if (JSON.stringify(found.global_context || {}) !== JSON.stringify(currentProject.value.global_context || {})) {
+                     currentProject.value.global_context = found.global_context || {}
+                 }
                  
                  // For scenes, we do a careful check before replacement to avoid jitter
                  // However, since scenes are nested, we rely on backend sending them.
@@ -433,10 +481,12 @@ const submitChoice = async () => {
         } else {
              // Send answer to analyze endpoint or a new interaction endpoint
              // We'll use a new POST /projects/{id}/submit_interaction
-             await api.post(`/projects/${currentProject.value.id}/interact`, {
+             const res = await api.post(`/projects/${currentProject.value.id}/interact`, {
                  answer: finalAnswer,
                  context_key: interaction.value.field || 'unknown' // Backend should provide this in payload
              })
+             if (res.data?.title) currentProject.value.title = res.data.title
+             if (res.data?.context) currentProject.value.global_context = res.data.context
         }
         
         interaction.value = null
@@ -914,7 +964,7 @@ const copyText = (value: unknown) => {
                 <div v-if="currentProject && !interaction" class="w-full max-w-4xl mt-8 pb-20 animate-fade-in-up">
                     <div class="flex items-center justify-between mb-6">
                         <div class="flex items-center gap-4">
-                            <h2 class="text-2xl font-light text-slate-800">{{ currentProject.title }}</h2>
+                            <h2 class="text-2xl font-light text-slate-800">{{ currentProjectTitle }}</h2>
                             <el-button size="small" circle :icon="Plus" @click="currentProject=null" title="开启新创意"></el-button>
                             <el-button size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
                         </div>

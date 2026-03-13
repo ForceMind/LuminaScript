@@ -87,8 +87,13 @@ SUMMARY_ORDER = [
     "user_notes"
 ]
 
-TITLE_PATTERN = re.compile(r"《\s*([^《》\n]{1,60}?)\s*》")
-TITLE_BREAK_PATTERN = re.compile(r"[，。！？：；,.!?;:\n]")
+TITLE_PATTERNS = [
+    re.compile(r"《\s*([^《》\n]{1,60}?)\s*》"),
+    re.compile(r"〈\s*([^〈〉\n]{1,60}?)\s*〉"),
+    re.compile(r"「\s*([^「」\n]{1,60}?)\s*」"),
+    re.compile(r"『\s*([^『』\n]{1,60}?)\s*』"),
+]
+TITLE_BREAK_PATTERN = re.compile(r"[，。！？：；,.!?;:\n]|--+|——|—|-")
 
 
 def extract_story_title(raw_text: str) -> str:
@@ -96,15 +101,65 @@ def extract_story_title(raw_text: str) -> str:
     if not text:
         return ""
 
-    marked_title = TITLE_PATTERN.search(text)
-    if marked_title:
-        return marked_title.group(1).strip()
+    for pattern in TITLE_PATTERNS:
+        marked_title = pattern.search(text)
+        if marked_title:
+            return marked_title.group(1).strip()
 
     short_title = TITLE_BREAK_PATTERN.split(text, maxsplit=1)[0].strip(" \t\r\n\"'“”‘’《》")
     if short_title and len(short_title) <= 30:
         return short_title
 
     return ""
+
+
+def sanitize_title_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized_options: List[Dict[str, Any]] = []
+    seen_titles: set[str] = set()
+
+    for option in options or []:
+        if not isinstance(option, dict):
+            continue
+
+        raw_value = str(option.get("value", "") or "").strip()
+        raw_label = str(option.get("label", "") or "").strip()
+        clean_title = extract_story_title(raw_value) or extract_story_title(raw_label)
+        if not clean_title:
+            clean_title = raw_value if raw_value and len(raw_value) <= 30 else raw_label
+
+        clean_title = clean_title.strip()
+        if not clean_title or clean_title in seen_titles:
+            continue
+
+        seen_titles.add(clean_title)
+        sanitized_options.append({
+            "label": clean_title,
+            "value": clean_title
+        })
+
+    return sanitized_options
+
+
+def normalize_project_title(project: models.Project) -> bool:
+    current_title = str(project.title or "").strip()
+    context_title = ""
+    if isinstance(project.global_context, dict):
+        context_title = str(project.global_context.get("title", "") or "").strip()
+
+    raw_candidate = context_title or current_title
+    if not raw_candidate:
+        return False
+
+    clean_title = extract_story_title(raw_candidate)
+    if not clean_title or clean_title == current_title:
+        return False
+
+    project.title = clean_title
+    if isinstance(project.global_context, dict):
+        updated_context = dict(project.global_context)
+        updated_context["title"] = clean_title
+        project.global_context = updated_context
+    return True
 
 
 def format_summary_value(key: str, value: Any) -> str:
@@ -454,7 +509,15 @@ async def list_projects(
         .order_by(models.Project.id.desc())
         .options(selectinload(models.Project.scenes))
     )
-    return result.scalars().all()
+    projects = result.scalars().all()
+    title_updated = False
+    for project in projects:
+        title_updated = normalize_project_title(project) or title_updated
+
+    if title_updated:
+        await db.commit()
+
+    return projects
 
 
 @app.delete("/projects/{project_id}")
@@ -541,6 +604,7 @@ async def submit_interaction(
     # Update context
     # Note: sqlalchemy JSON field needs reassignment to trigger update
     current_context = dict(project.global_context) if project.global_context else {}
+    previous_title = project.title
     
     # Special Handling: Reset
     answer_text = (interaction.answer or "").strip()
@@ -577,7 +641,11 @@ async def submit_interaction(
 
     await db.commit()
     logger.info(f"项目 {project_id} 上下文已更新，缓存已清除")
-    return {"status": "updated", "context": project.global_context}
+    return {
+        "status": "updated",
+        "context": project.global_context,
+        "title": project.title or previous_title or "",
+    }
 
 
 @app.post("/projects/{project_id}/analyze")
@@ -594,6 +662,9 @@ async def analyze_logline(
     project = await db.get(models.Project, project_id)
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if normalize_project_title(project):
+        await db.commit()
 
     # Check Cache First (For resuming sessions)
     if project.next_step_cache:
@@ -818,6 +889,11 @@ async def analyze_logline(
             "options": question_data.get("options", [])
         })
     }
+
+    if next_step["key"] == "title":
+        response_payload["payload"]["options"] = sanitize_title_options(
+            response_payload["payload"].get("options", [])
+        )
     
     # Cache the result to DB so next fetch is instant
     project.next_step_cache = response_payload
