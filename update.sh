@@ -13,9 +13,56 @@ BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 BACKUP_DIR="$PROJECT_DIR/backups/update_$(date +%Y%m%d_%H%M%S)"
 VENV_DIR="$BACKEND_DIR/venv"
+FRONTEND_SERVER_FILE="$FRONTEND_DIR/server.cjs"
 
 echo -e "${BLUE}====== 妙笔流光一键更新脚本 ======${NC}"
 echo "项目目录: $PROJECT_DIR"
+
+mkdir -p "$BACKUP_DIR"
+
+backup_if_exists() {
+    local source_path="$1"
+    local relative_path=""
+    local target_dir=""
+
+    if [ ! -e "$source_path" ]; then
+        return
+    fi
+
+    relative_path="${source_path#$PROJECT_DIR/}"
+    if [ "$relative_path" = "$source_path" ]; then
+        relative_path="$(basename "$source_path")"
+    fi
+
+    target_dir="$BACKUP_DIR/$(dirname "$relative_path")"
+    mkdir -p "$target_dir"
+    cp -a "$source_path" "$target_dir/"
+    echo "已备份: $source_path"
+}
+
+is_runtime_data_path() {
+    local path="$1"
+    case "$path" in
+        backend/.env|*.db|*.sqlite|*.sqlite3|*.log|frontend/dist/*|frontend/node_modules/*|backend/venv/*|backend/__pycache__/*|node_modules/*|backups/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_auto_restore_path() {
+    local path="$1"
+    case "$path" in
+        frontend/server.cjs|frontend/package-lock.json)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 if [ ! -d "$PROJECT_DIR/.git" ]; then
     echo -e "${RED}当前目录不是 Git 仓库，无法执行更新。${NC}"
@@ -23,9 +70,42 @@ if [ ! -d "$PROJECT_DIR/.git" ]; then
 fi
 
 echo -e "${YELLOW}[1/6] 检查当前代码状态...${NC}"
-if [ -n "$(git status --porcelain)" ]; then
-    echo -e "${RED}检测到未提交的本地修改。为避免覆盖你的改动，本次更新已停止。${NC}"
-    echo "请先提交、暂存或清理工作区后再执行。"
+AUTO_RESTORE_PATHS=()
+BLOCKING_CHANGES=()
+
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+
+    path="${line:3}"
+    if [[ "$path" == *" -> "* ]]; then
+        path="${path##* -> }"
+    fi
+
+    if is_runtime_data_path "$path"; then
+        continue
+    fi
+
+    if is_auto_restore_path "$path"; then
+        AUTO_RESTORE_PATHS+=("$path")
+        continue
+    fi
+
+    BLOCKING_CHANGES+=("$line")
+done < <(git status --porcelain=v1 --untracked-files=all)
+
+if [ "${#AUTO_RESTORE_PATHS[@]}" -gt 0 ]; then
+    echo "检测到部署过程产生的本地文件变更，正在自动备份并恢复 Git 状态..."
+    for path in "${AUTO_RESTORE_PATHS[@]}"; do
+        backup_if_exists "$PROJECT_DIR/$path"
+        git restore --source=HEAD --worktree --staged -- "$path"
+        echo "已恢复: $path"
+    done
+fi
+
+if [ "${#BLOCKING_CHANGES[@]}" -gt 0 ]; then
+    echo -e "${RED}检测到代码或配置存在未提交修改。为避免覆盖人工改动，本次更新已停止。${NC}"
+    printf '%s\n' "${BLOCKING_CHANGES[@]}"
+    echo "请先确认这些修改是否需要保留。"
     exit 1
 fi
 
@@ -37,16 +117,6 @@ fi
 echo "当前分支: $CURRENT_BRANCH"
 
 echo -e "${YELLOW}[2/6] 备份用户数据和配置...${NC}"
-mkdir -p "$BACKUP_DIR"
-
-backup_if_exists() {
-    local source_path="$1"
-    if [ -e "$source_path" ]; then
-        cp -a "$source_path" "$BACKUP_DIR/"
-        echo "已备份: $source_path"
-    fi
-}
-
 backup_if_exists "$BACKEND_DIR/.env"
 backup_if_exists "$BACKEND_DIR/lumina.db"
 backup_if_exists "$BACKEND_DIR/lumina_v2.db"
@@ -85,7 +155,14 @@ VENV_PIP="$VENV_DIR/bin/pip"
 
 echo -e "${YELLOW}[5/6] 构建前端...${NC}"
 cd "$FRONTEND_DIR"
-npm install
+if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
+    if ! npm ci; then
+        echo -e "${YELLOW}npm ci 失败，回退到 npm install。${NC}"
+        npm install
+    fi
+else
+    npm install
+fi
 if ! npm run build; then
     echo -e "${YELLOW}检测到 npm run build 不可用，自动回退到 vite build。${NC}"
     npx vite build
@@ -102,12 +179,12 @@ else
     echo -e "${YELLOW}未找到 uvicorn，已跳过后端重启。${NC}"
 fi
 
-if [ -f "$PROJECT_DIR/server.cjs" ]; then
+if [ -f "$FRONTEND_SERVER_FILE" ]; then
     fpid="$(lsof -t -i:8600 2>/dev/null || true)"
     if [ -n "${fpid:-}" ]; then
         kill -9 "$fpid" 2>/dev/null || true
     fi
-    nohup node "$PROJECT_DIR/server.cjs" >> "$PROJECT_DIR/frontend.log" 2>&1 &
+    nohup node "$FRONTEND_SERVER_FILE" >> "$PROJECT_DIR/frontend.log" 2>&1 &
     echo "前端已重启: 8600"
 else
     echo -e "${YELLOW}未找到 server.cjs，已完成代码更新和前端构建。${NC}"
