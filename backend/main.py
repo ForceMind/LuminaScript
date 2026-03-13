@@ -711,7 +711,7 @@ async def admin_list_login_logs(
     # 1. Get Total Count
     count_query = select(func.count()).select_from(models.LoginLog)
     total_result = await db.execute(count_query)
-    total = total_result.scalar()
+    total = int(total_result.scalar() or 0)
 
     # 2. Get Items
     result = await db.execute(
@@ -724,7 +724,7 @@ async def admin_list_login_logs(
     
     logs = []
     for log, username in result:
-        logs.append(_serialize_admin_ai_log(log, username))
+        logs.append(_serialize_admin_login_log(log, username or ""))
         
     return {"total": total, "items": logs}
 
@@ -740,7 +740,7 @@ async def admin_list_ai_logs(
     # 1. Get Total Count
     count_query = select(func.count()).select_from(models.AIInteractionLog)
     total_result = await db.execute(count_query)
-    total = total_result.scalar()
+    total = int(total_result.scalar() or 0)
 
     # 2. Get Items
     result = await db.execute(
@@ -752,9 +752,7 @@ async def admin_list_ai_logs(
     )
     logs = []
     for log, username in result:
-        log_dict = log.__dict__
-        log_dict['user_name'] = username
-        logs.append(log_dict)
+        logs.append(_serialize_admin_ai_log(log, username or ""))
         
     return {"total": total, "items": logs}
 
