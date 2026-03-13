@@ -1,11 +1,38 @@
 import sqlite3
 import asyncio
-from database import init_db
+from pathlib import Path
+from database import init_db, DATABASE_URL
 from passlib.context import CryptContext
 import os
 
-DB_FILE = "lumina_v2.db"
+BASE_DIR = Path(__file__).resolve().parent
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def resolve_db_file() -> str:
+    for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+        if DATABASE_URL.startswith(prefix):
+            raw_path = DATABASE_URL[len(prefix):].split("?", 1)[0]
+            if not raw_path or raw_path == ":memory:":
+                return str((BASE_DIR / "lumina_v2.db").resolve())
+
+            db_path = Path(raw_path)
+            if not db_path.is_absolute():
+                db_path = (BASE_DIR / db_path).resolve()
+            return str(db_path)
+
+    return str((BASE_DIR / "lumina_v2.db").resolve())
+
+
+DB_FILE = resolve_db_file()
+
+
+def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    )
+    return cursor.fetchone() is not None
 
 def get_password_hash(password):
     return pwd_context.hash(password)
@@ -15,10 +42,19 @@ def upgrade_schema():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
+    if not table_exists(cursor, "users") or not table_exists(cursor, "projects"):
+        print("Core tables missing. Initializing ORM schema first...")
+        conn.close()
+        asyncio.run(init_db())
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
     # 1. Add is_admin to users
     try:
         cursor.execute("SELECT is_admin FROM users LIMIT 1")
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
         print("Adding 'is_admin' column to users table...")
         cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
     
@@ -37,14 +73,18 @@ def upgrade_schema():
     # 2.1 Add user_agent to login_logs if missing
     try:
         cursor.execute("SELECT user_agent FROM login_logs LIMIT 1")
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
         print("Adding 'user_agent' column to login_logs table...")
         cursor.execute("ALTER TABLE login_logs ADD COLUMN user_agent VARCHAR")
         
     # 2.2 Add location to login_logs if missing
     try:
         cursor.execute("SELECT location FROM login_logs LIMIT 1")
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
         print("Adding 'location' column to login_logs table...")
         cursor.execute("ALTER TABLE login_logs ADD COLUMN location VARCHAR")
     
@@ -85,7 +125,9 @@ def upgrade_schema():
     ):
         try:
             cursor.execute(f"SELECT {column_name} FROM ai_logs LIMIT 1")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower():
+                raise
             print(f"Adding '{column_name}' column to ai_logs table...")
             cursor.execute(column_sql)
     print("Checked 'ai_logs' table.")
@@ -105,6 +147,7 @@ def upgrade_schema():
         if len(admins) > 0:
             print(f"Skipping admin update. Current admins: {[u[1] for u in admins]}")
             conn.commit()
+            conn.close()
             return
         else:
             print("No admin detected in database. Proceeding to create initial admin...")
