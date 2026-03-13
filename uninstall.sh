@@ -43,7 +43,7 @@ backup_if_exists() {
 }
 
 stop_services() {
-    echo -e "${YELLOW}停止现有服务...${NC}"
+    echo -e "${YELLOW}鍋滄鐜版湁鏈嶅姟...${NC}"
     bash "$PROJECT_DIR/miaobi" stop || true
 }
 
@@ -55,6 +55,9 @@ remove_miaobi_link() {
             rm -f /usr/local/bin/miaobi
             echo "已移除 /usr/local/bin/miaobi"
         fi
+    elif [ -f "/usr/local/bin/miaobi" ]; then
+        rm -f /usr/local/bin/miaobi
+        echo "已移除 /usr/local/bin/miaobi"
     fi
 }
 
@@ -65,10 +68,10 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-echo -e "${BLUE}====== 妙笔流光卸载脚本 ======${NC}"
-echo "项目目录: $PROJECT_DIR"
+echo -e "${BLUE}====== 濡欑瑪娴佸厜鍗歌浇鑴氭湰 ======${NC}"
+echo "椤圭洰鐩綍: $PROJECT_DIR"
 
-echo -e "${YELLOW}[1/4] 备份关键数据...${NC}"
+echo -e "${YELLOW}[1/4] 澶囦唤鍏抽敭鏁版嵁...${NC}"
 backup_if_exists "$BACKEND_DIR/.env"
 backup_if_exists "$BACKEND_DIR/lumina_v2.db"
 backup_if_exists "$BACKEND_DIR/lumina.db"
@@ -78,35 +81,35 @@ backup_if_exists "$PROJECT_DIR/backend.log"
 backup_if_exists "$PROJECT_DIR/frontend.log"
 backup_if_exists "$RUNTIME_FILE"
 
-echo -e "${YELLOW}[2/4] 停止服务...${NC}"
+echo -e "${YELLOW}[2/4] 鍋滄鏈嶅姟...${NC}"
 stop_services
 
-echo -e "${YELLOW}[3/4] 清理命令入口与运行文件...${NC}"
+echo -e "${YELLOW}[3/4] 娓呯悊鍛戒护鍏ュ彛涓庤繍琛屾枃浠?..${NC}"
 remove_miaobi_link
 rm -f "$RUNTIME_FILE"
 
-if confirm "是否删除 Python 虚拟环境 (backend/venv)"; then
+if confirm "鏄惁鍒犻櫎 Python 铏氭嫙鐜 (backend/venv)"; then
     rm -rf "$BACKEND_DIR/venv"
-    echo "已删除 backend/venv"
+    echo "宸插垹闄?backend/venv"
 fi
 
-if confirm "是否删除前端构建产物与依赖 (frontend/dist, frontend/node_modules, frontend/server.cjs)"; then
+if confirm "鏄惁鍒犻櫎鍓嶇鏋勫缓浜х墿涓庝緷璧?(frontend/dist, frontend/node_modules, frontend/server.cjs)"; then
     rm -rf "$FRONTEND_DIR/dist" "$FRONTEND_DIR/node_modules"
     rm -f "$FRONTEND_DIR/server.cjs"
-    echo "已删除前端构建产物与依赖"
+    echo "宸插垹闄ゅ墠绔瀯寤轰骇鐗╀笌渚濊禆"
 fi
 
-if confirm "是否删除运行日志 (backend.log, frontend.log)"; then
+if confirm "鏄惁鍒犻櫎杩愯鏃ュ織 (backend.log, frontend.log)"; then
     rm -f "$PROJECT_DIR/backend.log" "$PROJECT_DIR/frontend.log"
-    echo "已删除运行日志"
+    echo "宸插垹闄よ繍琛屾棩蹇?
 fi
 
-if confirm "是否删除数据库与配置文件 (.env, *.db)"; then
+if confirm "鏄惁鍒犻櫎鏁版嵁搴撲笌閰嶇疆鏂囦欢 (.env, *.db)"; then
     rm -f "$BACKEND_DIR/.env" "$BACKEND_DIR/lumina_v2.db" "$BACKEND_DIR/lumina.db" "$PROJECT_DIR/lumina_v2.db" "$PROJECT_DIR/lumina.db"
-    echo "已删除数据库与配置文件"
+    echo "宸插垹闄ゆ暟鎹簱涓庨厤缃枃浠?
 fi
 
-echo -e "${YELLOW}[4/4] 卸载完成${NC}"
-echo "备份目录: $BACKUP_DIR"
-echo "如需彻底删除项目目录，请手动执行:"
+echo -e "${YELLOW}[4/4] 鍗歌浇瀹屾垚${NC}"
+echo "澶囦唤鐩綍: $BACKUP_DIR"
+echo "濡傞渶褰诲簳鍒犻櫎椤圭洰鐩綍锛岃鎵嬪姩鎵ц:"
 echo "  rm -rf $PROJECT_DIR"
