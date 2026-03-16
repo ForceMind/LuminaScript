@@ -567,11 +567,13 @@ async def ensure_story_synopsis(project: models.Project, context: Dict[str, Any]
         return enriched_context
 
     try:
-        synopsis = await llm.generate_story_synopsis(
+        synopsis, synopsis_usage = await llm.generate_story_synopsis(
             logline=project.logline or "",
             context=enriched_context,
             project_type=project.project_type or "movie"
         )
+        if synopsis_usage:
+            project.total_tokens += int(synopsis_usage or 0)
     except Exception as exc:
         logger.warning(f"Failed to generate story synopsis for project {project.id}: {exc}")
         return enriched_context
@@ -1251,6 +1253,7 @@ async def submit_interaction(
         "status": "updated",
         "context": project.global_context,
         "title": project.title or previous_title or "",
+        "total_tokens": int(project.total_tokens or 0),
     }
 
 
@@ -1268,6 +1271,11 @@ async def analyze_logline(
     project = await db.get(models.Project, project_id)
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    def with_runtime_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(payload or {})
+        result["total_tokens"] = int(project.total_tokens or 0)
+        return result
 
     normalized = False
     if normalize_project_title(project):
@@ -1320,7 +1328,7 @@ async def analyze_logline(
             await db.commit()
         else:
             logger.info(f"项目 {project_id} 命中缓存，直接返回之前的提问。")
-            return project.next_step_cache
+            return with_runtime_meta(project.next_step_cache)
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
@@ -1347,7 +1355,7 @@ async def analyze_logline(
     # 2. If all steps completed -> Proceed to Outline Generation
     if not next_step:
         logger.info(f"项目 {project_id} 所有基础设定步骤已完成，准备生成大纲。")
-        return {"type": "completed", "message": "基础设定已完成！准备生成大纲..."}
+        return with_runtime_meta({"type": "completed", "message": "基础设定已完成！准备生成大纲..."})
 
     logger.info(f"项目 {project_id} 下一步骤: {next_step['key']} ({next_step_index}/{total_steps})")
     
@@ -1359,18 +1367,18 @@ async def analyze_logline(
     # 3. Handle specific logic for the next step
     # 3.1 Hardcoded options for Type
     if next_step["key"] == "project_type":
-        return {
+        return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "project_type",
                 "question": next_step["question"],
                 "options": next_step["default_options"]
             })
-        }
+        })
     
     # 3.2 Hardcoded options for Episode Count / Movie Duration / Scene Count
     if next_step["key"] == "movie_duration":
-         return {
+         return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "movie_duration",
@@ -1382,10 +1390,10 @@ async def analyze_logline(
                     {"label": "60分钟 (中片/电视电影)", "value": "60"}
                 ]
             })
-        }
+        })
 
     if next_step["key"] == "scene_count_target":
-         return {
+         return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "scene_count_target",
@@ -1397,10 +1405,10 @@ async def analyze_logline(
                     {"label": "120场以上 (极度详尽)", "value": "120"}
                 ]
             })
-        }
+        })
 
     if next_step["key"] == "episode_count":
-         return {
+         return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "episode_count",
@@ -1413,10 +1421,10 @@ async def analyze_logline(
                     {"label": "40集以上", "value": "40"}
                 ]
             })
-        }
+        })
     
     if next_step["key"] == "episode_duration":
-         return {
+         return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "episode_duration",
@@ -1429,7 +1437,7 @@ async def analyze_logline(
                     {"label": "60分钟 (美剧/电影感)", "value": "60mins"}
                 ]
             })
-        }
+        })
     
     if next_step.get("is_confirmation"):
         normalized_context = await ensure_story_synopsis(project, normalized_context)
@@ -1438,7 +1446,7 @@ async def analyze_logline(
 
         summary_text = build_context_summary(project, normalized_context)
         await db.commit()
-        return {
+        return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "final_confirm",
@@ -1453,10 +1461,10 @@ async def analyze_logline(
                     {"label": "🔄 重新设定 (清空当前设定重头开始)", "value": "reset"}
                 ]
             })
-        }
+        })
 
     if next_step["key"] == "video_duration_seconds":
-         return {
+         return with_runtime_meta({
             "type": "interaction_required",
             "payload": add_progress({
                 "field": "video_duration_seconds",
@@ -1470,7 +1478,7 @@ async def analyze_logline(
                     {"label": "120秒（8条提示词）", "value": "120"}
                 ]
             })
-        }
+        })
     
     # 3.4 Check Prompt Richness (Optimization)
     # If the user's initial logline is very long (> 100 chars) and detailed,
@@ -1561,7 +1569,7 @@ async def analyze_logline(
     project.next_step_cache = response_payload
     await db.commit()
 
-    return response_payload
+    return with_runtime_meta(response_payload)
 
 @app.post("/projects/{project_id}/generate_scenes")
 async def generate_scenes(

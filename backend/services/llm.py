@@ -263,6 +263,23 @@ def _normalize_interaction_payload(step_key: str, base_question: str, payload: d
 
     return {"question": question, "options": options[:4]}
 
+
+def _estimate_token_usage(messages, content: str) -> int:
+    """
+    Estimate token usage when upstream provider does not return usage.
+    Chinese chars are roughly 1 token, other chars roughly 1 token per 4 chars.
+    """
+    try:
+        prompt_text = "\n".join(str((msg or {}).get("content", "") or "") for msg in (messages or []))
+        completion_text = str(content or "")
+        merged = f"{prompt_text}\n{completion_text}"
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", merged))
+        other_chars = max(0, len(merged) - cjk_chars)
+        estimated = int(cjk_chars * 1.05 + other_chars / 4 + max(1, len(messages or [])) * 6)
+        return max(1, estimated)
+    except Exception:
+        return max(1, len(str(content or "")) // 4)
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -284,9 +301,13 @@ async def raw_generation(messages, temperature=0.7, json_response=False):
                 temperature=temperature
             )
             content = response.choices[0].message.content
-            usage = response.usage.total_tokens if response.usage else 0
-            
-            logger.info(f"LLM调用: 成功完成 (消耗Token: {usage})")
+            usage_obj = getattr(response, "usage", None)
+            usage = int(getattr(usage_obj, "total_tokens", 0) or 0)
+            if usage <= 0:
+                usage = _estimate_token_usage(messages, content)
+                logger.info(f"LLM调用: 成功完成 (上游未返回Token，使用估算值: {usage})")
+            else:
+                logger.info(f"LLM调用: 成功完成 (消耗Token: {usage})")
             
             # If user expects JSON, we try to clean it up lightly
             if json_response and content:
@@ -406,16 +427,12 @@ async def review_user_input(text: str):
 async def generate_story_synopsis(logline: str, context: dict | None = None, project_type: str = "movie"):
     """
     Generate AI-written brief and detailed synopses from the current project setup.
-    Returns:
-    {
-        "brief": str,
-        "detailed": str
-    }
+    Returns ({brief, detailed}, usage)
     """
     clean_logline = (logline or "").strip()
     context = context or {}
     if not clean_logline and not context:
-        return {"brief": "", "detailed": ""}
+        return {"brief": "", "detailed": ""}, 0
 
     type_label = {
         "movie": "电影剧本",
@@ -448,7 +465,7 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
     请基于以上信息生成两个版本的故事梗概。
     """
 
-    content, _ = await raw_generation(
+    content, usage = await raw_generation(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -458,17 +475,17 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
     )
 
     if not content:
-        return {"brief": "", "detailed": ""}
+        return {"brief": "", "detailed": ""}, usage
 
     try:
         parsed = json.loads(content)
         return {
             "brief": str(parsed.get("brief", "") or "").strip(),
             "detailed": str(parsed.get("detailed", "") or "").strip()
-        }
+        }, usage
     except Exception:
         logger.warning("generate_story_synopsis failed to parse JSON response")
-        return {"brief": "", "detailed": ""}
+        return {"brief": "", "detailed": ""}, usage
 
 
 async def extract_setup_from_long_input(long_input: str):

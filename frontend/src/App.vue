@@ -593,6 +593,16 @@ const fetchProjectDetail = async (projectId: number) => {
     }
 }
 
+const syncProjectTokensFromResponse = (payload: any) => {
+    if (!currentProject.value || !payload) return
+    const nextTokens = Number(payload?.total_tokens)
+    if (!Number.isFinite(nextTokens) || nextTokens < 0) return
+    currentProject.value = {
+        ...currentProject.value,
+        total_tokens: Math.floor(nextTokens)
+    }
+}
+
 const runPollingCycle = async () => {
     if (!token.value || !isDocumentVisible()) return
     if (pollRequestInFlight.value) return
@@ -723,6 +733,7 @@ const analyzeLogline = async (id: number) => {
     loadingText.value = 'AI 正在阅读您的创意并构思问题，如遇波动系统会自动重试...'
     
     const res = await api.post(`/projects/${id}/analyze`)
+    syncProjectTokensFromResponse(res.data)
     
     if (res.data.type === 'interaction_required') {
       interaction.value = res.data.payload
@@ -815,6 +826,7 @@ const submitChoice = async () => {
              })
              if (res.data?.title) currentProject.value.title = res.data.title
              if (res.data?.context) currentProject.value.global_context = res.data.context
+             syncProjectTokensFromResponse(res.data)
         }
         
         interaction.value = null
