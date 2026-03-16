@@ -84,11 +84,25 @@ const BACKGROUND_LIST_POLL_INTERVAL_MS = 45000
 
 const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible'
 
+const normalizeProjectStatus = (status: unknown) => {
+    const raw = toTextValue(status).trim().toLowerCase()
+    if (!raw) return ''
+    if (raw.includes('.')) {
+        const parts = raw.split('.')
+        return parts[parts.length - 1] || raw
+    }
+    return raw
+}
+
+const isStatus = (status: unknown, expected: string) => {
+    return normalizeProjectStatus(status) === expected
+}
+
 const isSceneGenerationActive = (project: any) => {
     if (!project) return false
-    if (String(project.status || '') === 'generating') return true
+    if (isStatus(project.status, 'generating')) return true
     const scenes = Array.isArray(project.scenes) ? project.scenes : []
-    return scenes.some((scene: any) => ['pending', 'generating'].includes(String(scene?.status || '')))
+    return scenes.some((scene: any) => ['pending', 'generating'].includes(normalizeProjectStatus(scene?.status)))
 }
 
 const upsertProjectListItem = (project: any) => {
@@ -118,7 +132,7 @@ const syncCurrentProjectSummary = (project: any) => {
 const hasBackgroundGeneratingProjects = () => {
     return projectList.value.some((project: any) => {
         if (!project || project.id === currentProject.value?.id) return false
-        return String(project.status || '') === 'generating'
+        return normalizeProjectStatus(project.status) === 'generating'
     })
 }
 
@@ -691,22 +705,29 @@ const analyzeLogline = async (id: number) => {
       selectedOption.value = ''
       customInput.value = '' 
     } else if (res.data.type === 'completed') {
-        // Analysis complete. Trigger Scene Generation automatically.
+        // Setup complete. Only auto-generate for fresh projects.
         interaction.value = null
+        const latestProject = await fetchProjectDetail(id)
+        const activeProject = latestProject || currentProject.value
+        const activeStatus = normalizeProjectStatus(activeProject?.status)
+        const hasGeneratedScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
+
+        if (hasGeneratedScenes || ['generating', 'completed'].includes(activeStatus)) {
+            return
+        }
+
         loadingText.value = '基础设定完成！AI 正在为您生成分场大纲（这可能需要几分钟，请耐心等待）...'
         ElMessage.success('基础设定完成！正在生成分场大纲...')
-        
-        // Call generate_scenes without selected_option, forcing it to use Context
-        // Increase timeout for this specific call since batch generation can be slow
+
         await api.post(
-            `/projects/${id}/generate_scenes`, 
-            null, 
-            { 
+            `/projects/${id}/generate_scenes`,
+            null,
+            {
                 params: { selected_option: 'auto' },
                 timeout: 300000 // 5 minutes timeout for large batches
             }
         )
-        
+
         await fetchProjectDetail(id)
     } else {
         interaction.value = null
@@ -788,7 +809,7 @@ const handleOptionSelect = (opt: any) => {
 
 const loadProject = async (p: any) => {
     // Prevent accidental switch if generating
-    if (currentProject.value && currentProject.value.status === 'generating' && currentProject.value.id !== p.id) {
+    if (currentProject.value && normalizeProjectStatus(currentProject.value.status) === 'generating' && currentProject.value.id !== p.id) {
         try {
             await ElMessageBox.confirm(
                 '当前创意正在生成中，切换项目您将无法实时看到生成进度（任务会在后台继续）。确定要切换吗？',
@@ -815,16 +836,19 @@ const loadProject = async (p: any) => {
     
     // Always check state/resume flow
     const activeProject = detailedProject || currentProject.value
-    if (activeProject.status === 'generating') {
-        loading.value = false // Allow viewing generated content
-    } else if (activeProject.status !== 'completed' && activeProject.status !== 'failed') {
-        loading.value = true;
-        loadingText.value = "正在恢复进度...";
-        analyzeLogline(activeProject.id)
+    const activeStatus = normalizeProjectStatus(activeProject?.status)
+    const hasScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
+
+    if (activeStatus === 'generating') {
+        loading.value = false
+    } else if (!hasScenes && activeStatus !== 'completed' && activeStatus !== 'failed') {
+        loading.value = true
+        loadingText.value = "正在恢复进度..."
+        await analyzeLogline(activeProject.id)
+    } else {
+        loading.value = false
     }
-    if (activeProject.status === 'pending' || !activeProject.scenes || activeProject.scenes.length === 0) {
-        // Additional checks if needed
-    }
+
     startPolling()
 }
 
@@ -1294,7 +1318,7 @@ const copyText = (value: unknown) => {
                     </div>
 
                     <!-- Progress Bar -->
-                    <div v-if="currentProject.scenes && currentProject.scenes.length > 0 && currentProject.status !== 'completed'" class="mb-6 bg-white p-6 rounded-xl shadow-sm border border-blue-100 animate-pulse">
+                    <div v-if="currentProject.scenes && currentProject.scenes.length > 0 && !isStatus(currentProject.status, 'completed')" class="mb-6 bg-white p-6 rounded-xl shadow-sm border border-blue-100 animate-pulse">
                          <div class="flex justify-between items-center mb-2">
                             <span class="text-sm font-bold text-blue-800 flex items-center gap-2">
                                 <el-icon class="is-loading"><Loading /></el-icon>
@@ -1315,7 +1339,7 @@ const copyText = (value: unknown) => {
                     <div class="space-y-6">
                         <!-- Project Info Tabs -->
                         <div v-if="currentProject.scenes && currentProject.scenes.length > 0" class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-6">
-                             <el-tabs>
+                             <el-tabs class="project-info-tabs">
                                 <el-tab-pane label="剧情大纲">
                                     <div class="space-y-4">
                                         <el-collapse accordion>
@@ -1409,7 +1433,7 @@ const copyText = (value: unknown) => {
                         </div>
                         
                         <div v-if="!currentProject.scenes || currentProject.scenes.length === 0" class="text-center py-10 text-gray-400">
-                             <div v-if="loading || currentProject.status === 'generating'">
+                             <div v-if="loading || isStatus(currentProject.status, 'generating')">
                                 <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
                                 <p>{{ loadingText || 'AI 正在逐场构架剧本，请稍候...' }}</p>
                                 <p class="text-xs mt-2 text-gray-400">（受网络速度和模型提供商影响，生成速度无法控制，请耐心等待）</p>
@@ -1427,13 +1451,13 @@ const copyText = (value: unknown) => {
                             <div class="bg-gray-50 px-6 py-4 border-b border-gray-100 flex items-center justify-between">
                                 <span class="font-medium text-gray-700">第 {{ scene.scene_index }} 场</span>
                                 <div class="flex items-center gap-2">
-                                     <el-tag v-if="scene.status === 'completed'" type="success" size="small" effect="plain">已完成</el-tag>
-                                     <el-tag v-else-if="scene.status === 'generating'" type="primary" size="small" effect="plain">生成中...</el-tag>
+                                     <el-tag v-if="isStatus(scene.status, 'completed')" type="success" size="small" effect="plain">已完成</el-tag>
+                                     <el-tag v-else-if="isStatus(scene.status, 'generating')" type="primary" size="small" effect="plain">生成中...</el-tag>
                                      <el-tag v-else type="info" size="small" effect="plain">等待中</el-tag>
 
                                      <!-- Regenerate Button -->
                                      <el-button 
-                                        v-if="scene.status === 'completed'" 
+                                        v-if="isStatus(scene.status, 'completed')" 
                                         size="small" 
                                         link 
                                         type="primary" 
@@ -1514,5 +1538,42 @@ const copyText = (value: unknown) => {
 .key-setting-preview ul,
 .key-setting-preview ol {
     margin: 0 !important;
+}
+
+.project-info-tabs .el-tabs__header {
+    margin-bottom: 1rem;
+}
+
+@media (max-width: 768px) {
+    .project-info-tabs .el-tabs__nav-prev,
+    .project-info-tabs .el-tabs__nav-next {
+        display: none !important;
+    }
+
+    .project-info-tabs .el-tabs__nav-wrap.is-scrollable {
+        padding: 0 !important;
+    }
+
+    .project-info-tabs .el-tabs__nav-scroll {
+        overflow-x: auto !important;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-x;
+        scrollbar-width: none;
+        cursor: grab;
+    }
+
+    .project-info-tabs .el-tabs__nav-scroll::-webkit-scrollbar {
+        display: none;
+    }
+
+    .project-info-tabs .el-tabs__nav {
+        float: none;
+        white-space: nowrap;
+    }
+
+    .project-info-tabs .el-tabs__item {
+        padding: 0 14px !important;
+    }
 }
 </style>

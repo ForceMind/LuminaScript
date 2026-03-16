@@ -129,12 +129,8 @@ FINAL_CONFIRM_ALLOWED_VALUES = {"confirmed", "reset"} | {f"edit:{key}" for key, 
 AUTO_PREFILL_MIN_LENGTH = 120
 AUTO_PREFILL_FLAG = "_auto_prefill_attempted"
 AUTO_PREFILL_FIELDS = [
-    "project_type",
-    "movie_duration",
-    "scene_count_target",
-    "episode_count",
-    "episode_duration",
-    "video_duration_seconds",
+    # Keep basic setup questions mandatory.
+    # We only auto-fill direction/content fields from long user input.
     "tone",
     "time_period",
     "title",
