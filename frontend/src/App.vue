@@ -74,6 +74,7 @@ const selectedOption = ref('')
 const customInput = ref('')
 const loading = ref(false)
 const loadingText = ref('AI 正在思考中...')
+const switchingProject = ref(false)
 const projectList = ref<any[]>([])
 const pollTimer = ref<any>(null)
 const isStarted = ref(false)
@@ -821,35 +822,43 @@ const loadProject = async (p: any) => {
         }
     }
     
-    currentProject.value = {
-        ...p,
-        scenes: Array.isArray(p?.scenes) ? p.scenes : []
-    }
-    drawerOpen.value = false 
-    interaction.value = null
-    
-    const detailedProject = await fetchProjectDetail(p.id)
-    if (detailedProject) {
-        currentProject.value = detailedProject
-        upsertProjectListItem(detailedProject)
-    }
-    
-    // Always check state/resume flow
-    const activeProject = detailedProject || currentProject.value
-    const activeStatus = normalizeProjectStatus(activeProject?.status)
-    const hasScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
+    switchingProject.value = true
+    loading.value = true
+    loadingText.value = '正在加载历史剧本...'
 
-    if (activeStatus === 'generating') {
-        loading.value = false
-    } else if (!hasScenes && activeStatus !== 'completed' && activeStatus !== 'failed') {
-        loading.value = true
-        loadingText.value = "正在恢复进度..."
-        await analyzeLogline(activeProject.id)
-    } else {
-        loading.value = false
-    }
+    try {
+        currentProject.value = {
+            ...p,
+            scenes: Array.isArray(p?.scenes) ? p.scenes : []
+        }
+        drawerOpen.value = false
+        interaction.value = null
 
-    startPolling()
+        const detailedProject = await fetchProjectDetail(p.id)
+        if (detailedProject) {
+            currentProject.value = detailedProject
+            upsertProjectListItem(detailedProject)
+        }
+
+        // Always check state/resume flow
+        const activeProject = detailedProject || currentProject.value
+        const activeStatus = normalizeProjectStatus(activeProject?.status)
+        const hasScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
+
+        if (activeStatus === 'generating') {
+            loading.value = false
+        } else if (!hasScenes && activeStatus !== 'completed' && activeStatus !== 'failed') {
+            loading.value = true
+            loadingText.value = "正在恢复进度..."
+            await analyzeLogline(activeProject.id)
+        } else {
+            loading.value = false
+        }
+
+        startPolling()
+    } finally {
+        switchingProject.value = false
+    }
 }
 
 const deleteProject = async () => {
@@ -1433,9 +1442,9 @@ const copyText = (value: unknown) => {
                         </div>
                         
                         <div v-if="!currentProject.scenes || currentProject.scenes.length === 0" class="text-center py-10 text-gray-400">
-                             <div v-if="loading || isStatus(currentProject.status, 'generating')">
+                             <div v-if="switchingProject || loading || isStatus(currentProject.status, 'generating')">
                                 <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
-                                <p>{{ loadingText || 'AI 正在逐场构架剧本，请稍候...' }}</p>
+                                <p>{{ switchingProject ? '正在加载历史剧本...' : (loadingText || 'AI 正在逐场构架剧本，请稍候...') }}</p>
                                 <p class="text-xs mt-2 text-gray-400">（受网络速度和模型提供商影响，生成速度无法控制，请耐心等待）</p>
                              </div>
                              <div v-else class="py-4">
