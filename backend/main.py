@@ -1774,6 +1774,88 @@ async def regenerate_scene(
     background_tasks.add_task(run_generation_loop, project.id)
     return {"status": "Regeneration scheduled"}
 
+@app.post("/projects/{project_id}/scenes/{scene_index}/to_prompt")
+async def rewrite_scene_to_prompt(
+    project_id: int,
+    scene_index: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    project = await db.get(models.Project, project_id)
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    result = await db.execute(
+        select(models.Scene)
+        .where(models.Scene.project_id == project_id)
+        .where(models.Scene.scene_index == scene_index)
+    )
+    scene = result.scalars().first()
+    if not scene:
+        raise HTTPException(status_code=404, detail="Scene not found")
+
+    context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    prompt_cache = context.get("_scene_ai_prompts")
+    if not isinstance(prompt_cache, dict):
+        prompt_cache = {}
+
+    cache_key = str(scene_index)
+    cached_prompt = str(prompt_cache.get(cache_key, "") or "").strip()
+    if cached_prompt:
+        return {"scene_index": scene_index, "prompt": cached_prompt, "cached": True}
+
+    rewrite_prompt = (
+        f"project_id={project_id}, scene_index={scene_index}, "
+        f"outline={scene.outline or ''}, content={scene.content or ''}"
+    )
+
+    try:
+        prompt_text, usage = await llm.rewrite_scene_to_ai_prompt(
+            project_type=project.project_type or "movie",
+            logline=project.logline or "",
+            style_guide=project.genre or "",
+            scene_outline=scene.outline or "",
+            scene_content=scene.content or "",
+            scene_index=scene_index
+        )
+    except Exception as exc:
+        await log_ai_action(
+            user_id=current_user.id,
+            project_id=project_id,
+            action=f"scene_to_prompt_{scene_index}",
+            prompt=rewrite_prompt,
+            response="",
+            tokens=0,
+            status="failed",
+            step_key=f"scene:{scene_index}",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        raise HTTPException(status_code=503, detail="AI 提示词转写失败，请稍后重试")
+
+    final_prompt = str(prompt_text or "").strip()
+    if not final_prompt:
+        raise HTTPException(status_code=503, detail="AI 未返回有效提示词，请稍后重试")
+
+    prompt_cache[cache_key] = final_prompt
+    context["_scene_ai_prompts"] = prompt_cache
+    project.global_context = context
+    project.total_tokens += int(usage or 0)
+    await db.commit()
+
+    await log_ai_action(
+        user_id=current_user.id,
+        project_id=project_id,
+        action=f"scene_to_prompt_{scene_index}",
+        prompt=rewrite_prompt,
+        response=final_prompt,
+        tokens=int(usage or 0),
+        status="success",
+        step_key=f"scene:{scene_index}",
+    )
+
+    return {"scene_index": scene_index, "prompt": final_prompt, "cached": False}
+
 # --- Export (New) ---
 import io
 # Try imports, fallback to plain text if failed

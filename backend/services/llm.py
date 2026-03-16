@@ -731,6 +731,83 @@ async def write_short_video_prompt(
 
     return await raw_generation(messages, temperature=0.7)
 
+async def rewrite_scene_to_ai_prompt(
+    project_type: str,
+    logline: str,
+    style_guide: str,
+    scene_outline: str,
+    scene_content: str,
+    scene_index: int,
+):
+    """
+    Rewrite an existing scene into an AI-generation friendly prompt block.
+    Returns (prompt_text, usage).
+    """
+    type_label = {
+        "movie": "电影剧本",
+        "tv": "剧集剧本",
+        "short": "短剧剧本",
+        "short_video": "短视频剧本",
+    }.get(project_type, "剧本")
+
+    if project_type == "short_video":
+        timeline_instruction = """
+    分时段描述请严格使用：
+    0–3秒：[开场画面描述、运镜、动作]
+    3–6秒：[中段发展]
+    6–10秒：[高潮或关键动作]
+    10–15秒：[收尾、定格画面、品牌文字]
+        """
+    else:
+        timeline_instruction = """
+    分时段描述请严格使用四段节奏：
+    第一段：[开场画面与角色状态]
+    第二段：[冲突推进与动作变化]
+    第三段：[高潮/反转与视觉爆点]
+    第四段：[收束画面与情绪落点]
+        """
+
+    system_prompt = f"""
+    你是影视 AIGC 提示词导演，请把现有场景转写成可直接用于视频生成模型的中文提示词。
+    项目类型：{type_label}
+
+    输出要求（必须全部满足）：
+    1. 只输出纯文本，不要 JSON，不要 Markdown 代码块，不要额外解释。
+    2. 必须包含以下字段，并按顺序逐行输出：
+       [主体/人物设定]：
+       [场景/环境]：
+       [动作/运动描述]：
+       [运镜语言]：
+       [分时段描述]：
+       [转场/特效]：
+       [音频/音效设计]：
+       [风格/氛围]：
+    3. 运镜语言必须使用专业术语（推镜头/拉镜头/跟拍/环绕/俯拍/仰拍/特写等）。
+    4. 描述要具体可执行，避免空泛词。
+    {timeline_instruction}
+    """
+
+    user_prompt = f"""
+    项目 logline：
+    {logline or "无"}
+
+    当前风格设定：
+    {style_guide or "无"}
+
+    场次编号：第{scene_index}场
+    场次大纲：
+    {scene_outline or "无"}
+
+    场次正文：
+    {scene_content or "无"}
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return await raw_generation(messages, temperature=0.4)
+
 async def generate_interaction_options(step_key: str, base_question: str, context_str: str):
     """
     Generates tailored options for a specific step in the Project Bible creation.

@@ -76,6 +76,8 @@ const loading = ref(false)
 const loadingText = ref('AI 正在思考中...')
 const switchingProject = ref(false)
 const projectList = ref<any[]>([])
+const scenePromptMap = ref<Record<number, string>>({})
+const scenePromptLoadingMap = ref<Record<number, boolean>>({})
 const pollTimer = ref<any>(null)
 const isStarted = ref(false)
 
@@ -328,6 +330,15 @@ const getProjectTooltipText = (project: any) => {
     return getProjectTitle(project)
 }
 
+const getProjectTypeDisplay = (project: any) => {
+    const projectType = toTextValue(project?.project_type || '').trim()
+    const contextType = toTextValue(project?.global_context?.project_type || '').trim()
+    const preferredType = projectType && normalizeContextKey(projectType) !== 'pending'
+        ? projectType
+        : (contextType || projectType || 'pending')
+    return formatProjectTypeText(preferredType) || '待确定'
+}
+
 const currentProjectTitle = computed(() => {
     return getProjectTitle(currentProject.value) || 'Untitled'
 })
@@ -360,13 +371,22 @@ const characterDetailsText = computed(() => {
 })
 
 const isControlInteractionField = (field: string) => {
-    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration', 'video_duration_seconds'].includes(field)
+    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration'].includes(field)
 }
 
 const canUseCustomInput = computed(() => {
     const field = toTextValue(interaction.value?.field || '').trim()
     if (!field) return true
+    if (field === 'video_duration_seconds') return true
     return !isControlInteractionField(field)
+})
+
+const customInputPlaceholder = computed(() => {
+    const field = toTextValue(interaction.value?.field || '').trim()
+    if (field === 'video_duration_seconds') {
+        return '输入自定义时长（秒），例如 180'
+    }
+    return '输入您的想法...'
 })
 
 const shouldShowOptionValue = (opt: any) => {
@@ -635,6 +655,8 @@ const logout = () => {
     projectList.value = []
     currentProject.value = null
     interaction.value = null
+    scenePromptMap.value = {}
+    scenePromptLoadingMap.value = {}
     ElMessage.info('已退出登录')
 }
 
@@ -674,6 +696,8 @@ const createProject = async () => {
       project_type: "pending" // Explicitly mark as pending classification
     })
     currentProject.value = res.data
+    scenePromptMap.value = {}
+    scenePromptLoadingMap.value = {}
     logline.value = '' // Clear input
     
     // 2. Trigger analysis (which will now ask for Type first)
@@ -808,6 +832,15 @@ const handleOptionSelect = (opt: any) => {
     customInput.value = '' // clear manual input
 }
 
+const startNewProject = () => {
+    currentProject.value = null
+    interaction.value = null
+    loading.value = false
+    switchingProject.value = false
+    scenePromptMap.value = {}
+    scenePromptLoadingMap.value = {}
+}
+
 const loadProject = async (p: any) => {
     // Prevent accidental switch if generating
     if (currentProject.value && normalizeProjectStatus(currentProject.value.status) === 'generating' && currentProject.value.id !== p.id) {
@@ -827,6 +860,8 @@ const loadProject = async (p: any) => {
     loadingText.value = '正在加载历史剧本...'
 
     try {
+        scenePromptMap.value = {}
+        scenePromptLoadingMap.value = {}
         currentProject.value = {
             ...p,
             scenes: Array.isArray(p?.scenes) ? p.scenes : []
@@ -902,6 +937,43 @@ const regenerateScene = async (sceneId: number, sceneIndex: number) => {
         await fetchProjectDetail(currentProject.value.id)
         startPolling()
     } catch(e) { console.error(e); ElMessage.error('重试请求失败') }
+}
+
+const getScenePrompt = (sceneId: number) => {
+    return toTextValue(scenePromptMap.value[sceneId] || '')
+}
+
+const isScenePromptLoading = (sceneId: number) => {
+    return !!scenePromptLoadingMap.value[sceneId]
+}
+
+const convertSceneToPrompt = async (scene: any) => {
+    if (!currentProject.value?.id || !scene?.scene_index || !scene?.id) return
+
+    const sceneId = Number(scene.id)
+    const sceneIndex = Number(scene.scene_index)
+    if (!sceneId || !sceneIndex) return
+
+    scenePromptLoadingMap.value = { ...scenePromptLoadingMap.value, [sceneId]: true }
+
+    try {
+        const res = await api.post(`/projects/${currentProject.value.id}/scenes/${sceneIndex}/to_prompt`)
+        const promptText = toTextValue(res.data?.prompt).trim()
+        if (!promptText) {
+            ElMessage.warning('AI 提示词为空，请重试')
+            return
+        }
+        scenePromptMap.value = {
+            ...scenePromptMap.value,
+            [sceneId]: promptText
+        }
+        ElMessage.success('已生成 AI 提示词')
+    } catch (e: any) {
+        console.error(e)
+        ElMessage.error(e.response?.data?.detail || '转写失败，请稍后重试')
+    } finally {
+        scenePromptLoadingMap.value = { ...scenePromptLoadingMap.value, [sceneId]: false }
+    }
 }
 
 const exportScript = (format: string = 'txt') => {
@@ -1085,7 +1157,7 @@ const copyText = (value: unknown) => {
                         </el-dropdown-menu>
                     </template>
                  </el-dropdown>
-                 <el-button type="primary" round :icon="Plus" @click="currentProject=null">开始新创意</el-button>
+                 <el-button type="primary" round :icon="Plus" @click="startNewProject">开始新创意</el-button>
             </div>
         </header>
 
@@ -1103,9 +1175,12 @@ const copyText = (value: unknown) => {
                                 class="px-3 py-3 rounded-lg cursor-pointer transition flex items-center gap-3"
                                 :class="currentProject?.id === p.id ? 'bg-blue-50 text-blue-600 font-medium' : 'text-gray-600 hover:bg-gray-50'">
                                 <el-icon><Document /></el-icon>
-                                <span class="text-sm min-w-0 flex-1 sidebar-item-text" :title="getProjectTooltipText(p)">
-                                    {{ getProjectDisplayText(p) }}
-                                </span>
+                                <div class="min-w-0 flex-1 space-y-1">
+                                    <div class="text-sm sidebar-item-text" :title="getProjectTooltipText(p)">
+                                        {{ getProjectDisplayText(p) }}
+                                    </div>
+                                    <el-tag size="small" effect="plain" class="project-type-tag">{{ getProjectTypeDisplay(p) }}</el-tag>
+                                </div>
                             </li>
                         </ul>
                         <div v-if="sortedProjectList.length === 0" class="text-center text-gray-400 text-sm py-8">
@@ -1152,13 +1227,16 @@ const copyText = (value: unknown) => {
                     <div class="flex-1 overflow-y-auto">
                         <ul class="space-y-2 p-1">
                             <div class="p-2">
-                                <el-button class="w-full" :icon="Plus" @click="currentProject=null; drawerOpen=false">新创意</el-button>
+                                <el-button class="w-full" :icon="Plus" @click="startNewProject(); drawerOpen=false">新创意</el-button>
                             </div>
                             <li v-for="p in sortedProjectList" :key="p.id" 
                                 @click="loadProject(p)"
                                 class="p-4 rounded-lg bg-gray-50 text-gray-700 border border-gray-100 shadow-sm active:bg-blue-50">
                                 <div class="sidebar-item-text text-sm" :title="getProjectTooltipText(p)">
                                     {{ getProjectDisplayText(p) }}
+                                </div>
+                                <div class="mt-2">
+                                    <el-tag size="small" effect="plain" class="project-type-tag">{{ getProjectTypeDisplay(p) }}</el-tag>
                                 </div>
                             </li>
                         </ul>
@@ -1286,7 +1364,7 @@ const copyText = (value: unknown) => {
                                 <div class="absolute -top-3 left-2 px-1 bg-white text-xs font-bold text-gray-400">或者自行输入</div>
                                 <el-input 
                                     v-model="customInput"
-                                    placeholder="输入您的想法..." 
+                                    :placeholder="customInputPlaceholder"
                                     size="large"
                                     @input="selectedOption = ''"
                                 />
@@ -1306,7 +1384,7 @@ const copyText = (value: unknown) => {
                     <div class="flex items-center justify-between mb-6">
                         <div class="flex items-center gap-4">
                             <h2 class="text-2xl font-light text-slate-800">{{ currentProjectTitle }}</h2>
-                            <el-button size="small" circle :icon="Plus" @click="currentProject=null" title="开启新创意"></el-button>
+                            <el-button size="small" circle :icon="Plus" @click="startNewProject" title="开启新创意"></el-button>
                             <el-button size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
                         </div>
                         <div class="flex items-center gap-3">
@@ -1464,6 +1542,29 @@ const copyText = (value: unknown) => {
                                      <el-tag v-else-if="isStatus(scene.status, 'generating')" type="primary" size="small" effect="plain">生成中...</el-tag>
                                      <el-tag v-else type="info" size="small" effect="plain">等待中</el-tag>
 
+                                     <el-button
+                                        v-if="scene.content"
+                                        size="small"
+                                        link
+                                        type="info"
+                                        @click="copyText(scene.content)"
+                                        title="一键复制本场内容"
+                                     >
+                                        <el-icon><Document /></el-icon> 复制内容
+                                     </el-button>
+
+                                     <el-button
+                                        v-if="isStatus(scene.status, 'completed')"
+                                        size="small"
+                                        link
+                                        type="success"
+                                        :loading="isScenePromptLoading(scene.id)"
+                                        @click="convertSceneToPrompt(scene)"
+                                        title="转写为 AI 提示词"
+                                     >
+                                        <el-icon><MagicStick /></el-icon> 转写提示词
+                                     </el-button>
+
                                      <!-- Regenerate Button -->
                                      <el-button 
                                         v-if="isStatus(scene.status, 'completed')" 
@@ -1489,6 +1590,14 @@ const copyText = (value: unknown) => {
                                 </div>
                                 <div v-else class="h-20 flex items-center justify-center text-gray-300 italic">
                                     等待 AI 撰写...
+                                </div>
+
+                                <div v-if="getScenePrompt(scene.id)" class="mt-5 bg-blue-50 border border-blue-100 rounded-lg p-4">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <div class="text-sm font-bold text-blue-700">AI 提示词</div>
+                                        <el-button size="small" type="primary" plain @click="copyText(getScenePrompt(scene.id))">一键复制</el-button>
+                                    </div>
+                                    <div class="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{{ getScenePrompt(scene.id) }}</div>
                                 </div>
                             </div>
                         </div>
@@ -1534,6 +1643,9 @@ const copyText = (value: unknown) => {
     -webkit-box-orient: vertical;
     overflow: hidden;
     word-break: break-all;
+}
+.project-type-tag {
+    max-width: 100%;
 }
 .key-setting-preview-wrapper {
     max-height: 4.75rem;
