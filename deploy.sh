@@ -440,6 +440,11 @@ EOF
     fi
 }
 
+SYSTEMD_BACKEND_SERVICE="lumina-backend"
+SYSTEMD_FRONTEND_SERVICE="lumina-frontend"
+SYSTEMD_BACKEND_FILE="/etc/systemd/system/${SYSTEMD_BACKEND_SERVICE}.service"
+SYSTEMD_FRONTEND_FILE="/etc/systemd/system/${SYSTEMD_FRONTEND_SERVICE}.service"
+
 start_services() {
     echo -e "${YELLOW}[6/6] 启动后端与前端服务...${NC}"
 
@@ -448,6 +453,87 @@ start_services() {
 
     pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
     pick_backend_port
+    write_frontend_server
+
+    if command_exists systemctl; then
+        setup_systemd_services
+    else
+        start_services_nohup
+    fi
+}
+
+setup_systemd_services() {
+    # Stop old nohup processes if any
+    pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+    local fpid
+    fpid="$(lsof -t -i:"$FRONTEND_PORT" 2>/dev/null || true)"
+    [ -n "$fpid" ] && kill -9 $fpid 2>/dev/null || true
+    sleep 1
+
+    local node_bin
+    node_bin="$(command -v node)"
+
+    cat > "$SYSTEMD_BACKEND_FILE" <<SVCEOF
+[Unit]
+Description=LuminaScript Backend (uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BACKEND_DIR
+ExecStart=$VENV_DIR/bin/uvicorn main:app --app-dir $BACKEND_DIR --host 0.0.0.0 --port $BACKEND_PORT
+Restart=always
+RestartSec=3
+Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:$BACKEND_LOG
+StandardError=append:$BACKEND_LOG
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    cat > "$SYSTEMD_FRONTEND_FILE" <<SVCEOF
+[Unit]
+Description=LuminaScript Frontend (Node.js)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$FRONTEND_DIR
+ExecStart=$node_bin $FRONTEND_DIR/server.cjs
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+StandardOutput=append:$FRONTEND_LOG
+StandardError=append:$FRONTEND_LOG
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    systemctl daemon-reload
+    systemctl enable "$SYSTEMD_BACKEND_SERVICE"
+    systemctl restart "$SYSTEMD_BACKEND_SERVICE"
+
+    sleep 3
+    if ! systemctl is-active --quiet "$SYSTEMD_BACKEND_SERVICE"; then
+        echo -e "${RED}后端 systemd 服务启动失败，请查看: journalctl -u $SYSTEMD_BACKEND_SERVICE${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}后端服务已通过 systemd 启动 (端口 $BACKEND_PORT)${NC}"
+
+    systemctl enable "$SYSTEMD_FRONTEND_SERVICE"
+    systemctl restart "$SYSTEMD_FRONTEND_SERVICE"
+
+    sleep 2
+    if ! systemctl is-active --quiet "$SYSTEMD_FRONTEND_SERVICE"; then
+        echo -e "${RED}前端 systemd 服务启动失败，请查看: journalctl -u $SYSTEMD_FRONTEND_SERVICE${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}前端服务已通过 systemd 启动 (端口 $FRONTEND_PORT)${NC}"
+}
+
+start_services_nohup() {
     nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
 
     sleep 3
@@ -456,7 +542,6 @@ start_services() {
         exit 1
     fi
 
-    write_frontend_server
     local fpid
     fpid="$(lsof -t -i:"$FRONTEND_PORT" 2>/dev/null || true)"
     [ -n "$fpid" ] && kill -9 $fpid 2>/dev/null || true

@@ -122,6 +122,23 @@ EOF
 restart_services_fallback() {
     echo -e "${YELLOW}未找到 miaobi，使用兼容模式重启服务。${NC}"
 
+    # Prefer systemd if services exist
+    if command -v systemctl >/dev/null 2>&1 && \
+       [ -f "/etc/systemd/system/lumina-backend.service" ] && \
+       [ -f "/etc/systemd/system/lumina-frontend.service" ]; then
+        echo "检测到 systemd 服务，使用 systemctl 重启..."
+        systemctl restart lumina-backend
+        systemctl restart lumina-frontend
+        sleep 3
+        if systemctl is-active --quiet lumina-backend && systemctl is-active --quiet lumina-frontend; then
+            echo -e "${GREEN}服务已通过 systemd 重启成功。${NC}"
+        else
+            echo -e "${RED}systemd 重启异常，请检查: journalctl -u lumina-backend -u lumina-frontend${NC}"
+        fi
+        return
+    fi
+
+    # Fallback to nohup (no systemd)
     if [ -x "$VENV_DIR/bin/uvicorn" ]; then
         pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
         cd "$BACKEND_DIR"
