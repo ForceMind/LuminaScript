@@ -12,6 +12,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 RUNTIME_FILE="$PROJECT_DIR/.lumina_runtime"
+GLOBAL_RUNTIME_FILE="/etc/miaobi/runtime.env"
 BACKUP_DIR="$PROJECT_DIR/backups/uninstall_$(date +%Y%m%d_%H%M%S)"
 BACKEND_PORT="8000"
 FRONTEND_PORT="8600"
@@ -61,6 +62,22 @@ remove_miaobi_link() {
     fi
 }
 
+remove_global_runtime_file() {
+    local runtime_project=""
+    if [ ! -f "$GLOBAL_RUNTIME_FILE" ]; then
+        return
+    fi
+    runtime_project="$(sed -n 's/^PROJECT_DIR=//p' "$GLOBAL_RUNTIME_FILE" | head -n 1)"
+    runtime_project="${runtime_project%\"}"
+    runtime_project="${runtime_project#\"}"
+    runtime_project="${runtime_project%\'}"
+    runtime_project="${runtime_project#\'}"
+    if [ "$runtime_project" = "$PROJECT_DIR" ]; then
+        rm -f "$GLOBAL_RUNTIME_FILE"
+        echo "已移除全局运行时配置: $GLOBAL_RUNTIME_FILE"
+    fi
+}
+
 confirm() {
     local prompt="$1"
     local answer=""
@@ -86,6 +103,7 @@ stop_services
 
 echo -e "${YELLOW}[3/4] 娓呯悊鍛戒护鍏ュ彛涓庤繍琛屾枃浠?..${NC}"
 remove_miaobi_link
+remove_global_runtime_file
 rm -f "$RUNTIME_FILE"
 
 if confirm "鏄惁鍒犻櫎 Python 铏氭嫙鐜 (backend/venv)"; then

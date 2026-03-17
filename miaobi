@@ -13,6 +13,7 @@ if [ -z "${SCRIPT_PATH:-}" ]; then
     SCRIPT_PATH="${BASH_SOURCE[0]}"
 fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+GLOBAL_RUNTIME_FILE="/etc/miaobi/runtime.env"
 
 is_project_dir() {
     local dir="$1"
@@ -30,11 +31,52 @@ resolve_from_runtime_file() {
     local value=""
     [ -f "$runtime_file" ] || return 1
     value="$(sed -n 's/^PROJECT_DIR=//p' "$runtime_file" | head -n 1)"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
     [ -n "$value" ] || return 1
     if is_project_dir "$value"; then
         cd "$value" && pwd
         return 0
     fi
+    return 1
+}
+
+resolve_from_runtime_candidates() {
+    local candidate resolved
+    for candidate in \
+        "${MIAOBI_RUNTIME_FILE:-}" \
+        "$GLOBAL_RUNTIME_FILE" \
+        "/usr/local/etc/miaobi/runtime.env" \
+        "$SCRIPT_DIR/.lumina_runtime" \
+        "$PWD/.lumina_runtime" \
+        "${HOME:-}/LuminaScript/.lumina_runtime" \
+        "/root/LuminaScript/.lumina_runtime" \
+        "/opt/LuminaScript/.lumina_runtime" \
+        "/srv/LuminaScript/.lumina_runtime"
+    do
+        [ -n "$candidate" ] || continue
+        if resolved="$(resolve_from_runtime_file "$candidate")"; then
+            echo "$resolved"
+            return 0
+        fi
+    done
+    return 1
+}
+
+scan_runtime_files() {
+    local base candidate resolved
+    for base in "${HOME:-}" "/root" "/home" "/opt" "/srv"; do
+        [ -d "$base" ] || continue
+        while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            if resolved="$(resolve_from_runtime_file "$candidate")"; then
+                echo "$resolved"
+                return 0
+            fi
+        done < <(find "$base" -maxdepth 4 -type f -name ".lumina_runtime" 2>/dev/null | head -n 120)
+    done
     return 1
 }
 
@@ -46,24 +88,33 @@ detect_project_dir() {
         return
     fi
 
-    for candidate in "$SCRIPT_DIR" "$PWD" "/root/LuminaScript" "/opt/LuminaScript" "/srv/LuminaScript"; do
+    for candidate in "$SCRIPT_DIR" "$PWD" "$(dirname "$SCRIPT_PATH")" "/root/LuminaScript" "/opt/LuminaScript" "/srv/LuminaScript"; do
         if is_project_dir "$candidate"; then
             cd "$candidate" && pwd
             return
         fi
     done
 
-    for candidate in "$SCRIPT_DIR/.lumina_runtime" "$PWD/.lumina_runtime" "/root/LuminaScript/.lumina_runtime"; do
-        if resolved="$(resolve_from_runtime_file "$candidate")"; then
-            echo "$resolved"
-            return
-        fi
-    done
+    if resolved="$(resolve_from_runtime_candidates)"; then
+        echo "$resolved"
+        return
+    fi
 
-    echo "$SCRIPT_DIR"
+    if resolved="$(scan_runtime_files)"; then
+        echo "$resolved"
+        return
+    fi
+
+    echo ""
 }
 
 PROJECT_DIR="$(detect_project_dir)"
+if ! is_project_dir "$PROJECT_DIR"; then
+    echo -e "${RED}无法定位项目目录，miaobi 暂时无法执行此命令。${NC}" >&2
+    echo -e "${YELLOW}请先指定项目目录，例如：MIAOBI_PROJECT_DIR=/your/LuminaScript miaobi update${NC}" >&2
+    exit 1
+fi
+
 RUNTIME_FILE="$PROJECT_DIR/.lumina_runtime"
 BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
