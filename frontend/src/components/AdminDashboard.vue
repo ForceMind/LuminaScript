@@ -11,8 +11,13 @@ const activeTab = ref('users')
 const users = ref<any[]>([])
 const loginLogs = ref<any[]>([])
 const aiLogs = ref<any[]>([])
+const aiUserStats = ref<any[]>([])
+const aiContentLogs = ref<any[]>([])
 const loading = ref(false)
 const exportLoading = ref(false)
+const aiDetailLoading = ref(false)
+const aiDetailVisible = ref(false)
+const aiDetail = ref<any | null>(null)
 
 const loginPage = ref(1)
 const loginPageSize = ref(20)
@@ -21,6 +26,12 @@ const loginTotal = ref(0)
 const aiPage = ref(1)
 const aiPageSize = ref(20)
 const aiTotal = ref(0)
+
+const aiContentPage = ref(1)
+const aiContentPageSize = ref(20)
+const aiContentTotal = ref(0)
+const aiContentUserId = ref<number | null>(null)
+const aiContentKeyword = ref('')
 
 const api = axios.create({ baseURL: '/api' })
 api.interceptors.request.use((config) => {
@@ -80,6 +91,73 @@ const fetchAiLogs = async () => {
     }
 }
 
+const fetchAiUserStats = async () => {
+    try {
+        const res = await api.get('/admin/logs/ai/users')
+        aiUserStats.value = Array.isArray(res.data?.items) ? res.data.items : []
+    } catch (e) {
+        console.error(e)
+        aiUserStats.value = []
+    }
+}
+
+const fetchAiContentLogs = async () => {
+    loading.value = true
+    try {
+        const params = new URLSearchParams()
+        params.set('page', String(aiContentPage.value))
+        params.set('page_size', String(aiContentPageSize.value))
+        if (aiContentUserId.value !== null && aiContentUserId.value !== undefined) {
+            params.set('user_id', String(aiContentUserId.value))
+        }
+        const keyword = aiContentKeyword.value.trim()
+        if (keyword) {
+            params.set('keyword', keyword)
+        }
+        const res = await api.get(`/admin/logs/ai?${params.toString()}`)
+        if (res.data.items) {
+            aiContentLogs.value = res.data.items
+            aiContentTotal.value = res.data.total
+        } else {
+            aiContentLogs.value = res.data
+            aiContentTotal.value = res.data.length
+        }
+    } catch (e) {
+        console.error(e)
+        ElMessage.error('无法获取 AI 内容审计日志')
+    } finally {
+        loading.value = false
+    }
+}
+
+const resetAiContentFilter = async () => {
+    aiContentUserId.value = null
+    aiContentKeyword.value = ''
+    aiContentPage.value = 1
+    await fetchAiContentLogs()
+}
+
+const applyAiContentFilter = async () => {
+    aiContentPage.value = 1
+    await fetchAiContentLogs()
+}
+
+const openAiDetail = async (logId: number) => {
+    aiDetailVisible.value = true
+    aiDetailLoading.value = true
+    aiDetail.value = null
+    try {
+        const res = await api.get(`/admin/logs/ai/${logId}`)
+        aiDetail.value = res.data || null
+    } catch (e) {
+        console.error(e)
+        ElMessage.error('无法获取该条 AI 日志详情')
+        aiDetailVisible.value = false
+    } finally {
+        aiDetailLoading.value = false
+    }
+}
+
 const downloadAllUserData = async () => {
     exportLoading.value = true
     try {
@@ -118,10 +196,18 @@ const handleTabChange = () => {
         aiPage.value = 1
         fetchAiLogs()
     }
+    if (activeTab.value === 'ai_content') {
+        aiContentPage.value = 1
+        fetchAiUserStats()
+        fetchAiContentLogs()
+    }
 }
 
 watch(loginPage, () => fetchLoginLogs())
 watch(aiPage, () => fetchAiLogs())
+watch(aiContentPage, () => {
+    if (activeTab.value === 'ai_content') fetchAiContentLogs()
+})
 
 onMounted(() => {
     fetchUsers()
@@ -261,7 +347,112 @@ onMounted(() => {
                     />
                 </div>
             </el-tab-pane>
+
+            <el-tab-pane label="AI 内容审计" name="ai_content">
+                <div class="mb-4 flex flex-wrap gap-3 items-center">
+                    <el-select
+                        v-model="aiContentUserId"
+                        clearable
+                        filterable
+                        class="!w-64"
+                        placeholder="按用户筛选"
+                    >
+                        <el-option
+                            v-for="item in aiUserStats"
+                            :key="item.user_id"
+                            :label="`${item.username}（${item.log_count}）`"
+                            :value="item.user_id"
+                        />
+                    </el-select>
+                    <el-input
+                        v-model="aiContentKeyword"
+                        class="!w-96"
+                        clearable
+                        placeholder="关键词搜索（Prompt / Response / 错误信息 / 操作）"
+                        @keyup.enter="applyAiContentFilter"
+                    />
+                    <el-button type="primary" @click="applyAiContentFilter">查询</el-button>
+                    <el-button @click="resetAiContentFilter">重置</el-button>
+                </div>
+
+                <el-table :data="aiContentLogs" stripe v-loading="loading">
+                    <el-table-column prop="timestamp" label="时间" width="180" />
+                    <el-table-column prop="user_name" label="用户" width="120" />
+                    <el-table-column prop="action" label="操作" width="160" />
+                    <el-table-column label="状态" width="100">
+                        <template #default="scope">
+                            <el-tag :type="getAiStatusType(scope.row.status)">
+                                {{ scope.row.status || 'success' }}
+                            </el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="tokens" label="Tokens" width="90" />
+                    <el-table-column label="Prompt" min-width="260">
+                        <template #default="scope">
+                            <el-popover placement="top" :width="520" trigger="hover">
+                                <template #reference>
+                                    <div class="truncate cursor-pointer text-gray-600">
+                                        {{ scope.row.prompt || '-' }}
+                                    </div>
+                                </template>
+                                <div class="whitespace-pre-wrap text-xs h-72 overflow-y-auto">{{ scope.row.prompt || '无' }}</div>
+                            </el-popover>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="Response" min-width="260">
+                        <template #default="scope">
+                            <el-popover placement="top" :width="520" trigger="hover">
+                                <template #reference>
+                                    <div class="truncate cursor-pointer" :class="scope.row.status === 'failed' ? 'text-red-500' : 'text-blue-600'">
+                                        {{ scope.row.response || '-' }}
+                                    </div>
+                                </template>
+                                <div class="whitespace-pre-wrap text-xs h-72 overflow-y-auto">{{ scope.row.response || '无' }}</div>
+                            </el-popover>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="详情" width="90" fixed="right">
+                        <template #default="scope">
+                            <el-button size="small" link type="primary" @click="openAiDetail(scope.row.id)">查看</el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+
+                <div class="mt-4 flex justify-center">
+                    <el-pagination
+                        v-model:current-page="aiContentPage"
+                        layout="total, prev, pager, next"
+                        :total="aiContentTotal"
+                        :page-size="aiContentPageSize"
+                        background
+                    />
+                </div>
+            </el-tab-pane>
         </el-tabs>
     </div>
+
+    <el-dialog v-model="aiDetailVisible" width="80%" title="AI 日志完整内容" destroy-on-close>
+        <div v-loading="aiDetailLoading" class="min-h-40">
+            <template v-if="aiDetail">
+                <div class="grid grid-cols-2 gap-3 mb-4 text-sm">
+                    <div><span class="text-gray-400">用户：</span>{{ aiDetail.user_name || '-' }}</div>
+                    <div><span class="text-gray-400">时间：</span>{{ aiDetail.timestamp || '-' }}</div>
+                    <div><span class="text-gray-400">操作：</span>{{ aiDetail.action || '-' }}</div>
+                    <div><span class="text-gray-400">状态：</span>{{ aiDetail.status || 'success' }}</div>
+                    <div><span class="text-gray-400">步骤：</span>{{ aiDetail.step_key || '-' }}</div>
+                    <div><span class="text-gray-400">Tokens：</span>{{ aiDetail.tokens || 0 }}</div>
+                </div>
+
+                <div class="mb-3">
+                    <div class="font-semibold mb-1">Prompt（完整）</div>
+                    <div class="whitespace-pre-wrap text-xs leading-5 p-3 rounded border bg-gray-50 max-h-80 overflow-y-auto">{{ aiDetail.prompt || '无' }}</div>
+                </div>
+                <div>
+                    <div class="font-semibold mb-1">Response（完整）</div>
+                    <div class="whitespace-pre-wrap text-xs leading-5 p-3 rounded border bg-gray-50 max-h-80 overflow-y-auto">{{ aiDetail.response || '无' }}</div>
+                </div>
+            </template>
+        </div>
+    </el-dialog>
 </div>
 </template>

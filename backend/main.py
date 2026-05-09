@@ -670,12 +670,15 @@ async def log_ai_action(
     attempt: int = 1,
 ):
     async with SessionLocal() as db:
+        prompt_text = "" if prompt is None else str(prompt)
+        response_text = "" if response is None else str(response)
         log = models.AIInteractionLog(
             user_id=user_id,
             project_id=project_id,
             action=action,
-            prompt=prompt[:5000],  # Truncate if too long to save generic DB space
-            response=response[:5000],
+            # Keep full prompt/response for audit traceability.
+            prompt=prompt_text,
+            response=response_text,
             tokens=tokens,
             status=(status or "success")[:50],
             step_key=(step_key or "")[:100] or None,
@@ -731,20 +734,56 @@ async def admin_list_login_logs(
 async def admin_list_ai_logs(
     page: int = 1,
     page_size: int = 20,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    log_status: Optional[str] = None,
+    keyword: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     admin: models.User = Depends(check_admin)
 ):
     async def _fetch_ai_logs_page() -> Dict[str, Any]:
         offset = (page - 1) * page_size
-
         count_query = select(func.count()).select_from(models.AIInteractionLog)
+        data_query = (
+            select(models.AIInteractionLog, models.User.username)
+            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+        )
+
+        if user_id is not None:
+            count_query = count_query.where(models.AIInteractionLog.user_id == user_id)
+            data_query = data_query.where(models.AIInteractionLog.user_id == user_id)
+
+        if action:
+            action_text = str(action).strip()
+            if action_text:
+                count_query = count_query.where(models.AIInteractionLog.action == action_text)
+                data_query = data_query.where(models.AIInteractionLog.action == action_text)
+
+        if log_status:
+            status_text = str(log_status).strip()
+            if status_text:
+                count_query = count_query.where(models.AIInteractionLog.status == status_text)
+                data_query = data_query.where(models.AIInteractionLog.status == status_text)
+
+        if keyword:
+            keyword_text = str(keyword).strip()
+            if keyword_text:
+                pattern = f"%{keyword_text}%"
+                condition = (
+                    models.AIInteractionLog.prompt.like(pattern) |
+                    models.AIInteractionLog.response.like(pattern) |
+                    models.AIInteractionLog.error_message.like(pattern) |
+                    models.AIInteractionLog.action.like(pattern)
+                )
+                count_query = count_query.where(condition)
+                data_query = data_query.where(condition)
+
         total_result = await db.execute(count_query)
         total = int(total_result.scalar() or 0)
 
         result = await db.execute(
-            select(models.AIInteractionLog, models.User.username)
-            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
-            .order_by(models.AIInteractionLog.timestamp.desc())
+            data_query
+            .order_by(models.AIInteractionLog.timestamp.desc(), models.AIInteractionLog.id.desc())
             .offset(offset)
             .limit(page_size)
         )
@@ -765,6 +804,69 @@ async def admin_list_ai_logs(
         except Exception as retry_exc:
             logger.error(f"AI 日志自动修复后仍失败: {retry_exc}")
             raise HTTPException(status_code=500, detail="AI日志表结构异常，请执行更新脚本后重试。")
+
+
+@app.get("/admin/logs/ai/users")
+async def admin_list_ai_log_users(
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(check_admin)
+):
+    result = await db.execute(
+        select(
+            models.User.id,
+            models.User.username,
+            func.count(models.AIInteractionLog.id).label("log_count"),
+            func.max(models.AIInteractionLog.timestamp).label("last_log_at"),
+        )
+        .join(models.AIInteractionLog, models.AIInteractionLog.user_id == models.User.id)
+        .group_by(models.User.id, models.User.username)
+        .order_by(func.count(models.AIInteractionLog.id).desc(), models.User.id.asc())
+    )
+    items = []
+    for user_id, username, log_count, last_log_at in result:
+        items.append({
+            "user_id": int(user_id),
+            "username": str(username or ""),
+            "log_count": int(log_count or 0),
+            "last_log_at": str(last_log_at or ""),
+        })
+    return {"items": items}
+
+
+@app.get("/admin/logs/ai/{log_id}", response_model=schemas.AIInteractionLogResponse)
+async def admin_get_ai_log_detail(
+    log_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(check_admin)
+):
+    async def _fetch_log_detail() -> Optional[Dict[str, Any]]:
+        result = await db.execute(
+            select(models.AIInteractionLog, models.User.username)
+            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+            .where(models.AIInteractionLog.id == log_id)
+            .limit(1)
+        )
+        row = result.first()
+        if not row:
+            return None
+        log, username = row
+        return _serialize_admin_ai_log(log, username or "")
+
+    try:
+        data = await _fetch_log_detail()
+    except OperationalError as exc:
+        logger.error(f"AI 日志详情查询失败，尝试自动修复表结构: {exc}")
+        try:
+            import upgrade_admin
+            await asyncio.to_thread(upgrade_admin.upgrade_schema)
+            data = await _fetch_log_detail()
+        except Exception as retry_exc:
+            logger.error(f"AI 日志详情自动修复后仍失败: {retry_exc}")
+            raise HTTPException(status_code=500, detail="AI日志表结构异常，请执行更新脚本后重试。")
+
+    if not data:
+        raise HTTPException(status_code=404, detail="AI日志不存在")
+    return data
 
 
 def _serialize_admin_scene(scene: models.Scene) -> Dict[str, Any]:
