@@ -477,6 +477,7 @@ start_services() {
 
     pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
     pick_backend_port
+    write_runtime_file
     write_frontend_server
 
     if command_exists systemctl; then
@@ -618,7 +619,6 @@ main() {
     configure_admin_policy
     build_frontend
     start_services
-    write_runtime_file
     install_miaobi
     print_finish
 }

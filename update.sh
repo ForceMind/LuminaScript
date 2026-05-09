@@ -119,6 +119,26 @@ EOF
     fi
 }
 
+sync_backend_port_from_systemd() {
+    local detected_port=""
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
+    fi
+    if [ ! -f "/etc/systemd/system/lumina-backend.service" ]; then
+        return
+    fi
+
+    detected_port="$(
+        systemctl show -p ExecStart --value lumina-backend 2>/dev/null \
+            | sed -n 's/.*--port \([0-9][0-9]*\).*/\1/p' \
+            | tail -n 1
+    )"
+
+    if [[ "$detected_port" =~ ^[0-9]+$ ]]; then
+        BACKEND_PORT="$detected_port"
+    fi
+}
+
 restart_services_fallback() {
     echo -e "${YELLOW}未找到 miaobi，使用兼容模式重启服务。${NC}"
 
@@ -271,13 +291,15 @@ fi
 echo -e "${YELLOW}[6/6] 重启当前服务...${NC}"
 cd "$PROJECT_DIR"
 
+sync_backend_port_from_systemd
+write_runtime_file
+
 if [ -f "$PROJECT_DIR/miaobi" ]; then
     bash "$PROJECT_DIR/miaobi" restart
 else
     restart_services_fallback
 fi
 
-write_runtime_file
 install_miaobi
 
 echo -e "${GREEN}更新完成。备份目录: $BACKUP_DIR${NC}"
