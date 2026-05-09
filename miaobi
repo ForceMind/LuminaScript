@@ -14,6 +14,10 @@ if [ -z "${SCRIPT_PATH:-}" ]; then
 fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 GLOBAL_RUNTIME_FILE="/etc/miaobi/runtime.env"
+SYSTEMD_BACKEND_SERVICE="lumina-backend"
+SYSTEMD_FRONTEND_SERVICE="lumina-frontend"
+SYSTEMD_BACKEND_FILE="/etc/systemd/system/${SYSTEMD_BACKEND_SERVICE}.service"
+SYSTEMD_FRONTEND_FILE="/etc/systemd/system/${SYSTEMD_FRONTEND_SERVICE}.service"
 
 is_project_dir() {
     local dir="$1"
@@ -24,6 +28,16 @@ is_project_dir() {
     [ -f "$dir/update.sh" ] || return 1
     [ -f "$dir/uninstall.sh" ] || return 1
     return 0
+}
+
+use_systemd_services() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if [ -f "$SYSTEMD_BACKEND_FILE" ] && [ -f "$SYSTEMD_FRONTEND_FILE" ]; then
+        return 0
+    fi
+    return 1
 }
 
 resolve_from_runtime_file() {
@@ -150,7 +164,11 @@ load_runtime() {
 }
 
 find_backend_pids() {
-    pgrep -f "$PROJECT_DIR/backend/venv/bin/uvicorn" 2>/dev/null || true
+    pgrep -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+}
+
+find_backend_port_pids() {
+    lsof -t -i:"$BACKEND_PORT" 2>/dev/null || true
 }
 
 find_frontend_pids() {
@@ -164,8 +182,20 @@ find_frontend_pids() {
 }
 
 stop_backend() {
-    local pids
-    pids="$(find_backend_pids)"
+    if use_systemd_services; then
+        systemctl stop "$SYSTEMD_BACKEND_SERVICE" 2>/dev/null || true
+        return
+    fi
+
+    local pids backend_pids port_pids
+    backend_pids="$(find_backend_pids)"
+    port_pids="$(find_backend_port_pids)"
+    pids="$(
+        {
+            [ -n "$backend_pids" ] && printf '%s\n' "$backend_pids"
+            [ -n "$port_pids" ] && printf '%s\n' "$port_pids"
+        } | awk 'NF' | sort -u
+    )"
     if [ -z "$pids" ]; then
         echo "后端未运行"
         return
@@ -180,6 +210,11 @@ stop_backend() {
 }
 
 stop_frontend() {
+    if use_systemd_services; then
+        systemctl stop "$SYSTEMD_FRONTEND_SERVICE" 2>/dev/null || true
+        return
+    fi
+
     local pids
     pids="$(find_frontend_pids)"
     if [ -z "$pids" ]; then
@@ -196,16 +231,30 @@ stop_frontend() {
 }
 
 start_backend() {
+    if use_systemd_services; then
+        systemctl start "$SYSTEMD_BACKEND_SERVICE"
+        sleep 1
+        if systemctl is-active --quiet "$SYSTEMD_BACKEND_SERVICE"; then
+            echo -e "${GREEN}后端已通过 systemd 启动${NC}"
+            return 0
+        fi
+        echo -e "${RED}后端 systemd 启动失败，请检查: journalctl -u $SYSTEMD_BACKEND_SERVICE${NC}"
+        return 1
+    fi
+
+    local backend_pids port_pids
     if [ ! -x "$VENV_DIR/bin/uvicorn" ]; then
         echo -e "${RED}未找到后端运行环境: $VENV_DIR/bin/uvicorn${NC}"
         return 1
     fi
-    if [ -n "$(find_backend_pids)" ]; then
+    backend_pids="$(find_backend_pids)"
+    if [ -n "$backend_pids" ]; then
         echo "后端已运行"
         return 0
     fi
-    if lsof -t -i:"$BACKEND_PORT" >/dev/null 2>&1; then
-        echo -e "${RED}后端端口 $BACKEND_PORT 已被其他进程占用${NC}"
+    port_pids="$(find_backend_port_pids)"
+    if [ -n "$port_pids" ]; then
+        echo -e "${RED}后端端口 $BACKEND_PORT 已被其他进程占用 (PID: $port_pids)${NC}"
         return 1
     fi
     mkdir -p "$(dirname "$BACKEND_LOG")"
@@ -221,6 +270,17 @@ start_backend() {
 }
 
 start_frontend() {
+    if use_systemd_services; then
+        systemctl start "$SYSTEMD_FRONTEND_SERVICE"
+        sleep 1
+        if systemctl is-active --quiet "$SYSTEMD_FRONTEND_SERVICE"; then
+            echo -e "${GREEN}前端已通过 systemd 启动${NC}"
+            return 0
+        fi
+        echo -e "${RED}前端 systemd 启动失败，请检查: journalctl -u $SYSTEMD_FRONTEND_SERVICE${NC}"
+        return 1
+    fi
+
     if [ ! -f "$FRONTEND_DIR/server.cjs" ]; then
         echo -e "${RED}未找到前端服务文件: $FRONTEND_DIR/server.cjs${NC}"
         return 1
@@ -245,6 +305,25 @@ start_frontend() {
 }
 
 show_status() {
+    if use_systemd_services; then
+        echo -e "${BLUE}项目目录:${NC} $PROJECT_DIR"
+        echo -e "${BLUE}后端端口:${NC} $BACKEND_PORT"
+        echo -e "${BLUE}前端端口:${NC} $FRONTEND_PORT"
+        if systemctl is-active --quiet "$SYSTEMD_BACKEND_SERVICE"; then
+            echo -e "${GREEN}后端运行中(systemd):${NC} $SYSTEMD_BACKEND_SERVICE"
+        else
+            echo -e "${YELLOW}后端未运行(systemd):${NC} $SYSTEMD_BACKEND_SERVICE"
+        fi
+        if systemctl is-active --quiet "$SYSTEMD_FRONTEND_SERVICE"; then
+            echo -e "${GREEN}前端运行中(systemd):${NC} $SYSTEMD_FRONTEND_SERVICE"
+        else
+            echo -e "${YELLOW}前端未运行(systemd):${NC} $SYSTEMD_FRONTEND_SERVICE"
+        fi
+        echo "后端日志: $BACKEND_LOG"
+        echo "前端日志: $FRONTEND_LOG"
+        return
+    fi
+
     local backend_pids frontend_pids
     backend_pids="$(find_backend_pids)"
     frontend_pids="$(find_frontend_pids)"

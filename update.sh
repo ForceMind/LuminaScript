@@ -140,7 +140,12 @@ restart_services_fallback() {
 
     # Fallback to nohup (no systemd)
     if [ -x "$VENV_DIR/bin/uvicorn" ]; then
+        local bpid=""
         pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+        bpid="$(lsof -t -i:$BACKEND_PORT 2>/dev/null || true)"
+        if [ -n "$bpid" ]; then
+            kill -9 $bpid 2>/dev/null || true
+        fi
         cd "$BACKEND_DIR"
         nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
         cd "$PROJECT_DIR"
