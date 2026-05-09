@@ -380,10 +380,34 @@ write_frontend_server() {
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
-const BACKEND_PORT = ${BACKEND_PORT};
-const FRONTEND_PORT = ${FRONTEND_PORT};
+
+function parseRuntimeFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return {};
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const result = {};
+    for (const lineRaw of raw.split(/\\r?\\n/)) {
+      const line = String(lineRaw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      const idx = line.indexOf('=');
+      if (idx <= 0) continue;
+      const key = line.slice(0, idx).trim();
+      const value = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (key) result[key] = value;
+    }
+    return result;
+  } catch (err) {
+    return {};
+  }
+}
+
+const runtimePath = path.resolve(__dirname, '..', '.lumina_runtime');
+const runtime = parseRuntimeFile(runtimePath);
+const BACKEND_PORT = Number(process.env.BACKEND_PORT || runtime.BACKEND_PORT || ${BACKEND_PORT});
+const FRONTEND_PORT = Number(process.env.FRONTEND_PORT || runtime.FRONTEND_PORT || ${FRONTEND_PORT});
 
 app.use('/api', createProxyMiddleware({
   target: \`http://127.0.0.1:\${BACKEND_PORT}\`,
