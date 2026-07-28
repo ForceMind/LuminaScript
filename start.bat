@@ -58,10 +58,11 @@ echo LLM_BASE_URL=!BASE_URL!
 echo LLM_MODEL_ID=!MODEL_ID!
 ) > "%ENV_FILE%"
 echo [OK] 配置已保存。
+%PYTHON_CMD% backend\bootstrap_security.py
 
 :RUN
-:: --- 4. 启动后端 ---
-echo [1/2] 正在启动后端...
+:: --- 4. 启动后端与 Worker ---
+echo [1/3] 正在启动后端...
 cd backend
 if not exist "venv" (
     echo [Init] 创建虚拟环境...
@@ -71,12 +72,31 @@ call venv\Scripts\activate.bat
 
 echo [Install] 检查依赖...
 pip install -r requirements.txt >nul 2>&1
+python bootstrap_security.py
+python migrate.py
+if errorlevel 1 (
+    echo [Error] 数据库迁移失败，请检查上方错误。
+    exit /b 1
+)
+python upgrade_admin.py
+set "UPGRADE_EXIT=!ERRORLEVEL!"
+if "!UPGRADE_EXIT!"=="3" (
+    echo [Security] 需要设置安全的管理员账号和密码。
+    python manage_admin.py
+    if errorlevel 1 exit /b 1
+)
+if not "!UPGRADE_EXIT!"=="0" if not "!UPGRADE_EXIT!"=="3" (
+    echo [Error] 数据库升级失败，请检查上方错误。
+    exit /b !UPGRADE_EXIT!
+)
 
 start "Lumina Backend" cmd /k "title Backend && uvicorn main:app --reload --port 8000"
+echo [2/3] 正在启动生成 Worker...
+start "Lumina Worker" cmd /k "title Worker && venv\Scripts\python.exe worker.py"
 cd ..
 
 :: --- 5. 启动前端 ---
-echo [2/2] 正在启动前端...
+echo [3/3] 正在启动前端...
 cd frontend
 if not exist "node_modules" (
     echo [Init] 安装前端依赖...

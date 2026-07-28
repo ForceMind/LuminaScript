@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import { DataLine, Download } from '@element-plus/icons-vue'
 
-const props = defineProps<{ token: string }>()
+const props = defineProps<{ token: string; currentUserId: number }>()
 const emit = defineEmits(['close'])
 
 const activeTab = ref('users')
@@ -18,6 +20,7 @@ const exportLoading = ref(false)
 const aiDetailLoading = ref(false)
 const aiDetailVisible = ref(false)
 const aiDetail = ref<any | null>(null)
+const roleUpdatingId = ref<number | null>(null)
 
 const loginPage = ref(1)
 const loginPageSize = ref(20)
@@ -52,6 +55,30 @@ const fetchUsers = async () => {
         ElMessage.error('无法获取用户列表')
     } finally {
         loading.value = false
+    }
+}
+
+const updateUserRole = async (target: any) => {
+    const nextIsAdmin = !Boolean(target.is_admin)
+    const action = nextIsAdmin ? '设为管理员' : '取消管理员权限'
+    try {
+        await ElMessageBox.confirm(
+            `确定要将“${target.username}”${action}吗？`,
+            '确认角色变更',
+            { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+        )
+        roleUpdatingId.value = target.id
+        const response = await api.patch(`/admin/users/${target.id}/role`, {
+            is_admin: nextIsAdmin,
+        })
+        Object.assign(target, response.data)
+        ElMessage.success('用户角色已更新')
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(error?.response?.data?.detail || '更新用户角色失败')
+        }
+    } finally {
+        roleUpdatingId.value = null
     }
 }
 
@@ -240,6 +267,19 @@ onMounted(() => {
                             <el-tag :type="scope.row.is_admin ? 'danger' : 'info'">
                                 {{ scope.row.is_admin ? '管理员' : '普通用户' }}
                             </el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="150">
+                        <template #default="scope">
+                            <el-button
+                                link
+                                :type="scope.row.is_admin ? 'danger' : 'primary'"
+                                :loading="roleUpdatingId === scope.row.id"
+                                :disabled="scope.row.id === props.currentUserId && Boolean(scope.row.is_admin)"
+                                @click="updateUserRole(scope.row)"
+                            >
+                                {{ scope.row.is_admin ? '取消管理员' : '设为管理员' }}
+                            </el-button>
                         </template>
                     </el-table-column>
                 </el-table>

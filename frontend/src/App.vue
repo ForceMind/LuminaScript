@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, defineAsyncComponent, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import {
   Document,
@@ -19,10 +19,15 @@ import {
   ArrowDown
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import { marked } from 'marked'
-import AdminDashboard from './components/AdminDashboard.vue'
+import DOMPurify from 'dompurify'
 
 marked.setOptions({ gfm: true, breaks: true })
+const AdminDashboard = defineAsyncComponent(
+    () => import('./components/AdminDashboard.vue')
+)
 
 const toTextValue = (value: unknown): string => {
     if (value === null || value === undefined) return ''
@@ -48,10 +53,14 @@ const renderMarkdown = (value: unknown) => {
     const text = toTextValue(value)
     if (!text) return ''
     try {
-        return marked.parse(text) as string
+        const rendered = marked.parse(text) as string
+        return DOMPurify.sanitize(rendered, {
+            USE_PROFILES: { html: true },
+            FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'option']
+        })
     } catch (e) {
         console.error("Markdown parse error:", e)
-        return text
+        return escapeHtml(text)
     }
 }
 
@@ -508,6 +517,14 @@ const handleAuth = async () => {
         ElMessage.warning('请输入用户名和密码')
         return
     }
+    if (!isLoginMode.value && authForm.value.username.trim().length < 3) {
+        ElMessage.warning('用户名至少需要 3 个字符')
+        return
+    }
+    if (!isLoginMode.value && authForm.value.password.length < 8) {
+        ElMessage.warning('注册密码至少需要 8 个字符')
+        return
+    }
     authLoading.value = true
     try {
         if (isLoginMode.value) {
@@ -668,6 +685,60 @@ const logout = () => {
     scenePromptMap.value = {}
     scenePromptLoadingMap.value = {}
     ElMessage.info('已退出登录')
+}
+
+const changePassword = async () => {
+    const getPromptValue = (result: unknown): string => {
+        if (typeof result !== 'object' || result === null || !('value' in result)) return ''
+        return String((result as { value?: unknown }).value || '')
+    }
+
+    try {
+        const currentResult = await ElMessageBox.prompt(
+            '请输入当前密码',
+            '修改密码',
+            {
+                inputType: 'password',
+                confirmButtonText: '下一步',
+                cancelButtonText: '取消',
+                inputValidator: (value: string) => !!value || '当前密码不能为空'
+            }
+        )
+        const newResult = await ElMessageBox.prompt(
+            '请输入新密码（至少 10 个字符）',
+            '修改密码',
+            {
+                inputType: 'password',
+                confirmButtonText: '下一步',
+                cancelButtonText: '取消',
+                inputValidator: (value: string) => value.length >= 10 || '新密码至少需要 10 个字符'
+            }
+        )
+        const newPassword = getPromptValue(newResult)
+        const confirmResult = await ElMessageBox.prompt(
+            '请再次输入新密码',
+            '确认新密码',
+            {
+                inputType: 'password',
+                confirmButtonText: '确认修改',
+                cancelButtonText: '取消',
+                inputValidator: (value: string) => value === newPassword || '两次输入的密码不一致'
+            }
+        )
+        const currentPassword = getPromptValue(currentResult)
+        const confirmedPassword = getPromptValue(confirmResult)
+        if (!currentPassword || !newPassword || confirmedPassword !== newPassword) return
+
+        await api.post('/users/me/password', {
+            current_password: currentPassword,
+            new_password: newPassword
+        })
+        ElMessage.success('密码已修改，请重新登录')
+        logout()
+    } catch (e: any) {
+        if (e === 'cancel' || e === 'close') return
+        ElMessage.error(e.response?.data?.detail || '密码修改失败')
+    }
 }
 
 // Start polling if token exists on load
@@ -1011,13 +1082,19 @@ const exportScript = (format: string = 'txt') => {
            const contentDisposition = response.headers['content-disposition'];
            let fileName = `script.${format}`;
            if (contentDisposition) {
-               const fileNameMatch = contentDisposition.match(/filename=(.+)/);
-               if (fileNameMatch && fileNameMatch.length === 2) fileName = fileNameMatch[1];
+               const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+               const plainMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
+               if (utf8Match?.[1]) {
+                   fileName = decodeURIComponent(utf8Match[1]);
+               } else if (plainMatch?.[1]) {
+                   fileName = plainMatch[1];
+               }
            }
            link.setAttribute('download', fileName);
            document.body.appendChild(link);
            link.click();
            document.body.removeChild(link);
+           window.URL.revokeObjectURL(url);
        })
        .catch(e => ElMessage.error('导出失败'))
 }
@@ -1213,6 +1290,9 @@ const copyText = (value: unknown) => {
                                  <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true">
                                     管理后台
                                  </el-button>
+                                 <el-button link size="small" class="!px-0 !h-auto" @click="changePassword">
+                                    修改密码
+                                 </el-button>
                              </div>
                          </div>
                          <el-button link class="text-gray-400 hover:text-red-500" @click="logout">
@@ -1266,6 +1346,9 @@ const copyText = (value: unknown) => {
                                      <span>{{ user?.username || '我的账号' }}</span>
                                       <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true; drawerOpen=false">
                                         管理后台
+                                     </el-button>
+                                     <el-button link size="small" class="!px-0 !h-auto" @click="changePassword">
+                                        修改密码
                                      </el-button>
                                  </div>
                              </div>
@@ -1620,7 +1703,12 @@ const copyText = (value: unknown) => {
         </div>
     </div>
     
-    <AdminDashboard v-if="showAdmin" :token="token" @close="showAdmin = false" />
+    <AdminDashboard
+        v-if="showAdmin"
+        :token="token"
+        :current-user-id="user.id"
+        @close="showAdmin = false"
+    />
   </div>
 </template>
 

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, JSON, Enum
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, JSON, Enum, UniqueConstraint
 from sqlalchemy.orm import relationship
 from database import Base
 import enum
@@ -8,6 +8,14 @@ class ProcessingStatus(str, enum.Enum):
     GENERATING = "generating"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class JobStatus(str, enum.Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 
 class User(Base):
     __tablename__ = "users"
@@ -70,7 +78,7 @@ class Project(Base):
     owner = relationship("User", back_populates="projects")
     
     # Stores global context like Character Bios, World View, etc.
-    global_context = Column(JSON, default={}) 
+    global_context = Column(JSON, default=dict)
     
     # Stores the next interaction step to cache specific questions
     next_step_cache = Column(JSON, nullable=True)
@@ -79,9 +87,17 @@ class Project(Base):
     global_summary = Column(Text, nullable=True)
 
     scenes = relationship("Scene", back_populates="project", cascade="all, delete-orphan")
+    generation_jobs = relationship(
+        "GenerationJob",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
 
 class Scene(Base):
     __tablename__ = "scenes"
+    __table_args__ = (
+        UniqueConstraint("project_id", "scene_index", name="uq_scenes_project_scene_index"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"))
@@ -99,3 +115,23 @@ class Scene(Base):
     status = Column(Enum(ProcessingStatus), default=ProcessingStatus.PENDING)
 
     project = relationship("Project", back_populates="scenes")
+
+
+class GenerationJob(Base):
+    __tablename__ = "generation_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), index=True)
+    kind = Column(String, index=True)
+    payload = Column(JSON, default=dict)
+    status = Column(Enum(JobStatus), default=JobStatus.QUEUED, index=True)
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=3)
+    available_at = Column(String, index=True)
+    locked_at = Column(String, nullable=True)
+    lock_token = Column(String, nullable=True, index=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(String)
+    updated_at = Column(String)
+
+    project = relationship("Project", back_populates="generation_jobs")

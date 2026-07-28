@@ -3,6 +3,15 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 const fs = require('fs');
 const app = express();
+app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+});
 
 function parseRuntimeFile(filePath) {
     try {
@@ -40,6 +49,8 @@ app.use('/api', createProxyMiddleware({
     changeOrigin: true,
     xfwd: true, // Auto-add x-forwarded-for headers so backend sees real IP
     pathRewrite: { '^/api': '' },
+    proxyTimeout: 600000,
+    timeout: 600000,
     onProxyReq: (proxyReq, req, res) => {
         // console.log('Proxy:', req.path, '->', API_URL + req.path);
     },

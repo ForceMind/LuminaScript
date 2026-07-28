@@ -1,40 +1,43 @@
 from openai import AsyncOpenAI
-import os
 import json
 import logging
 import re
-from pathlib import Path
 
 import asyncio
-from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from core.config import settings
 
 # Configure Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
 # Load Config
-API_KEY = os.getenv("LLM_API_KEY")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://maas-api.cn-huabei-1.xf-yun.com/v1")
-MODEL_ID = os.getenv("LLM_MODEL_ID", "xopglm47blth2")
+API_KEY = settings.llm_api_key
+BASE_URL = settings.llm_base_url
+MODEL_ID = settings.llm_model_id
+REQUEST_TIMEOUT_SECONDS = settings.llm_timeout_seconds
+MAX_CONCURRENT_REQUESTS = settings.llm_max_concurrency
 
 if not API_KEY:
     logger.warning("⚠️ LLM_API_KEY implies not set. LLM features will fail. Please set it in .env file.")
 else:
-    masked_key = API_KEY[:4] + "****" + API_KEY[-4:] if len(API_KEY) > 8 else "****"
-    logger.info(f"LLM 服务配置加载: Model={MODEL_ID}, BaseURL={BASE_URL}, Key={masked_key}")
+    logger.info(
+        "LLM 服务配置加载: Model=%s, BaseURL=%s, KeyConfigured=true",
+        MODEL_ID,
+        BASE_URL,
+    )
 
 client = AsyncOpenAI(
     api_key=API_KEY if API_KEY else "dummy_key", # Prevent client init failure, fail at request time
     base_url=BASE_URL,
+    timeout=REQUEST_TIMEOUT_SECONDS,
+    max_retries=0,
 )
 
 # Semantic Semaphore to limit concurrency globally (Max 20 concurrent requests)
 # We initialize it lazily or at module level if we are in an event loop, 
 # but safely we can use a bounded semaphore.
-_sem = asyncio.Semaphore(20)
+_sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 _PORN_PATTERNS = [
     r'色情', r'裸聊', r'约炮', r'性奴', r'乱伦', r'援交',

@@ -1,12 +1,15 @@
 import sqlite3
 import asyncio
+import sys
 from pathlib import Path
 from database import init_db, DATABASE_URL
-from passlib.context import CryptContext
-import os
+import models  # Register ORM tables before init_db() runs in standalone mode.
+from services.admin_provisioning import (
+    AdminProvisioningRequired,
+    ensure_admin_policy,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def resolve_db_file() -> str:
@@ -34,10 +37,7 @@ def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
     )
     return cursor.fetchone() is not None
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def upgrade_schema():
+def upgrade_legacy_schema():
     print(f"Checking database schema in {DB_FILE}...")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -132,62 +132,54 @@ def upgrade_schema():
             cursor.execute(column_sql)
     print("Checked 'ai_logs' table.")
 
-    # 4. Enforce Single Admin Policy
-    # User Requirement: "Ask if modify, restore default or set new"
-    
-    update_admin = os.environ.get("UPDATE_ADMIN", "false").lower() == "true"
-    admin_user = os.environ.get("ADMIN_USER", "admin")
-    admin_pass = os.environ.get("ADMIN_PASS", "admin123")
-    
-    # Check current admins
-    cursor.execute("SELECT id, username FROM users WHERE is_admin = 1")
-    admins = cursor.fetchall()
-    
-    if not update_admin:
-        if len(admins) > 0:
-            print(f"Skipping admin update. Current admins: {[u[1] for u in admins]}")
-            conn.commit()
-            conn.close()
-            return
-        else:
-            print("No admin detected in database. Proceeding to create initial admin...")
-
-    # Strategy:
-    # 1. If update is requested or no admin exists:
-    #    We will remove ALL other admins first to enforce "Single Admin"
-    if len(admins) > 0:
-        print(f"Enforcing single-admin policy for {admin_user}...")
-        cursor.execute("UPDATE users SET is_admin = 0 WHERE is_admin = 1")
-    
-    # Now ensure the target admin exists and has privileges
-    hashed = get_password_hash(admin_pass)
-    
-    cursor.execute("SELECT id FROM users WHERE username = ?", (admin_user,))
-    target_user = cursor.fetchone()
-    
-    if target_user:
-        print(f"Updating privileges for admin: {admin_user}")
-        cursor.execute("UPDATE users SET is_admin = 1, hashed_password = ? WHERE username = ?", (hashed, admin_user))
-    else:
-        print(f"Creating sole admin user: {admin_user}")
+    # 4. Protect scene identity against duplicate concurrent generation.
+    if table_exists(cursor, "scenes"):
         cursor.execute(
-            "INSERT INTO users (username, hashed_password, is_admin) VALUES (?, ?, ?)", 
-            (admin_user, hashed, 1)
+            """
+            SELECT project_id, scene_index, COUNT(*) AS duplicate_count
+            FROM scenes
+            GROUP BY project_id, scene_index
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
         )
-
-    # Clean up: Verify only one admin exists
-    cursor.execute("SELECT username FROM users WHERE is_admin = 1")
-    final_admins = cursor.fetchall()
-    print(f"Admin Policy Enforced. Current Admin: {[u[0] for u in final_admins]}")
+        duplicate_scene = cursor.fetchone()
+        if duplicate_scene:
+            conn.close()
+            raise RuntimeError(
+                "Duplicate scene indexes already exist for project "
+                f"{duplicate_scene[0]} scene {duplicate_scene[1]}. "
+                "Resolve the duplicates before starting the API."
+            )
+        else:
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_scenes_project_scene_index
+                ON scenes (project_id, scene_index)
+                """
+            )
+            print("Checked unique scene index.")
 
     conn.commit()
     conn.close()
-    print("Schema upgrade & Admin check complete.")
+    print("Legacy schema compatibility check complete.")
+
+
+def upgrade_schema(*, check_admin_policy: bool = True):
+    if DATABASE_URL.startswith(("sqlite+aiosqlite:///", "sqlite:///")):
+        upgrade_legacy_schema()
+
+    if check_admin_policy:
+        administrators = asyncio.run(ensure_admin_policy())
+        print(f"Current administrators: {administrators}")
+        print("Administrator policy check complete.")
 
 if __name__ == "__main__":
-    if os.path.exists(DB_FILE):
+    try:
+        from migrate import run_migrations
+
+        run_migrations()
         upgrade_schema()
-    else:
-        print("Database not found. Initializing new DB first...")
-        asyncio.run(init_db())
-        upgrade_schema()
+    except AdminProvisioningRequired as exc:
+        print(f"Administrator provisioning required: {exc}", file=sys.stderr)
+        sys.exit(3)

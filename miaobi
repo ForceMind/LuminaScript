@@ -16,8 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 GLOBAL_RUNTIME_FILE="/etc/miaobi/runtime.env"
 SYSTEMD_BACKEND_SERVICE="lumina-backend"
 SYSTEMD_FRONTEND_SERVICE="lumina-frontend"
+SYSTEMD_WORKER_SERVICE="lumina-worker"
 SYSTEMD_BACKEND_FILE="/etc/systemd/system/${SYSTEMD_BACKEND_SERVICE}.service"
 SYSTEMD_FRONTEND_FILE="/etc/systemd/system/${SYSTEMD_FRONTEND_SERVICE}.service"
+SYSTEMD_WORKER_FILE="/etc/systemd/system/${SYSTEMD_WORKER_SERVICE}.service"
 
 is_project_dir() {
     local dir="$1"
@@ -34,7 +36,9 @@ use_systemd_services() {
     if ! command -v systemctl >/dev/null 2>&1; then
         return 1
     fi
-    if [ -f "$SYSTEMD_BACKEND_FILE" ] && [ -f "$SYSTEMD_FRONTEND_FILE" ]; then
+    if [ -f "$SYSTEMD_BACKEND_FILE" ] && \
+       [ -f "$SYSTEMD_WORKER_FILE" ] && \
+       [ -f "$SYSTEMD_FRONTEND_FILE" ]; then
         return 0
     fi
     return 1
@@ -137,6 +141,7 @@ BACKEND_PORT="8000"
 FRONTEND_PORT="8600"
 BACKEND_LOG="$PROJECT_DIR/backend.log"
 FRONTEND_LOG="$PROJECT_DIR/frontend.log"
+WORKER_LOG="$PROJECT_DIR/worker.log"
 
 run_project_script() {
     local script_name="$1"
@@ -161,10 +166,15 @@ load_runtime() {
     FRONTEND_PORT="${FRONTEND_PORT:-8600}"
     BACKEND_LOG="${BACKEND_LOG:-$PROJECT_DIR/backend.log}"
     FRONTEND_LOG="${FRONTEND_LOG:-$PROJECT_DIR/frontend.log}"
+    WORKER_LOG="${WORKER_LOG:-$PROJECT_DIR/worker.log}"
 }
 
 find_backend_pids() {
     pgrep -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+}
+
+find_worker_pids() {
+    pgrep -f "$BACKEND_DIR/worker.py" 2>/dev/null || true
 }
 
 find_backend_port_pids() {
@@ -204,6 +214,27 @@ stop_backend() {
     kill $pids 2>/dev/null || true
     sleep 2
     pids="$(find_backend_pids)"
+    if [ -n "$pids" ]; then
+        kill -9 $pids 2>/dev/null || true
+    fi
+}
+
+stop_worker() {
+    if use_systemd_services; then
+        systemctl stop "$SYSTEMD_WORKER_SERVICE" 2>/dev/null || true
+        return
+    fi
+
+    local pids
+    pids="$(find_worker_pids)"
+    if [ -z "$pids" ]; then
+        echo "生成 Worker 未运行"
+        return
+    fi
+    echo "停止生成 Worker: $pids"
+    kill $pids 2>/dev/null || true
+    sleep 2
+    pids="$(find_worker_pids)"
     if [ -n "$pids" ]; then
         kill -9 $pids 2>/dev/null || true
     fi
@@ -259,13 +290,45 @@ start_backend() {
     fi
     mkdir -p "$(dirname "$BACKEND_LOG")"
     export PYTHONUNBUFFERED=1
-    nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
+    nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
     sleep 2
     if [ -n "$(find_backend_pids)" ]; then
-        echo -e "${GREEN}后端已启动: 0.0.0.0:$BACKEND_PORT${NC}"
+        echo -e "${GREEN}后端已启动: 127.0.0.1:$BACKEND_PORT${NC}"
         return 0
     fi
     echo -e "${RED}后端启动失败，请查看日志: $BACKEND_LOG${NC}"
+    return 1
+}
+
+start_worker() {
+    if use_systemd_services; then
+        systemctl start "$SYSTEMD_WORKER_SERVICE"
+        sleep 1
+        if systemctl is-active --quiet "$SYSTEMD_WORKER_SERVICE"; then
+            echo -e "${GREEN}生成 Worker 已通过 systemd 启动${NC}"
+            return 0
+        fi
+        echo -e "${RED}生成 Worker 启动失败，请检查: journalctl -u $SYSTEMD_WORKER_SERVICE${NC}"
+        return 1
+    fi
+
+    if [ ! -x "$VENV_DIR/bin/python" ] || [ ! -f "$BACKEND_DIR/worker.py" ]; then
+        echo -e "${RED}未找到生成 Worker 运行文件或 Python 环境${NC}"
+        return 1
+    fi
+    if [ -n "$(find_worker_pids)" ]; then
+        echo "生成 Worker 已运行"
+        return 0
+    fi
+    mkdir -p "$(dirname "$WORKER_LOG")"
+    export PYTHONUNBUFFERED=1
+    nohup "$VENV_DIR/bin/python" "$BACKEND_DIR/worker.py" >> "$WORKER_LOG" 2>&1 &
+    sleep 2
+    if [ -n "$(find_worker_pids)" ]; then
+        echo -e "${GREEN}生成 Worker 已启动${NC}"
+        return 0
+    fi
+    echo -e "${RED}生成 Worker 启动失败，请查看日志: $WORKER_LOG${NC}"
     return 1
 }
 
@@ -314,18 +377,25 @@ show_status() {
         else
             echo -e "${YELLOW}后端未运行(systemd):${NC} $SYSTEMD_BACKEND_SERVICE"
         fi
+        if systemctl is-active --quiet "$SYSTEMD_WORKER_SERVICE"; then
+            echo -e "${GREEN}生成 Worker 运行中(systemd):${NC} $SYSTEMD_WORKER_SERVICE"
+        else
+            echo -e "${YELLOW}生成 Worker 未运行(systemd):${NC} $SYSTEMD_WORKER_SERVICE"
+        fi
         if systemctl is-active --quiet "$SYSTEMD_FRONTEND_SERVICE"; then
             echo -e "${GREEN}前端运行中(systemd):${NC} $SYSTEMD_FRONTEND_SERVICE"
         else
             echo -e "${YELLOW}前端未运行(systemd):${NC} $SYSTEMD_FRONTEND_SERVICE"
         fi
         echo "后端日志: $BACKEND_LOG"
+        echo "Worker 日志: $WORKER_LOG"
         echo "前端日志: $FRONTEND_LOG"
         return
     fi
 
-    local backend_pids frontend_pids
+    local backend_pids worker_pids frontend_pids
     backend_pids="$(find_backend_pids)"
+    worker_pids="$(find_worker_pids)"
     frontend_pids="$(find_frontend_pids)"
     echo -e "${BLUE}项目目录:${NC} $PROJECT_DIR"
     echo -e "${BLUE}后端端口:${NC} $BACKEND_PORT"
@@ -335,12 +405,18 @@ show_status() {
     else
         echo -e "${YELLOW}后端未运行${NC}"
     fi
+    if [ -n "$worker_pids" ]; then
+        echo -e "${GREEN}生成 Worker 运行中${NC} PID: $worker_pids"
+    else
+        echo -e "${YELLOW}生成 Worker 未运行${NC}"
+    fi
     if [ -n "$frontend_pids" ]; then
         echo -e "${GREEN}前端运行中${NC} PID: $frontend_pids"
     else
         echo -e "${YELLOW}前端未运行${NC}"
     fi
     echo "后端日志: $BACKEND_LOG"
+    echo "Worker 日志: $WORKER_LOG"
     echo "前端日志: $FRONTEND_LOG"
 }
 
@@ -351,10 +427,11 @@ show_help() {
 用法:
   miaobi                打开中文运维面板
   miaobi status         查看运行状态
-  miaobi start          启动前后端服务
-  miaobi stop           停止前后端服务
-  miaobi restart        重启前后端服务
+  miaobi start          启动后端、生成 Worker 与前端服务
+  miaobi stop           停止全部服务
+  miaobi restart        重启全部服务
   miaobi logs backend   查看后端日志
+  miaobi logs worker    查看生成 Worker 日志
   miaobi logs frontend  查看前端日志
   miaobi update         执行更新脚本
   miaobi uninstall      执行卸载脚本
@@ -372,21 +449,23 @@ show_menu() {
         echo "3) 停止服务"
         echo "4) 重启服务"
         echo "5) 查看后端日志"
-        echo "6) 查看前端日志"
-        echo "7) 执行更新"
-        echo "8) 执行卸载"
-        echo "9) 退出"
-        read -r -p "请选择操作 [1-9]: " choice
+        echo "6) 查看生成 Worker 日志"
+        echo "7) 查看前端日志"
+        echo "8) 执行更新"
+        echo "9) 执行卸载"
+        echo "10) 退出"
+        read -r -p "请选择操作 [1-10]: " choice
         case "$choice" in
             1) show_status ;;
-            2) start_backend && start_frontend ;;
-            3) stop_frontend; stop_backend ;;
-            4) stop_frontend; stop_backend; start_backend && start_frontend ;;
+            2) start_backend && start_worker && start_frontend ;;
+            3) stop_frontend; stop_worker; stop_backend ;;
+            4) stop_frontend; stop_worker; stop_backend; start_backend && start_worker && start_frontend ;;
             5) exec tail -f "$BACKEND_LOG" ;;
-            6) exec tail -f "$FRONTEND_LOG" ;;
-            7) run_project_script "update.sh" ;;
-            8) run_project_script "uninstall.sh" ;;
-            9) exit 0 ;;
+            6) exec tail -f "$WORKER_LOG" ;;
+            7) exec tail -f "$FRONTEND_LOG" ;;
+            8) run_project_script "update.sh" ;;
+            9) run_project_script "uninstall.sh" ;;
+            10) exit 0 ;;
             *) echo -e "${YELLOW}无效选项，请重新输入${NC}" ;;
         esac
     done
@@ -403,23 +482,26 @@ main() {
             show_status
             ;;
         start)
-            start_backend && start_frontend
+            start_backend && start_worker && start_frontend
             ;;
         stop)
             stop_frontend
+            stop_worker
             stop_backend
             ;;
         restart)
             stop_frontend
+            stop_worker
             stop_backend
-            start_backend && start_frontend
+            start_backend && start_worker && start_frontend
             ;;
         logs)
             case "${2:-}" in
                 backend) exec tail -f "$BACKEND_LOG" ;;
+                worker) exec tail -f "$WORKER_LOG" ;;
                 frontend) exec tail -f "$FRONTEND_LOG" ;;
                 *)
-                    echo -e "${RED}请指定 logs backend 或 logs frontend${NC}"
+                    echo -e "${RED}请指定 logs backend、logs worker 或 logs frontend${NC}"
                     exit 1
                     ;;
             esac

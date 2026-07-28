@@ -19,6 +19,7 @@ BACKEND_PORT="8000"
 FRONTEND_PORT="8600"
 BACKEND_LOG="$PROJECT_DIR/backend.log"
 FRONTEND_LOG="$PROJECT_DIR/frontend.log"
+WORKER_LOG="$PROJECT_DIR/worker.log"
 
 if [ -f "$RUNTIME_FILE" ]; then
     # shellcheck disable=SC1090
@@ -32,6 +33,7 @@ BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-8600}"
 BACKEND_LOG="${BACKEND_LOG:-$PROJECT_DIR/backend.log}"
 FRONTEND_LOG="${FRONTEND_LOG:-$PROJECT_DIR/frontend.log}"
+WORKER_LOG="${WORKER_LOG:-$PROJECT_DIR/worker.log}"
 FRONTEND_SERVER_FILE="$FRONTEND_DIR/server.cjs"
 
 mkdir -p "$BACKUP_DIR"
@@ -102,6 +104,7 @@ BACKEND_PORT=$BACKEND_PORT
 FRONTEND_PORT=$FRONTEND_PORT
 BACKEND_LOG=$BACKEND_LOG
 FRONTEND_LOG=$FRONTEND_LOG
+WORKER_LOG=$WORKER_LOG
 EOF
 
     if mkdir -p "$(dirname "$GLOBAL_RUNTIME_FILE")" 2>/dev/null; then
@@ -114,6 +117,7 @@ BACKEND_PORT=$BACKEND_PORT
 FRONTEND_PORT=$FRONTEND_PORT
 BACKEND_LOG=$BACKEND_LOG
 FRONTEND_LOG=$FRONTEND_LOG
+WORKER_LOG=$WORKER_LOG
 EOF
         chmod 644 "$GLOBAL_RUNTIME_FILE" 2>/dev/null || true
     fi
@@ -139,21 +143,56 @@ sync_backend_port_from_systemd() {
     fi
 }
 
+ensure_worker_systemd_service() {
+    if ! command -v systemctl >/dev/null 2>&1 || \
+       [ ! -f "/etc/systemd/system/lumina-backend.service" ]; then
+        return
+    fi
+
+    cat > "/etc/systemd/system/lumina-worker.service" <<EOF
+[Unit]
+Description=LuminaScript Generation Worker
+After=network.target lumina-backend.service
+
+[Service]
+Type=simple
+WorkingDirectory=$BACKEND_DIR
+ExecStart=$VENV_DIR/bin/python $BACKEND_DIR/worker.py
+Restart=always
+RestartSec=3
+Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+StandardOutput=append:$WORKER_LOG
+StandardError=append:$WORKER_LOG
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 restart_services_fallback() {
     echo -e "${YELLOW}未找到 miaobi，使用兼容模式重启服务。${NC}"
 
     # Prefer systemd if services exist
     if command -v systemctl >/dev/null 2>&1 && \
        [ -f "/etc/systemd/system/lumina-backend.service" ] && \
+       [ -f "/etc/systemd/system/lumina-worker.service" ] && \
        [ -f "/etc/systemd/system/lumina-frontend.service" ]; then
         echo "检测到 systemd 服务，使用 systemctl 重启..."
         systemctl restart lumina-backend
+        systemctl restart lumina-worker
         systemctl restart lumina-frontend
         sleep 3
-        if systemctl is-active --quiet lumina-backend && systemctl is-active --quiet lumina-frontend; then
+        if systemctl is-active --quiet lumina-backend && \
+           systemctl is-active --quiet lumina-worker && \
+           systemctl is-active --quiet lumina-frontend; then
             echo -e "${GREEN}服务已通过 systemd 重启成功。${NC}"
         else
-            echo -e "${RED}systemd 重启异常，请检查: journalctl -u lumina-backend -u lumina-frontend${NC}"
+            echo -e "${RED}systemd 重启异常，请检查: journalctl -u lumina-backend -u lumina-worker -u lumina-frontend${NC}"
         fi
         return
     fi
@@ -167,8 +206,13 @@ restart_services_fallback() {
             kill -9 $bpid 2>/dev/null || true
         fi
         cd "$BACKEND_DIR"
-        nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
+        nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
         cd "$PROJECT_DIR"
+    fi
+
+    if [ -x "$VENV_DIR/bin/python" ] && [ -f "$BACKEND_DIR/worker.py" ]; then
+        pkill -f "$BACKEND_DIR/worker.py" 2>/dev/null || true
+        nohup "$VENV_DIR/bin/python" "$BACKEND_DIR/worker.py" >> "$WORKER_LOG" 2>&1 &
     fi
 
     if [ -f "$FRONTEND_SERVER_FILE" ]; then
@@ -241,6 +285,7 @@ backup_if_exists "$BACKEND_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/lumina.db"
 backup_if_exists "$PROJECT_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/backend.log"
+backup_if_exists "$PROJECT_DIR/worker.log"
 backup_if_exists "$PROJECT_DIR/frontend.log"
 backup_if_exists "$RUNTIME_FILE"
 
@@ -271,6 +316,20 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PIP" install -r "$BACKEND_DIR/requirements.txt"
+"$VENV_PYTHON" "$BACKEND_DIR/bootstrap_security.py"
+chmod 600 "$BACKEND_DIR/.env" 2>/dev/null || true
+"$VENV_PYTHON" "$BACKEND_DIR/migrate.py"
+set +e
+"$VENV_PYTHON" "$BACKEND_DIR/upgrade_admin.py"
+UPGRADE_EXIT=$?
+set -e
+if [ "$UPGRADE_EXIT" -eq 3 ]; then
+    echo -e "${YELLOW}需要设置安全的管理员账号和密码。${NC}"
+    "$VENV_PYTHON" "$BACKEND_DIR/manage_admin.py"
+elif [ "$UPGRADE_EXIT" -ne 0 ]; then
+    echo -e "${RED}数据库升级失败，请根据上方错误修复后重试。${NC}"
+    exit "$UPGRADE_EXIT"
+fi
 
 echo -e "${YELLOW}[5/6] 构建前端...${NC}"
 cd "$FRONTEND_DIR"
@@ -290,6 +349,26 @@ fi
 
 echo -e "${YELLOW}[6/6] 重启当前服务...${NC}"
 cd "$PROJECT_DIR"
+
+if command -v systemctl >/dev/null 2>&1 && \
+   [ -f "/etc/systemd/system/lumina-backend.service" ]; then
+    ensure_worker_systemd_service
+    sed -i 's/--host 0\.0\.0\.0/--host 127.0.0.1/g' /etc/systemd/system/lumina-backend.service
+    for service_name in lumina-backend lumina-worker lumina-frontend; do
+        if [ -f "/etc/systemd/system/${service_name}.service" ]; then
+            mkdir -p "/etc/systemd/system/${service_name}.service.d"
+            cat > "/etc/systemd/system/${service_name}.service.d/hardening.conf" <<EOF
+[Service]
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+EOF
+        fi
+    done
+    systemctl daemon-reload
+    systemctl enable lumina-worker
+fi
 
 sync_backend_port_from_systemd
 write_runtime_file

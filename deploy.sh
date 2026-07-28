@@ -17,6 +17,7 @@ RUNTIME_FILE="$PROJECT_DIR/.lumina_runtime"
 GLOBAL_RUNTIME_FILE="/etc/miaobi/runtime.env"
 BACKEND_LOG="$PROJECT_DIR/backend.log"
 FRONTEND_LOG="$PROJECT_DIR/frontend.log"
+WORKER_LOG="$PROJECT_DIR/worker.log"
 BACKEND_PORT_DEFAULT="8000"
 FRONTEND_PORT_DEFAULT="8600"
 
@@ -35,6 +36,7 @@ BACKEND_PORT="${BACKEND_PORT:-$BACKEND_PORT_DEFAULT}"
 FRONTEND_PORT="${FRONTEND_PORT:-$FRONTEND_PORT_DEFAULT}"
 BACKEND_LOG="${BACKEND_LOG:-$PROJECT_DIR/backend.log}"
 FRONTEND_LOG="${FRONTEND_LOG:-$PROJECT_DIR/frontend.log}"
+WORKER_LOG="${WORKER_LOG:-$PROJECT_DIR/worker.log}"
 
 PKG_MGR=""
 OS_NAME="Unknown"
@@ -43,7 +45,7 @@ OS_LIKE=""
 PYTHON_BIN=""
 UPDATE_ADMIN="false"
 ADMIN_USER="admin"
-ADMIN_PASS="admin123"
+ADMIN_PASS=""
 
 print_header() {
     echo -e "${BLUE}====== 妙笔流光 (LuminaScript) 部署助手 ======${NC}"
@@ -307,24 +309,18 @@ EOF
 
 configure_admin_policy() {
     echo -e "${YELLOW}[3.1/6] 管理员账户策略...${NC}"
-    echo "1) 保持现有管理员（推荐）"
-    echo "2) 重置为默认管理员 admin / admin123"
-    echo "3) 设置新的管理员账号和密码"
+    echo "1) 保持现有管理员（仅适用于已有数据库）"
+    echo "2) 设置或更新管理员账号和密码（新部署请选择此项）"
 
     local choice u p p2
-    read -r -p "请选择 [1/2/3，默认1]: " choice
-    choice="${choice:-1}"
+    read -r -p "请选择 [1/2，默认2]: " choice
+    choice="${choice:-2}"
 
     case "$choice" in
         1)
             UPDATE_ADMIN="false"
             ;;
         2)
-            UPDATE_ADMIN="true"
-            ADMIN_USER="admin"
-            ADMIN_PASS="admin123"
-            ;;
-        3)
             UPDATE_ADMIN="true"
             read -r -p "管理员用户名 [默认 admin]: " u
             ADMIN_USER="${u:-admin}"
@@ -333,11 +329,11 @@ configure_admin_policy() {
                 echo
                 read -r -s -p "确认密码: " p2
                 echo
-                if [ -n "$p" ] && [ "$p" = "$p2" ]; then
+                if [ "${#p}" -ge 10 ] && [ "$p" = "$p2" ]; then
                     ADMIN_PASS="$p"
                     break
                 fi
-                echo -e "${RED}两次密码不一致，请重新输入。${NC}"
+                echo -e "${RED}密码至少 10 个字符，且两次输入必须一致。${NC}"
             done
             ;;
         *)
@@ -376,57 +372,10 @@ pick_backend_port() {
 }
 
 write_frontend_server() {
-    cat > "$FRONTEND_DIR/server.cjs" <<EOF
-const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const path = require('path');
-const fs = require('fs');
-
-const app = express();
-
-function parseRuntimeFile(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return {};
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const result = {};
-    for (const lineRaw of raw.split(/\\r?\\n/)) {
-      const line = String(lineRaw || '').trim();
-      if (!line || line.startsWith('#')) continue;
-      const idx = line.indexOf('=');
-      if (idx <= 0) continue;
-      const key = line.slice(0, idx).trim();
-      const value = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
-      if (key) result[key] = value;
-    }
-    return result;
-  } catch (err) {
-    return {};
-  }
-}
-
-const runtimePath = path.resolve(__dirname, '..', '.lumina_runtime');
-const runtime = parseRuntimeFile(runtimePath);
-const BACKEND_PORT = Number(process.env.BACKEND_PORT || runtime.BACKEND_PORT || ${BACKEND_PORT});
-const FRONTEND_PORT = Number(process.env.FRONTEND_PORT || runtime.FRONTEND_PORT || ${FRONTEND_PORT});
-
-app.use('/api', createProxyMiddleware({
-  target: \`http://127.0.0.1:\${BACKEND_PORT}\`,
-  changeOrigin: true,
-  pathRewrite: { '^/api': '' },
-  xfwd: true,
-  proxyTimeout: 600000,
-  timeout: 600000
-}));
-
-app.use(express.static(path.join(__dirname, 'dist')));
-app.use((req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-});
-
-app.listen(FRONTEND_PORT, '0.0.0.0', () => {
-  console.log(\`Frontend service running at http://0.0.0.0:\${FRONTEND_PORT}\`);
-});
-EOF
+    if [ ! -f "$FRONTEND_DIR/server.cjs" ]; then
+        echo -e "${RED}缺少前端服务文件: $FRONTEND_DIR/server.cjs${NC}"
+        exit 1
+    fi
 }
 
 install_miaobi() {
@@ -447,6 +396,7 @@ BACKEND_PORT=$BACKEND_PORT
 FRONTEND_PORT=$FRONTEND_PORT
 BACKEND_LOG=$BACKEND_LOG
 FRONTEND_LOG=$FRONTEND_LOG
+WORKER_LOG=$WORKER_LOG
 EOF
 
     if mkdir -p "$(dirname "$GLOBAL_RUNTIME_FILE")" 2>/dev/null; then
@@ -459,6 +409,7 @@ BACKEND_PORT=$BACKEND_PORT
 FRONTEND_PORT=$FRONTEND_PORT
 BACKEND_LOG=$BACKEND_LOG
 FRONTEND_LOG=$FRONTEND_LOG
+WORKER_LOG=$WORKER_LOG
 EOF
         chmod 644 "$GLOBAL_RUNTIME_FILE" 2>/dev/null || true
     fi
@@ -466,16 +417,23 @@ EOF
 
 SYSTEMD_BACKEND_SERVICE="lumina-backend"
 SYSTEMD_FRONTEND_SERVICE="lumina-frontend"
+SYSTEMD_WORKER_SERVICE="lumina-worker"
 SYSTEMD_BACKEND_FILE="/etc/systemd/system/${SYSTEMD_BACKEND_SERVICE}.service"
 SYSTEMD_FRONTEND_FILE="/etc/systemd/system/${SYSTEMD_FRONTEND_SERVICE}.service"
+SYSTEMD_WORKER_FILE="/etc/systemd/system/${SYSTEMD_WORKER_SERVICE}.service"
 
 start_services() {
-    echo -e "${YELLOW}[6/6] 启动后端与前端服务...${NC}"
+    echo -e "${YELLOW}[6/6] 启动后端、生成 Worker 与前端服务...${NC}"
+
+    "$VENV_DIR/bin/python" "$BACKEND_DIR/bootstrap_security.py"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+    "$VENV_DIR/bin/python" "$BACKEND_DIR/migrate.py"
 
     UPDATE_ADMIN="$UPDATE_ADMIN" ADMIN_USER="$ADMIN_USER" ADMIN_PASS="$ADMIN_PASS" \
         "$VENV_DIR/bin/python" "$BACKEND_DIR/upgrade_admin.py"
 
     pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+    pkill -f "$BACKEND_DIR/worker.py" 2>/dev/null || true
     pick_backend_port
     write_runtime_file
     write_frontend_server
@@ -490,6 +448,7 @@ start_services() {
 setup_systemd_services() {
     # Stop old nohup processes if any
     pkill -f "$VENV_DIR/bin/uvicorn" 2>/dev/null || true
+    pkill -f "$BACKEND_DIR/worker.py" 2>/dev/null || true
     local fpid
     fpid="$(lsof -t -i:"$FRONTEND_PORT" 2>/dev/null || true)"
     [ -n "$fpid" ] && kill -9 $fpid 2>/dev/null || true
@@ -506,12 +465,40 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$BACKEND_DIR
-ExecStart=$VENV_DIR/bin/uvicorn main:app --app-dir $BACKEND_DIR --host 0.0.0.0 --port $BACKEND_PORT
+ExecStart=$VENV_DIR/bin/uvicorn main:app --app-dir $BACKEND_DIR --host 127.0.0.1 --port $BACKEND_PORT
 Restart=always
 RestartSec=3
 Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 StandardOutput=append:$BACKEND_LOG
 StandardError=append:$BACKEND_LOG
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    cat > "$SYSTEMD_WORKER_FILE" <<SVCEOF
+[Unit]
+Description=LuminaScript Generation Worker
+After=network.target $SYSTEMD_BACKEND_SERVICE.service
+
+[Service]
+Type=simple
+WorkingDirectory=$BACKEND_DIR
+ExecStart=$VENV_DIR/bin/python $BACKEND_DIR/worker.py
+Restart=always
+RestartSec=3
+Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+StandardOutput=append:$WORKER_LOG
+StandardError=append:$WORKER_LOG
 
 [Install]
 WantedBy=multi-user.target
@@ -529,6 +516,10 @@ ExecStart=$node_bin $FRONTEND_DIR/server.cjs
 Restart=always
 RestartSec=3
 Environment=NODE_ENV=production
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 StandardOutput=append:$FRONTEND_LOG
 StandardError=append:$FRONTEND_LOG
 
@@ -547,6 +538,16 @@ SVCEOF
     fi
     echo -e "${GREEN}后端服务已通过 systemd 启动 (端口 $BACKEND_PORT)${NC}"
 
+    systemctl enable "$SYSTEMD_WORKER_SERVICE"
+    systemctl restart "$SYSTEMD_WORKER_SERVICE"
+
+    sleep 2
+    if ! systemctl is-active --quiet "$SYSTEMD_WORKER_SERVICE"; then
+        echo -e "${RED}生成 Worker 启动失败，请查看: journalctl -u $SYSTEMD_WORKER_SERVICE${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}生成 Worker 已通过 systemd 启动${NC}"
+
     systemctl enable "$SYSTEMD_FRONTEND_SERVICE"
     systemctl restart "$SYSTEMD_FRONTEND_SERVICE"
 
@@ -559,11 +560,16 @@ SVCEOF
 }
 
 start_services_nohup() {
-    nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 0.0.0.0 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
+    nohup "$VENV_DIR/bin/uvicorn" main:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port "$BACKEND_PORT" >> "$BACKEND_LOG" 2>&1 &
+    nohup "$VENV_DIR/bin/python" "$BACKEND_DIR/worker.py" >> "$WORKER_LOG" 2>&1 &
 
     sleep 3
     if ! lsof -t -i:"$BACKEND_PORT" >/dev/null 2>&1; then
         echo -e "${RED}后端启动失败，请查看日志: $BACKEND_LOG${NC}"
+        exit 1
+    fi
+    if ! pgrep -f "$BACKEND_DIR/worker.py" >/dev/null 2>&1; then
+        echo -e "${RED}生成 Worker 启动失败，请查看日志: $WORKER_LOG${NC}"
         exit 1
     fi
 
@@ -602,8 +608,9 @@ print_finish() {
 
     echo -e "\n${GREEN}====== 部署完成 ======${NC}"
     echo "前端访问地址: http://$ip:$FRONTEND_PORT"
-    echo "后端 API 地址: http://$ip:$BACKEND_PORT"
+    echo "后端 API 地址（仅服务器本机）: http://127.0.0.1:$BACKEND_PORT"
     echo "后端日志: $BACKEND_LOG"
+    echo "Worker 日志: $WORKER_LOG"
     echo "前端日志: $FRONTEND_LOG"
     echo "运维命令: miaobi"
 }

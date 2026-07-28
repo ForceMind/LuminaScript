@@ -48,6 +48,21 @@ stop_services() {
     bash "$PROJECT_DIR/miaobi" stop || true
 }
 
+remove_systemd_services() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
+    fi
+
+    local service_name
+    for service_name in lumina-backend lumina-worker lumina-frontend; do
+        systemctl disable --now "$service_name" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${service_name}.service"
+        rm -rf "/etc/systemd/system/${service_name}.service.d"
+    done
+    systemctl daemon-reload
+    systemctl reset-failed 2>/dev/null || true
+}
+
 remove_miaobi_link() {
     if [ -L "/usr/local/bin/miaobi" ]; then
         local target
@@ -57,8 +72,12 @@ remove_miaobi_link() {
             echo "已移除 /usr/local/bin/miaobi"
         fi
     elif [ -f "/usr/local/bin/miaobi" ]; then
-        rm -f /usr/local/bin/miaobi
-        echo "已移除 /usr/local/bin/miaobi"
+        if cmp -s "$PROJECT_DIR/miaobi" "/usr/local/bin/miaobi"; then
+            rm -f /usr/local/bin/miaobi
+            echo "已移除 /usr/local/bin/miaobi"
+        else
+            echo -e "${YELLOW}保留不属于当前项目的 /usr/local/bin/miaobi${NC}"
+        fi
     fi
 }
 
@@ -95,6 +114,7 @@ backup_if_exists "$BACKEND_DIR/lumina.db"
 backup_if_exists "$PROJECT_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/lumina.db"
 backup_if_exists "$PROJECT_DIR/backend.log"
+backup_if_exists "$PROJECT_DIR/worker.log"
 backup_if_exists "$PROJECT_DIR/frontend.log"
 backup_if_exists "$RUNTIME_FILE"
 
@@ -102,6 +122,7 @@ echo -e "${YELLOW}[2/4] 鍋滄鏈嶅姟...${NC}"
 stop_services
 
 echo -e "${YELLOW}[3/4] 娓呯悊鍛戒护鍏ュ彛涓庤繍琛屾枃浠?..${NC}"
+remove_systemd_services
 remove_miaobi_link
 remove_global_runtime_file
 rm -f "$RUNTIME_FILE"
@@ -111,14 +132,13 @@ if confirm "鏄惁鍒犻櫎 Python 铏氭嫙鐜 (backend/venv)"; then
     echo "宸插垹闄?backend/venv"
 fi
 
-if confirm "鏄惁鍒犻櫎鍓嶇鏋勫缓浜х墿涓庝緷璧?(frontend/dist, frontend/node_modules, frontend/server.cjs)"; then
+if confirm "鏄惁鍒犻櫎鍓嶇鏋勫缓浜х墿涓庝緷璧?(frontend/dist, frontend/node_modules)"; then
     rm -rf "$FRONTEND_DIR/dist" "$FRONTEND_DIR/node_modules"
-    rm -f "$FRONTEND_DIR/server.cjs"
     echo "宸插垹闄ゅ墠绔瀯寤轰骇鐗╀笌渚濊禆"
 fi
 
-if confirm "鏄惁鍒犻櫎杩愯鏃ュ織 (backend.log, frontend.log)"; then
-    rm -f "$PROJECT_DIR/backend.log" "$PROJECT_DIR/frontend.log"
+if confirm "鏄惁鍒犻櫎杩愯鏃ュ織 (backend.log, worker.log, frontend.log)"; then
+    rm -f "$PROJECT_DIR/backend.log" "$PROJECT_DIR/worker.log" "$PROJECT_DIR/frontend.log"
     echo "宸插垹闄よ繍琛屾棩蹇?
 fi
 

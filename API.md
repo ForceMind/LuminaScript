@@ -1,6 +1,11 @@
 # 妙笔流光 API 文档
 
 ## 认证
+### 注册普通账户
+- `POST /auth/register`
+- JSON 参数：`username`、`password`
+- 新账户默认没有管理员权限
+
 ### 登录
 - `POST /token`
 - 表单参数：`username`、`password`
@@ -8,6 +13,11 @@
 
 ### 当前用户
 - `GET /users/me`
+- 需要认证
+
+### 修改当前用户密码
+- `POST /users/me/password`
+- JSON 参数：`current_password`、`new_password`
 - 需要认证
 
 ## 项目接口
@@ -30,9 +40,12 @@
 
 ### 生成分场大纲
 - `POST /projects/{project_id}/generate_scenes`
+- 返回 `job_id`；任务写入持久化队列后由独立 Worker 执行
+- 同一项目已有活动任务时返回 `409`
 
 ### 重新生成单场
 - `POST /projects/{project_id}/scenes/{scene_index}/regenerate`
+- 返回 `job_id`；重新生成任务由独立 Worker 执行
 
 ### 导出单个项目
 - `GET /projects/{project_id}/export?format=txt|md|docx`
@@ -42,6 +55,11 @@
 
 ### 用户列表
 - `GET /admin/users`
+
+### 设置用户角色
+- `PATCH /admin/users/{user_id}/role`
+- JSON 参数：`is_admin`
+- 不能取消自己的管理员权限，系统至少保留一名管理员
 
 ### 登录日志
 - `GET /admin/logs/login?page=1&page_size=20`
@@ -85,4 +103,5 @@ bash uninstall.sh
 miaobi
 miaobi status
 miaobi stop
+miaobi logs worker
 ```

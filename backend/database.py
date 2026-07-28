@@ -1,35 +1,28 @@
 # Database Connection
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
-import os
-import re
-from pathlib import Path
-from dotenv import load_dotenv
+from sqlalchemy import event
+from core.config import settings
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / ".env"
-load_dotenv(ENV_FILE)
+DATABASE_URL = settings.database_url
 
-def normalize_database_url(url: str) -> str:
-    prefix = "sqlite+aiosqlite:///"
-    if not url.startswith(prefix):
-        return url
+SQL_ECHO = settings.sql_echo
 
-    db_path = url[len(prefix):]
-    if not db_path or db_path == ":memory:":
-        return url
-
-    if db_path.startswith("/") or re.match(r"^[A-Za-z]:[/\\\\]", db_path):
-        return url
-
-    resolved_path = (BASE_DIR / db_path).resolve()
-    return f"{prefix}{resolved_path.as_posix()}"
-
-DATABASE_URL = normalize_database_url(
-    os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./lumina_v2.db")
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=SQL_ECHO,
+    pool_pre_ping=True,
 )
 
-engine = create_async_engine(DATABASE_URL, echo=True)
+if DATABASE_URL.startswith("sqlite+aiosqlite:///"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def configure_sqlite_connection(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
 
 SessionLocal = sessionmaker(
     bind=engine,

@@ -1,27 +1,22 @@
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, status
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
-from sqlalchemy.exc import OperationalError
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel 
+from pydantic import BaseModel, Field, field_validator
+from contextlib import asynccontextmanager
+import asyncio
 import json
 import math
 import re
-import zipfile
-from pathlib import Path
 
-from database import init_db, get_db
+from database import get_db, SessionLocal
 import models
 import schemas
 import auth
 from services import llm  # Import LLM Service
 import logging
 import sys
-from datetime import datetime
-from dotenv import load_dotenv
-from fastapi import Request
 from fastapi.responses import StreamingResponse
 import io
 from urllib.parse import quote
@@ -31,10 +26,20 @@ try:
 except ImportError:
     DocxDocument = None
 
-# Load environment variables from .env file if it exists
-load_dotenv()
-from database import init_db, get_db, SessionLocal
 import database # needed for SessionLocal access in some scopes if not imported directly
+from repositories.projects import (
+    claim_generation,
+    increment_tokens as increment_project_tokens,
+    mark_claimed_failed as mark_claimed_project_failed,
+    recover_interrupted,
+)
+from services.generation_state import invalidate_scene_prompt_cache
+from services.audit import log_ai_action
+from api.auth_routes import router as auth_router
+from api.admin_routes import router as admin_router
+from migrate import run_migrations
+from services.admin_provisioning import ensure_admin_policy
+from services.job_queue import CONTENT_JOB, OUTLINE_JOB, enqueue_job
 
 # Configure Logging
 logging.basicConfig(
@@ -142,7 +147,25 @@ AUTO_PREFILL_FIELDS = [
     "user_notes",
 ]
 
-
+MAX_INTERACTION_ATTEMPTS = 2
+MAX_INTERACTION_ANSWER_LENGTH = 20000
+ALLOWED_PROJECT_TYPES = {"movie", "tv", "short", "short_video"}
+ALLOWED_INTERACTION_CONTEXT_KEYS = {
+    step["key"] for step in SETUP_FLOW_STEPS
+}
+NUMERIC_INTERACTION_LIMITS = {
+    "movie_duration": (30, 300),
+    "scene_count_target": (1, 200),
+    "episode_count": (1, 100),
+    "episode_duration": (1, 180),
+    "video_duration_seconds": (15, 600),
+}
+GENERATION_TARGET_LIMITS = {
+    "movie": 200,
+    "tv": 100,
+    "short": 100,
+    "short_video": 40,
+}
 def get_relevant_setup_steps(project_type: str) -> List[Dict[str, Any]]:
     p_type = project_type or "movie"
     relevant_steps = []
@@ -330,6 +353,38 @@ def normalize_extracted_setup_value(key: str, value: Any) -> str:
         return text if len(text) >= 2 else ""
 
     return text
+
+
+def validate_interaction_answer(context_key: str, raw_answer: Any) -> str:
+    answer = str(raw_answer or "").strip()
+    if not answer:
+        raise HTTPException(status_code=422, detail="回答不能为空")
+    if len(answer) > MAX_INTERACTION_ANSWER_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"回答不能超过 {MAX_INTERACTION_ANSWER_LENGTH} 个字符",
+        )
+
+    if context_key == "project_type":
+        normalized_type = answer.lower()
+        if normalized_type not in ALLOWED_PROJECT_TYPES:
+            raise HTTPException(status_code=422, detail="不支持的项目类型")
+        return normalized_type
+
+    if context_key in NUMERIC_INTERACTION_LIMITS:
+        number_match = re.search(r"\d+", answer)
+        if not number_match:
+            raise HTTPException(status_code=422, detail="请输入有效数字")
+        number = int(number_match.group(0))
+        minimum, maximum = NUMERIC_INTERACTION_LIMITS[context_key]
+        if number < minimum or number > maximum:
+            raise HTTPException(
+                status_code=422,
+                detail=f"数值必须在 {minimum} 到 {maximum} 之间",
+            )
+        return f"{number}mins" if context_key == "episode_duration" else str(number)
+
+    return answer
 
 
 def should_auto_prefill_from_logline(project: models.Project, context: Dict[str, Any]) -> bool:
@@ -559,7 +614,11 @@ def build_context_summary(project: models.Project, context: Dict[str, Any]) -> s
     return "\n".join(lines)
 
 
-async def ensure_story_synopsis(project: models.Project, context: Dict[str, Any]) -> Dict[str, Any]:
+async def ensure_story_synopsis(
+    project: models.Project,
+    context: Dict[str, Any],
+    db: Optional[AsyncSession] = None,
+) -> Dict[str, Any]:
     enriched_context = dict(context or {})
     has_brief = bool(str(enriched_context.get("synopsis_brief", "") or "").strip())
     has_detailed = bool(str(enriched_context.get("synopsis_detailed", "") or "").strip())
@@ -573,7 +632,12 @@ async def ensure_story_synopsis(project: models.Project, context: Dict[str, Any]
             project_type=project.project_type or "movie"
         )
         if synopsis_usage:
-            project.total_tokens += int(synopsis_usage or 0)
+            if db is not None:
+                await increment_project_tokens(db, project, synopsis_usage)
+            else:
+                project.total_tokens = int(project.total_tokens or 0) + int(
+                    synopsis_usage or 0
+                )
     except Exception as exc:
         logger.warning(f"Failed to generate story synopsis for project {project.id}: {exc}")
         return enriched_context
@@ -591,550 +655,51 @@ async def ensure_story_synopsis(project: models.Project, context: Dict[str, Any]
 
     return enriched_context
 
-# Initialize App
-app = FastAPI(title="LuminaScript API", version="0.1.0")
+async def recover_interrupted_generations() -> None:
+    """Mark in-process jobs interrupted by a previous process exit as failed."""
+    async with SessionLocal() as db:
+        recovered_scenes, recovered_projects = await recover_interrupted(db)
+        if recovered_scenes or recovered_projects:
+            logger.warning(
+                "Recovered interrupted generation state: projects=%s scenes=%s",
+                recovered_projects,
+                recovered_scenes,
+            )
 
-if __name__ == "__main__":
-    import uvicorn
-    # Allow running this file directly for debugging
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
 
-import asyncio
-
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     logger.info("服务器正在启动...")
-    await init_db()
-    
-    # Run Schema Upgrade Logic directly on startup to ensure DB is current
+
     try:
-        logger.info("Running database schema upgrade check...")
-        import upgrade_admin
-        # Run in threadpool to avoid blocking event loop too much
-        # But for startup, blocking is acceptable or use run_in_executor
-        await asyncio.to_thread(upgrade_admin.upgrade_schema)
-        logger.info("Database schema upgrade check complete.")
+        logger.info("Running database migrations...")
+        await asyncio.to_thread(run_migrations)
+        logger.info("Database migrations complete.")
+
+        logger.info("Running administrator policy check...")
+        administrators = await ensure_admin_policy()
+        logger.info(
+            "Administrator policy check complete. Administrators=%s",
+            administrators,
+        )
     except Exception as e:
-        logger.error(f"Failed to run schema upgrade: {e}")
-        
+        logger.exception(f"Failed to run schema upgrade: {e}")
+        raise
+
+    await recover_interrupted_generations()
     logger.info("数据库初始化完成，服务准备就绪。")
+    yield
+
+
+# Initialize App after the startup helpers are defined.
+app = FastAPI(title="LuminaScript API", version="0.1.0", lifespan=lifespan)
+app.include_router(auth_router)
+app.include_router(admin_router)
 
 @app.get("/")
 async def root():
     logger.info("收到根路径请求")
     return {"message": "欢迎使用妙笔流光 (LuminaScript) API"}
-
-# --- Admin & Logging Helpers ---
-
-async def check_admin(current_user: models.User = Depends(auth.get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-    return current_user
-
-async def log_login(user_id: int, ip: str, status: str, user_agent_str: str = ''):
-    try:
-        from user_agents import parse
-        import json
-        ua = parse(user_agent_str)
-        device_info = f"{ua.os.family} {ua.os.version_string} / {ua.browser.family} {ua.browser.version_string}"
-        if ua.is_mobile: device_info += " (Mobile)"
-        if ua.is_tablet: device_info += " (Tablet)"
-        if ua.is_pc: device_info += " (PC)"
-    except Exception as e:
-        logger.error(f"Error parsing UA: {e}")
-        device_info = user_agent_str[:50] # Fallback
-
-    async with SessionLocal() as db:
-        log = models.LoginLog(
-             user_id=user_id, 
-             ip_address=ip, 
-             user_agent=device_info,
-             status=status, 
-             timestamp=datetime.now().isoformat()
-        )
-        db.add(log)
-        await db.commit()
-
-async def log_ai_action(
-    user_id: int,
-    project_id: Optional[int],
-    action: str,
-    prompt: str,
-    response: str,
-    tokens: int,
-    *,
-    status: str = "success",
-    step_key: Optional[str] = None,
-    error_type: Optional[str] = None,
-    error_message: Optional[str] = None,
-    attempt: int = 1,
-):
-    async with SessionLocal() as db:
-        prompt_text = "" if prompt is None else str(prompt)
-        response_text = "" if response is None else str(response)
-        log = models.AIInteractionLog(
-            user_id=user_id,
-            project_id=project_id,
-            action=action,
-            # Keep full prompt/response for audit traceability.
-            prompt=prompt_text,
-            response=response_text,
-            tokens=tokens,
-            status=(status or "success")[:50],
-            step_key=(step_key or "")[:100] or None,
-            error_type=(error_type or "")[:100] or None,
-            error_message=(error_message or "")[:5000] or None,
-            attempt=max(1, int(attempt or 1)),
-            timestamp=datetime.now().isoformat()
-        )
-        db.add(log)
-        await db.commit()
-
-# --- Admin Routes ---
-
-@app.get("/admin/users", response_model=List[schemas.UserResponse])
-async def admin_list_users(
-    db: AsyncSession = Depends(get_db), 
-    admin: models.User = Depends(check_admin)
-):
-    result = await db.execute(select(models.User))
-    return result.scalars().all()
-
-@app.get("/admin/logs/login", response_model=schemas.PaginatedLoginLogs)
-async def admin_list_login_logs(
-    page: int = 1,
-    page_size: int = 20,
-    db: AsyncSession = Depends(get_db),
-    admin: models.User = Depends(check_admin)
-):
-    # Calculate offset
-    offset = (page - 1) * page_size
-    
-    # 1. Get Total Count
-    count_query = select(func.count()).select_from(models.LoginLog)
-    total_result = await db.execute(count_query)
-    total = int(total_result.scalar() or 0)
-
-    # 2. Get Items
-    result = await db.execute(
-        select(models.LoginLog, models.User.username)
-        .join(models.User, models.LoginLog.user_id == models.User.id)
-        .order_by(models.LoginLog.timestamp.desc())
-        .offset(offset)
-        .limit(page_size)
-    )
-    
-    logs = []
-    for log, username in result:
-        logs.append(_serialize_admin_login_log(log, username or ""))
-        
-    return {"total": total, "items": logs}
-
-@app.get("/admin/logs/ai", response_model=schemas.PaginatedAILogs)
-async def admin_list_ai_logs(
-    page: int = 1,
-    page_size: int = 20,
-    user_id: Optional[int] = None,
-    action: Optional[str] = None,
-    log_status: Optional[str] = None,
-    keyword: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-    admin: models.User = Depends(check_admin)
-):
-    async def _fetch_ai_logs_page() -> Dict[str, Any]:
-        offset = (page - 1) * page_size
-        count_query = select(func.count()).select_from(models.AIInteractionLog)
-        data_query = (
-            select(models.AIInteractionLog, models.User.username)
-            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
-        )
-
-        if user_id is not None:
-            count_query = count_query.where(models.AIInteractionLog.user_id == user_id)
-            data_query = data_query.where(models.AIInteractionLog.user_id == user_id)
-
-        if action:
-            action_text = str(action).strip()
-            if action_text:
-                count_query = count_query.where(models.AIInteractionLog.action == action_text)
-                data_query = data_query.where(models.AIInteractionLog.action == action_text)
-
-        if log_status:
-            status_text = str(log_status).strip()
-            if status_text:
-                count_query = count_query.where(models.AIInteractionLog.status == status_text)
-                data_query = data_query.where(models.AIInteractionLog.status == status_text)
-
-        if keyword:
-            keyword_text = str(keyword).strip()
-            if keyword_text:
-                pattern = f"%{keyword_text}%"
-                condition = (
-                    models.AIInteractionLog.prompt.like(pattern) |
-                    models.AIInteractionLog.response.like(pattern) |
-                    models.AIInteractionLog.error_message.like(pattern) |
-                    models.AIInteractionLog.action.like(pattern)
-                )
-                count_query = count_query.where(condition)
-                data_query = data_query.where(condition)
-
-        total_result = await db.execute(count_query)
-        total = int(total_result.scalar() or 0)
-
-        result = await db.execute(
-            data_query
-            .order_by(models.AIInteractionLog.timestamp.desc(), models.AIInteractionLog.id.desc())
-            .offset(offset)
-            .limit(page_size)
-        )
-        logs = []
-        for log, username in result:
-            logs.append(_serialize_admin_ai_log(log, username or ""))
-
-        return {"total": total, "items": logs}
-
-    try:
-        return await _fetch_ai_logs_page()
-    except OperationalError as exc:
-        logger.error(f"AI 日志查询失败，尝试自动修复表结构: {exc}")
-        try:
-            import upgrade_admin
-            await asyncio.to_thread(upgrade_admin.upgrade_schema)
-            return await _fetch_ai_logs_page()
-        except Exception as retry_exc:
-            logger.error(f"AI 日志自动修复后仍失败: {retry_exc}")
-            raise HTTPException(status_code=500, detail="AI日志表结构异常，请执行更新脚本后重试。")
-
-
-@app.get("/admin/logs/ai/users")
-async def admin_list_ai_log_users(
-    db: AsyncSession = Depends(get_db),
-    admin: models.User = Depends(check_admin)
-):
-    result = await db.execute(
-        select(
-            models.User.id,
-            models.User.username,
-            func.count(models.AIInteractionLog.id).label("log_count"),
-            func.max(models.AIInteractionLog.timestamp).label("last_log_at"),
-        )
-        .join(models.AIInteractionLog, models.AIInteractionLog.user_id == models.User.id)
-        .group_by(models.User.id, models.User.username)
-        .order_by(func.count(models.AIInteractionLog.id).desc(), models.User.id.asc())
-    )
-    items = []
-    for user_id, username, log_count, last_log_at in result:
-        items.append({
-            "user_id": int(user_id),
-            "username": str(username or ""),
-            "log_count": int(log_count or 0),
-            "last_log_at": str(last_log_at or ""),
-        })
-    return {"items": items}
-
-
-@app.get("/admin/logs/ai/{log_id}", response_model=schemas.AIInteractionLogResponse)
-async def admin_get_ai_log_detail(
-    log_id: int,
-    db: AsyncSession = Depends(get_db),
-    admin: models.User = Depends(check_admin)
-):
-    async def _fetch_log_detail() -> Optional[Dict[str, Any]]:
-        result = await db.execute(
-            select(models.AIInteractionLog, models.User.username)
-            .join(models.User, models.AIInteractionLog.user_id == models.User.id)
-            .where(models.AIInteractionLog.id == log_id)
-            .limit(1)
-        )
-        row = result.first()
-        if not row:
-            return None
-        log, username = row
-        return _serialize_admin_ai_log(log, username or "")
-
-    try:
-        data = await _fetch_log_detail()
-    except OperationalError as exc:
-        logger.error(f"AI 日志详情查询失败，尝试自动修复表结构: {exc}")
-        try:
-            import upgrade_admin
-            await asyncio.to_thread(upgrade_admin.upgrade_schema)
-            data = await _fetch_log_detail()
-        except Exception as retry_exc:
-            logger.error(f"AI 日志详情自动修复后仍失败: {retry_exc}")
-            raise HTTPException(status_code=500, detail="AI日志表结构异常，请执行更新脚本后重试。")
-
-    if not data:
-        raise HTTPException(status_code=404, detail="AI日志不存在")
-    return data
-
-
-def _serialize_admin_scene(scene: models.Scene) -> Dict[str, Any]:
-    return {
-        "id": scene.id,
-        "scene_index": scene.scene_index,
-        "outline": scene.outline,
-        "content": scene.content,
-        "summary": scene.summary,
-        "status": str(scene.status),
-    }
-
-
-def _serialize_admin_project(project: models.Project, owner_lookup: Dict[int, str]) -> Dict[str, Any]:
-    return {
-        "id": project.id,
-        "owner_id": project.owner_id,
-        "owner_username": owner_lookup.get(project.owner_id, ""),
-        "title": project.title,
-        "logline": project.logline,
-        "project_type": project.project_type,
-        "genre": project.genre,
-        "status": str(project.status),
-        "total_tokens": project.total_tokens,
-        "global_context": project.global_context or {},
-        "global_summary": project.global_summary,
-        "scene_count": len(project.scenes or []),
-        "scenes": [
-            _serialize_admin_scene(scene)
-            for scene in sorted(project.scenes or [], key=lambda item: item.scene_index)
-        ],
-    }
-
-
-def _serialize_admin_login_log(log: models.LoginLog, username: str) -> Dict[str, Any]:
-    return {
-        "id": log.id,
-        "user_id": log.user_id,
-        "user_name": str(username or ""),
-        "ip_address": str(log.ip_address or ""),
-        "user_agent": str(log.user_agent or ""),
-        "location": str(log.location or ""),
-        "status": str(log.status or ""),
-        "timestamp": str(log.timestamp or ""),
-    }
-
-
-def _serialize_admin_ai_log(log: models.AIInteractionLog, username: str) -> Dict[str, Any]:
-    def _safe_text(value: Any, default: str = "") -> str:
-        if value is None:
-            return default
-        try:
-            return str(value)
-        except Exception:
-            return default
-
-    def _safe_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return default
-
-    return {
-        "id": log.id,
-        "user_id": log.user_id,
-        "user_name": _safe_text(username),
-        "project_id": log.project_id,
-        "action": _safe_text(log.action),
-        "prompt": _safe_text(log.prompt),
-        "response": _safe_text(log.response),
-        "tokens": _safe_int(log.tokens, 0),
-        "status": _safe_text(log.status, "success") or "success",
-        "step_key": _safe_text(log.step_key),
-        "error_type": _safe_text(log.error_type),
-        "error_message": _safe_text(log.error_message),
-        "attempt": _safe_int(log.attempt, 1),
-        "timestamp": _safe_text(log.timestamp),
-    }
-
-
-def _iter_export_database_paths() -> List[Path]:
-    candidates: List[Path] = []
-    sqlite_prefix = "sqlite+aiosqlite:///"
-    if database.DATABASE_URL.startswith(sqlite_prefix):
-        candidates.append(Path(database.DATABASE_URL[len(sqlite_prefix):]))
-
-    backend_dir = Path(__file__).resolve().parent
-    project_dir = backend_dir.parent
-    candidates.extend([
-        backend_dir / "lumina_v2.db",
-        backend_dir / "lumina.db",
-        project_dir / "lumina_v2.db",
-        project_dir / "lumina.db",
-    ])
-
-    unique_paths: List[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        key = candidate.as_posix()
-        if key in seen or not candidate.exists():
-            continue
-        seen.add(key)
-        unique_paths.append(candidate)
-    return unique_paths
-
-
-@app.get("/admin/export/all")
-async def admin_export_all_data(
-    db: AsyncSession = Depends(get_db),
-    admin: models.User = Depends(check_admin)
-):
-    users_result = await db.execute(select(models.User).order_by(models.User.id.asc()))
-    users = users_result.scalars().all()
-    owner_lookup = {user.id: user.username for user in users}
-
-    projects_result = await db.execute(
-        select(models.Project)
-        .options(selectinload(models.Project.scenes))
-        .order_by(models.Project.id.asc())
-    )
-    projects = projects_result.scalars().all()
-
-    login_logs_result = await db.execute(
-        select(models.LoginLog)
-        .order_by(models.LoginLog.timestamp.desc(), models.LoginLog.id.desc())
-    )
-    login_logs = login_logs_result.scalars().all()
-
-    ai_logs_result = await db.execute(
-        select(models.AIInteractionLog)
-        .order_by(models.AIInteractionLog.timestamp.desc(), models.AIInteractionLog.id.desc())
-    )
-    ai_logs = ai_logs_result.scalars().all()
-
-    export_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_name = f"luminascript_admin_export_{export_time}.zip"
-
-    manifest = {
-        "exported_at": datetime.now().isoformat(),
-        "exported_by": admin.username,
-        "counts": {
-            "users": len(users),
-            "projects": len(projects),
-            "login_logs": len(login_logs),
-            "ai_logs": len(ai_logs),
-        },
-        "database_files": [path.name for path in _iter_export_database_paths()],
-    }
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        archive.writestr(
-            "users.json",
-            json.dumps(
-                [
-                    {
-                        "id": user.id,
-                        "username": user.username,
-                        "is_admin": bool(user.is_admin),
-                    }
-                    for user in users
-                ],
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        archive.writestr(
-            "projects.json",
-            json.dumps(
-                [_serialize_admin_project(project, owner_lookup) for project in projects],
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        archive.writestr(
-            "login_logs.json",
-            json.dumps(
-                [_serialize_admin_login_log(log, owner_lookup.get(log.user_id, "")) for log in login_logs],
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        archive.writestr(
-            "ai_logs.json",
-            json.dumps(
-                [_serialize_admin_ai_log(log, owner_lookup.get(log.user_id, "")) for log in ai_logs],
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-
-        for db_path in _iter_export_database_paths():
-            archive.write(db_path, arcname=f"database/{db_path.name}")
-
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(archive_name)}"}
-    )
-
-# --- Auth Routes ---
-
-@app.post("/token", response_model=schemas.Token)
-async def login_for_access_token(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    form_data: OAuth2PasswordRequestForm = Depends(), 
-    db: AsyncSession = Depends(get_db)
-):
-    logger.info(f"收到登录请求: 用户名={form_data.username}")
-    # 1. Fetch user
-    result = await db.execute(select(models.User).where(models.User.username == form_data.username))
-    user = result.scalars().first()
-    
-    # 获取真实IP (X-Forwarded-For 优先)
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        ip = forwarded.split(",")[0].strip()
-    else:
-        ip = request.client.host
-    
-    # User Agent
-    user_agent = request.headers.get("user-agent", "")
-    
-    # 2. Verify
-    if not user:
-        logger.warning(f"登录失败: 用户 {form_data.username} 不存在")
-        # Log failed attempt (No user_id, use 0 or distinct log)
-        # For simplicity, we skip logging unknown users or we need to change model to allow nullable user_id
-    elif not auth.verify_password(form_data.password, user.hashed_password):
-        logger.warning(f"登录失败: 用户 {form_data.username} 密码错误")
-        background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="failed", user_agent_str=user_agent)
-        
-    if not user or not auth.verify_password(form_data.password, user.hashed_password):
-         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户名或密码错误",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    logger.info(f"用户 {form_data.username} 登录成功")
-    background_tasks.add_task(log_login, user_id=user.id, ip=ip, status="success", user_agent_str=user_agent)
-    
-    # 3. Create Token
-    access_token = auth.create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/auth/register", response_model=schemas.UserResponse)
-async def register(user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
-    # Check existing
-    result = await db.execute(select(models.User).where(models.User.username == user.username))
-    if result.scalars().first():
-        raise HTTPException(status_code=400, detail="Username already registered")
-    
-    # Create
-    hashed_pw = auth.get_password_hash(user.password)
-    new_user = models.User(username=user.username, hashed_password=hashed_pw)
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    return new_user
-
-@app.get("/users/me", response_model=schemas.UserResponse)
-async def read_users_me(current_user: models.User = Depends(auth.get_current_user)):
-    return current_user
 
 # --- Project Management ---
 
@@ -1259,11 +824,19 @@ async def update_project(
     return project
 
 class InteractionRequest(BaseModel):
-    answer: str
-    context_key: str
+    answer: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
+    context_key: str = Field(min_length=1, max_length=100)
+
+    @field_validator("context_key")
+    @classmethod
+    def validate_context_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized not in ALLOWED_INTERACTION_CONTEXT_KEYS:
+            raise ValueError("不支持的交互字段")
+        return normalized
 
 class ContentReviewRequest(BaseModel):
-    text: str
+    text: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
 
 @app.post("/content/review")
 async def review_content(
@@ -1304,7 +877,10 @@ async def submit_interaction(
     previous_title = project.title
     
     # Special Handling: Reset
-    answer_text = (interaction.answer or "").strip()
+    answer_text = validate_interaction_answer(
+        interaction.context_key,
+        interaction.answer,
+    )
     if interaction.context_key == 'final_confirm' and answer_text == 'reset':
         logger.info(f"项目 {project_id} 收到重置请求，清空上下文重新开始设定流程")
         project.global_context = {}
@@ -1403,7 +979,7 @@ async def analyze_logline(
             filled_fields, prefill_changed = apply_auto_prefill(project, {})
 
         if prefill_usage:
-            project.total_tokens += prefill_usage
+            await increment_project_tokens(db, project, prefill_usage)
             background_tasks.add_task(
                 log_ai_action,
                 user_id=current_user.id,
@@ -1542,7 +1118,11 @@ async def analyze_logline(
         })
     
     if next_step.get("is_confirmation"):
-        normalized_context = await ensure_story_synopsis(project, normalized_context)
+        normalized_context = await ensure_story_synopsis(
+            project,
+            normalized_context,
+            db,
+        )
         if project.project_type and project.project_type != "pending":
             normalized_context["project_type"] = project.project_type
 
@@ -1594,11 +1174,10 @@ async def analyze_logline(
     logger.info(f"正在调用 LLM 为步骤 {next_step['key']} 生成选项...")
     
     # 3.2 For other steps, use LLM to generate context-aware options
-    attempt = 0
     question_data = None
     usage = 0
-    while True:
-        attempt += 1
+    last_error: Optional[Exception] = None
+    for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
         try:
             question_data, usage = await llm.generate_interaction_options(
                 step_key=next_step["key"],
@@ -1619,6 +1198,7 @@ async def analyze_logline(
             )
             break
         except Exception as e:
+            last_error = e
             raw_content = str(getattr(e, "raw_content", "") or "")
             error_type = str(getattr(e, "error_type", type(e).__name__) or type(e).__name__)
             error_message = str(e)
@@ -1643,14 +1223,25 @@ async def analyze_logline(
                 attempt=attempt,
             )
 
-            logger.warning(
-                f"项目 {project_id} 的步骤 {next_step['key']} 第 {attempt} 次生成失败，"
-                f"{wait_seconds} 秒后自动重试。"
-            )
-            await asyncio.sleep(wait_seconds)
+            if attempt < MAX_INTERACTION_ATTEMPTS:
+                logger.warning(
+                    f"项目 {project_id} 的步骤 {next_step['key']} 第 {attempt} 次生成失败，"
+                    f"{wait_seconds} 秒后自动重试。"
+                )
+                await asyncio.sleep(wait_seconds)
+
+    if question_data is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "AI 交互选项生成失败，请稍后重试。"
+                if last_error is not None
+                else "AI 未返回有效交互选项。"
+            ),
+        )
     
     # Update Token Usage
-    project.total_tokens += usage
+    await increment_project_tokens(db, project, usage)
     
     # Construction Response
     response_payload = {
@@ -1675,28 +1266,33 @@ async def analyze_logline(
 
 @app.post("/projects/{project_id}/generate_scenes")
 async def generate_scenes(
-    project_id: int, 
-    selected_option: str = None, 
-    background_tasks: BackgroundTasks = BackgroundTasks(),
+    project_id: int,
+    selected_option: Optional[str] = Query(default=None, max_length=1000),
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
     """
     Phase 1.5: User selected an option, now generate outline.
-    Phase 2: Add background task for generation.
+    Phase 2: Persist a durable generation job for the worker.
     """
     logger.info(f"收到生成分场大纲请求，项目ID: {project_id}")
     # 1. Update project genre/style based on selected_option
     project = await db.get(models.Project, project_id)
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Project not found")
-    
-    c = await ensure_story_synopsis(project, project.global_context or {})
+
+    if not await claim_generation(db, project_id, current_user.id):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
+    await db.commit()
+    await db.refresh(project)
+
+    c = await ensure_story_synopsis(project, project.global_context or {}, db)
     project.global_context = c
 
     # Use selected_option if string generic, or fallback to stored context values
-    style_context = selected_option
-    if not style_context:
+    style_context = str(selected_option or "").strip()
+    if not style_context or style_context.lower() == "auto":
         # Construct summary from context
         style_context = f"Genre: {project.project_type}, Tone: {c.get('tone')}, Style: {c.get('visual_style')}"
 
@@ -1717,7 +1313,6 @@ async def generate_scenes(
             if isinstance(raw_count, int):
                 target_count = raw_count
             elif isinstance(raw_count, str):
-                import re
                 # Try to find first number
                 digits = re.findall(r'\d+', raw_count)
                 if digits:
@@ -1733,6 +1328,7 @@ async def generate_scenes(
                 duration_seconds = 0
         if duration_seconds <= 0:
             duration_seconds = 60
+        duration_seconds = min(duration_seconds, NUMERIC_INTERACTION_LIMITS["video_duration_seconds"][1])
         target_count = max(1, math.ceil(duration_seconds / 15))
             
     # If movie duration is set but scene count isn't, estimate
@@ -1742,13 +1338,21 @@ async def generate_scenes(
             try:
                 # 1.5 scenes per minute is a high-detail script, 0.5 is low. 1.0 is standard.
                 target_count = int(int(re.findall(r'\d+', str(duration))[0]) * 0.8)
-            except: pass
+            except (IndexError, TypeError, ValueError):
+                pass
+
+    target_limit = GENERATION_TARGET_LIMITS.get(project.project_type or "", 100)
+    if target_count > target_limit:
+        logger.warning(
+            "项目 %s 请求生成 %s 个条目，已限制为 %s",
+            project_id,
+            target_count,
+            target_limit,
+        )
+    target_count = max(1, min(int(target_count or 1), target_limit))
 
     project.genre = style_context
-    project.status = models.ProcessingStatus.GENERATING
-    # Force clearing of any old scenes from a previous attempt
-    await db.execute(delete(models.Scene).where(models.Scene.project_id == project_id))
-    await db.commit()
+    invalidate_scene_prompt_cache(project)
 
     if project.project_type == "short_video":
         style_context = (
@@ -1756,28 +1360,47 @@ async def generate_scenes(
             f" 需要生成{target_count}条15秒提示词"
         )
 
-    logger.info(f"启动后台任务生成大纲... (Style: {style_context}, Count: {target_count})")
-    
-    # 2. Trigger Background Task for Incremental Outline Generation
-    background_tasks.add_task(
-        run_incremental_outline_generation, 
-        project_id, 
-        style_context, 
+    # Force clearing of any old scenes from a previous attempt
+    try:
+        await db.execute(delete(models.Scene).where(models.Scene.project_id == project_id))
+        job = await enqueue_job(
+            db,
+            project_id=project_id,
+            kind=OUTLINE_JOB,
+            payload={
+                "style_context": style_context,
+                "target_count": target_count,
+                "user_id": current_user.id,
+            },
+        )
+        await db.commit()
+    except Exception as exc:
+        await mark_claimed_project_failed(db, project_id)
+        logger.exception("Failed to prepare project %s for generation: %s", project_id, exc)
+        raise HTTPException(status_code=500, detail="生成任务准备失败，请稍后重试")
+
+    logger.info(
+        "生成大纲任务已入队。job=%s project=%s count=%s",
+        job.id,
+        project_id,
         target_count,
-        current_user.id
     )
-    
-    return {"status": "Scene generation started", "project_id": project_id}
+
+    return {
+        "status": "Scene generation queued",
+        "project_id": project_id,
+        "job_id": job.id,
+    }
 
 # --- Background Task Implementation ---
-from sqlalchemy import delete
 
 async def run_incremental_outline_generation(project_id: int, style_context: str, target_count: int, user_id: int):
     logger.info(f"[Task] Starting Incremental Outline Gen for Project {project_id}")
     
     async with database.SessionLocal() as db:
         project = await db.get(models.Project, project_id)
-        if not project: return
+        if not project:
+            return
         
         # Determine Batch Size (User requested "safe/one-by-one", so we choose 1 to be absolutely safe and responsive)
         # Using 1 allows frontend to see each scene pop up.
@@ -1785,17 +1408,17 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
         current_idx = 1
         last_context = "Start of story."
         
-        while current_idx <= target_count:
-            # Re-check status in case user cancelled
-            await db.refresh(project)
-            if project.status == models.ProcessingStatus.FAILED:
-                logger.info("[Task] Outline Gen Cancelled.")
-                return 
+        try:
+            while current_idx <= target_count:
+                # Re-check status in case user cancelled or a restart recovered the job.
+                await db.refresh(project)
+                if project.status != models.ProcessingStatus.GENERATING:
+                    logger.info("[Task] Outline generation no longer active.")
+                    return
 
-            end_idx = min(current_idx + batch_size - 1, target_count)
-            logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
-            
-            try:
+                end_idx = min(current_idx + batch_size - 1, target_count)
+                logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
+
                 batch_scenes, usage = await llm.generate_scene_batch(
                     project.logline, 
                     style_context, 
@@ -1804,50 +1427,60 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                     previous_context=last_context,
                     total_target=target_count
                 )
-                
-                project.total_tokens += usage
-                
-                # If success, save to DB immediately
-                if batch_scenes:
-                    # Logic Fix: Enforce strictly sequential indexing based on loop counter.
-                    # Do not trust LLM returned 'index' property to avoid duplicates if LLM resets to 1.
-                    offset = 0
-                    for s_data in batch_scenes:
-                        calculated_index = current_idx + offset
-                        new_scene = models.Scene(
-                            project_id=project.id,
-                            scene_index=calculated_index, 
-                            outline=s_data.get("outline", "Unknown"),
-                            status=models.ProcessingStatus.PENDING
+
+                if len(batch_scenes or []) != batch_size:
+                    raise RuntimeError(
+                        f"Outline batch {current_idx}-{end_idx} returned "
+                        f"{len(batch_scenes or [])} items; expected {batch_size}."
+                    )
+
+                await increment_project_tokens(db, project, usage)
+
+                # Enforce strictly sequential indexing; never trust the model's index.
+                for offset, scene_data in enumerate(batch_scenes):
+                    outline = str(scene_data.get("outline", "") or "").strip()
+                    if not outline:
+                        raise RuntimeError(
+                            f"Outline batch {current_idx}-{end_idx} returned empty content."
                         )
-                        db.add(new_scene)
-                        offset += 1
-                    
-                    # Update context for next batch
-                    summaries = [s.get('outline', '') for s in batch_scenes]
-                    last_context = "; ".join(summaries) # Keep it short
-                else:
-                    # Fallback for empty/failure
-                    logger.error(f"[Task] Batch {current_idx} failed.")
                     new_scene = models.Scene(
                         project_id=project.id,
-                        scene_index=current_idx,
-                        outline="[生成失败] 请稍后尝试重写此场。",
+                        scene_index=current_idx + offset,
+                        outline=outline,
                         status=models.ProcessingStatus.PENDING
                     )
                     db.add(new_scene)
 
+                summaries = [str(item.get("outline", "") or "") for item in batch_scenes]
+                last_context = "; ".join(summaries)
                 await db.commit()
-                
-            except Exception as e:
-                logger.error(f"[Task] Critical error in outline batch: {e}")
-            
-            current_idx += batch_size
-        
+
+                current_idx += batch_size
+        except Exception as exc:
+            await db.rollback()
+            logger.exception(f"[Task] Outline generation failed: {exc}")
+            project = await db.get(models.Project, project_id)
+            if project:
+                project.status = models.ProcessingStatus.FAILED
+                await db.commit()
+            try:
+                await log_ai_action(
+                    user_id=user_id,
+                    project_id=project_id,
+                    action="generate_outline",
+                    prompt=f"target_count={target_count}; style={style_context}",
+                    response="",
+                    tokens=0,
+                    status="failed",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as log_exc:
+                logger.error(f"[Task] Failed to persist outline error log: {log_exc}")
+            return
+
         # After Outline Complete -> Trigger Content Generation
         logger.info("[Task] Outline Complete. Starting Content Gen Loop...")
-        # Since we are not in a request scope, we can't use BackgroundTasks object easily to chain.
-        # But we can just await the next function directly since we are already in an async background loop.
         await run_generation_loop(project.id)
 
 
@@ -1855,7 +1488,6 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
 async def regenerate_scene(
     project_id: int, 
     scene_index: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
@@ -1871,18 +1503,41 @@ async def regenerate_scene(
     scene = result.scalars().first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
-        
+
+    if not await claim_generation(db, project_id, current_user.id):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
+
     # Reset status
     scene.status = models.ProcessingStatus.PENDING
-    scene.content = None # Clear old content
-    if project.status == models.ProcessingStatus.COMPLETED:
-        project.status = models.ProcessingStatus.GENERATING
-        
-    await db.commit()
-    
-    # Trigger loop again
-    background_tasks.add_task(run_generation_loop, project.id)
-    return {"status": "Regeneration scheduled"}
+    scene.content = None
+    scene.summary = None
+    project.status = models.ProcessingStatus.GENERATING
+    invalidate_scene_prompt_cache(project, scene_index)
+
+    try:
+        job = await enqueue_job(
+            db,
+            project_id=project_id,
+            kind=CONTENT_JOB,
+            payload={"scene_index": scene_index},
+        )
+        await db.commit()
+    except Exception as exc:
+        await mark_claimed_project_failed(db, project_id)
+        logger.exception(
+            "Failed to enqueue scene regeneration for project %s: %s",
+            project_id,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="重新生成任务准备失败，请稍后重试")
+
+    return {
+        "status": "Regeneration queued",
+        "project_id": project_id,
+        "scene_index": scene_index,
+        "job_id": job.id,
+    }
 
 @app.post("/projects/{project_id}/scenes/{scene_index}/to_prompt")
 async def rewrite_scene_to_prompt(
@@ -1903,6 +1558,11 @@ async def rewrite_scene_to_prompt(
     scene = result.scalars().first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
+    if (
+        scene.status != models.ProcessingStatus.COMPLETED
+        or not str(scene.content or "").strip()
+    ):
+        raise HTTPException(status_code=409, detail="场次内容尚未生成完成")
 
     context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
     prompt_cache = context.get("_scene_ai_prompts")
@@ -1950,7 +1610,7 @@ async def rewrite_scene_to_prompt(
     prompt_cache[cache_key] = final_prompt
     context["_scene_ai_prompts"] = prompt_cache
     project.global_context = context
-    project.total_tokens += int(usage or 0)
+    await increment_project_tokens(db, project, usage)
     await db.commit()
 
     await log_ai_action(
@@ -1966,23 +1626,7 @@ async def rewrite_scene_to_prompt(
 
     return {"scene_index": scene_index, "prompt": final_prompt, "cached": False}
 
-# --- Export (New) ---
-import io
-# Try imports, fallback to plain text if failed
-try:
-    from docx import Document as DocxDocument
-except ImportError:
-    DocxDocument = None
-try:
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-except ImportError:
-    canvas = None
-
-from fastapi.responses import StreamingResponse
-
+# --- Export ---
 @app.get("/projects/{project_id}/export")
 async def export_project(
     project_id: int, 
@@ -2081,92 +1725,183 @@ async def export_project(
 
 # --- Background Task (The Engine) ---
 
-async def run_generation_loop(project_id: int):
+async def _run_generation_loop(project_id: int):
     """
     The Core Loop: Iterates scenes and generates content with Rolling Summary.
     """
     logger.info(f"[后台任务] 开始为项目 {project_id} 生成剧本内容...")
     
-    # Create a new session for the background task
     async with database.SessionLocal() as db:
-        # Load Project Info
         project = await db.get(models.Project, project_id)
         if not project: 
             logger.error(f"[后台任务] 项目 {project_id} 未找到，任务中止")
             return
+        if project.status != models.ProcessingStatus.GENERATING:
+            logger.info(f"[后台任务] 项目 {project_id} 当前不是生成状态，任务中止")
+            return
 
-        # Load scenes
         result = await db.execute(
             select(models.Scene)
             .where(models.Scene.project_id == project_id)
             .order_by(models.Scene.scene_index)
         )
         scenes = result.scalars().all()
-        
+        if not scenes:
+            project.status = models.ProcessingStatus.FAILED
+            await db.commit()
+            logger.error(f"[后台任务] 项目 {project_id} 没有可生成的场次")
+            return
+
         cumulative_context = ""
 
         for scene in scenes:
-            # Re-Check Status (User might have deleted/paused)
-            await db.refresh(project)
-            if project.status == models.ProcessingStatus.FAILED: # Treat as stop signal
+            try:
+                await db.refresh(project)
+            except Exception:
+                logger.info(f"[后台任务] 项目 {project_id} 已不存在，任务中止")
+                return
+
+            if project.status != models.ProcessingStatus.GENERATING:
                 logger.info("[后台任务] 检测到停止信号，任务中止")
-                break
+                return
 
+            await db.refresh(scene)
             if scene.status == models.ProcessingStatus.COMPLETED:
-                continue # Skip already generated
+                cumulative_context += (
+                    f"\n[Scene {scene.scene_index} Summary]: "
+                    f"{scene.summary or scene.outline}"
+                )
+                continue
 
-            # 1. Mark as Generating
-            logger.info(f"[后台任务] 正在生成第 {scene.scene_index} 场: {scene.outline[:30]}...")
+            scene_id = scene.id
+            scene_index = scene.scene_index
+            scene_outline = scene.outline
+            logger.info(f"[后台任务] 正在生成第 {scene_index} 场: {scene_outline[:30]}...")
             scene.status = models.ProcessingStatus.GENERATING
             await db.commit()
-            
-            # 2. Call LLM to Write Scene
-            if project.project_type == "short_video":
-                generated_content, usage = await llm.write_short_video_prompt(
-                    logline=project.logline,
-                    style_guide=project.genre,
-                    current_scene_outline=scene.outline,
-                    clip_index=scene.scene_index,
-                    previous_context=cumulative_context
-                )
-            else:
-                generated_content, usage = await llm.write_scene_content(
-                    logline=project.logline,
-                    style_guide=project.genre,
-                    current_scene_outline=scene.outline,
-                    previous_context=cumulative_context
-                )
-            
-            project.total_tokens += usage
 
-            # Log AI Action (Direct call since we are already in background)
-            await log_ai_action(
-                user_id=project.owner_id,
-                project_id=project.id,
-                action=f"write_scene_{scene.scene_index}",
-                prompt=f"Outline: {scene.outline}, PrevContextLength: {len(cumulative_context)}",
-                response=generated_content if generated_content else "Error/Empty",
-                tokens=usage
-            )
+            generated_content = ""
+            usage = 0
+            try:
+                if project.project_type == "short_video":
+                    generated_content, usage = await llm.write_short_video_prompt(
+                        logline=project.logline,
+                        style_guide=project.genre,
+                        current_scene_outline=scene_outline,
+                        clip_index=scene_index,
+                        previous_context=cumulative_context
+                    )
+                else:
+                    generated_content, usage = await llm.write_scene_content(
+                        logline=project.logline,
+                        style_guide=project.genre,
+                        current_scene_outline=scene_outline,
+                        previous_context=cumulative_context
+                    )
 
-            # 3. Update Content
-            if generated_content:
+                generated_content = str(generated_content or "").strip()
+                if not generated_content:
+                    raise RuntimeError("LLM returned empty scene content")
+
+                await increment_project_tokens(db, project, usage)
                 scene.content = generated_content
-                # Simple rolling context for now (first 200 chars to avoid token limit in basic version)
-                cumulative_context += f"\n[Scene {scene.scene_index} Summary]: {scene.outline}" 
-                logger.info(f"[后台任务] 第 {scene.scene_index} 场生成完成")
-            else:
-                scene.content = "(AI Generation Failed)"
-                logger.error(f"[后台任务] 第 {scene.scene_index} 场生成内容为空")
+                scene.summary = scene_outline
+                scene.status = models.ProcessingStatus.COMPLETED
+                cumulative_context += (
+                    f"\n[Scene {scene_index} Summary]: {scene.summary}"
+                )
+                await db.commit()
+                logger.info(f"[后台任务] 第 {scene_index} 场生成完成")
+            except Exception as exc:
+                await db.rollback()
+                project = await db.get(models.Project, project_id)
+                failed_scene = await db.get(models.Scene, scene_id)
+                if project:
+                    project.status = models.ProcessingStatus.FAILED
+                if failed_scene:
+                    failed_scene.status = models.ProcessingStatus.FAILED
+                if project and usage:
+                    await increment_project_tokens(db, project, usage)
+                await db.commit()
 
-            scene.status = models.ProcessingStatus.COMPLETED
-            await db.commit()
-        
-        # Mark Project Complete
+                logger.exception(
+                    f"[后台任务] 第 {scene_index} 场生成失败: {exc}"
+                )
+                try:
+                    await log_ai_action(
+                        user_id=project.owner_id if project else 0,
+                        project_id=project_id,
+                        action=f"write_scene_{scene_index}",
+                        prompt=(
+                            f"Outline: {scene_outline}, "
+                            f"PrevContextLength: {len(cumulative_context)}"
+                        ),
+                        response=generated_content,
+                        tokens=usage,
+                        status="failed",
+                        step_key=f"scene:{scene_index}",
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                except Exception as log_exc:
+                    logger.error(f"[后台任务] 记录生成失败日志时出错: {log_exc}")
+                return
+
+            try:
+                await log_ai_action(
+                    user_id=project.owner_id,
+                    project_id=project.id,
+                    action=f"write_scene_{scene_index}",
+                    prompt=(
+                        f"Outline: {scene_outline}, "
+                        f"PrevContextLength: {len(cumulative_context)}"
+                    ),
+                    response=generated_content,
+                    tokens=usage,
+                )
+            except Exception as log_exc:
+                logger.error(f"[后台任务] 记录生成成功日志时出错: {log_exc}")
+
         project.status = models.ProcessingStatus.COMPLETED
         await db.commit()
         logger.info(f"[后台任务] 项目 {project_id} 所有剧本生成任务完成！")
-            
-    print(f"Generation loop finished for Project {project_id}")
 
-import database # Import at end to avoid circular dependency issues in loop if needed
+
+async def run_generation_loop(project_id: int):
+    """Run the generation engine and guarantee a terminal failure state."""
+    try:
+        await _run_generation_loop(project_id)
+    except Exception as exc:
+        logger.exception(
+            "[后台任务] 项目 %s 发生未处理的生成错误: %s",
+            project_id,
+            exc,
+        )
+        try:
+            async with database.SessionLocal() as db:
+                await mark_claimed_project_failed(db, project_id)
+                await db.execute(
+                    update(models.Scene)
+                    .where(models.Scene.project_id == project_id)
+                    .where(models.Scene.status == models.ProcessingStatus.GENERATING)
+                    .values(status=models.ProcessingStatus.FAILED)
+                )
+                await db.commit()
+        except Exception as recovery_exc:
+            logger.critical(
+                "[后台任务] 项目 %s 的失败状态无法写入: %s",
+                project_id,
+                recovery_exc,
+            )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        log_level="info",
+    )
