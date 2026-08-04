@@ -294,6 +294,8 @@ backup_if_exists "$RUNTIME_FILE"
 echo -e "${YELLOW}[3/6] 拉取最新代码...${NC}"
 git fetch origin
 git pull --ff-only origin "$CURRENT_BRANCH"
+# Repair the global command before any migration can stop the update early.
+install_miaobi
 
 echo -e "${YELLOW}[4/6] 更新后端依赖...${NC}"
 PYTHON_BIN=""
@@ -382,8 +384,6 @@ if [ -f "$PROJECT_DIR/miaobi" ]; then
 else
     restart_services_fallback
 fi
-
-install_miaobi
 
 echo -e "${GREEN}更新完成。备份目录: $BACKUP_DIR${NC}"
 echo "停止服务命令: miaobi stop"

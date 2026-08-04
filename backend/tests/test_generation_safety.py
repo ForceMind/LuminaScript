@@ -13,6 +13,7 @@ import main
 import migrate
 import models
 import schemas
+import upgrade_admin
 from api.admin_routes import update_user_role
 from services import login_limiter
 
@@ -498,6 +499,58 @@ def test_fresh_database_is_created_by_alembic(tmp_path, monkeypatch):
         "alembic_version",
     }.issubset(tables)
     assert revision == migrate.HEAD_REVISION
+
+
+def test_legacy_upgrade_archives_and_resolves_duplicate_scenes(tmp_path):
+    database_path = tmp_path / "duplicate-scenes.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE scenes (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                scene_index INTEGER,
+                outline TEXT,
+                content TEXT,
+                summary TEXT,
+                status VARCHAR
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO scenes (
+                id, project_id, scene_index, outline, content, summary, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 5, 2, "较短大纲", None, "备用摘要", "PENDING"),
+                (2, 5, 2, "完整大纲", "完整正文内容", None, "COMPLETED"),
+                (3, 5, 3, "下一场", "下一场正文", "下一场摘要", "COMPLETED"),
+            ],
+        )
+        groups, archived = upgrade_admin.resolve_duplicate_scenes(connection.cursor())
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX uq_scenes_project_scene_index
+            ON scenes (project_id, scene_index)
+            """
+        )
+        connection.commit()
+
+        kept = connection.execute(
+            "SELECT id, outline, content, summary, status FROM scenes "
+            "WHERE project_id = 5 AND scene_index = 2"
+        ).fetchall()
+        archive = connection.execute(
+            "SELECT source_scene_id, kept_scene_id, summary "
+            "FROM scene_duplicate_archive"
+        ).fetchall()
+
+    assert groups == 1
+    assert archived == 1
+    assert kept == [(2, "完整大纲", "完整正文内容", "备用摘要", "COMPLETED")]
+    assert archive == [(1, 2, "备用摘要")]
 
 
 def test_modular_routers_preserve_public_api_paths():

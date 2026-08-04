@@ -1,6 +1,7 @@
 import sqlite3
 import asyncio
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from database import init_db, DATABASE_URL
 import models  # Register ORM tables before init_db() runs in standalone mode.
@@ -36,6 +37,118 @@ def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
         (table_name,),
     )
     return cursor.fetchone() is not None
+
+
+def _scene_quality(row: tuple) -> tuple[int, int, int, int, int, int]:
+    """Rank duplicate scene rows without discarding richer generated content."""
+    status = str(row[6] or "").lower()
+    status_rank = {
+        "completed": 4,
+        "generating": 3,
+        "pending": 2,
+        "failed": 1,
+    }.get(status, 0)
+    content = str(row[4] or "").strip()
+    summary = str(row[5] or "").strip()
+    outline = str(row[3] or "").strip()
+    return (
+        int(bool(content)),
+        status_rank,
+        len(content),
+        len(summary),
+        len(outline),
+        int(row[0] or 0),
+    )
+
+
+def resolve_duplicate_scenes(cursor: sqlite3.Cursor) -> tuple[int, int]:
+    """Merge duplicate scene identities and archive every removed source row."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scene_duplicate_archive (
+            archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_scene_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            scene_index INTEGER NOT NULL,
+            outline TEXT,
+            content TEXT,
+            summary TEXT,
+            status VARCHAR,
+            kept_scene_id INTEGER NOT NULL,
+            archived_at VARCHAR NOT NULL,
+            reason VARCHAR NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        SELECT project_id, scene_index, COUNT(*) AS duplicate_count
+        FROM scenes
+        GROUP BY project_id, scene_index
+        HAVING COUNT(*) > 1
+        ORDER BY project_id, scene_index
+        """
+    )
+    duplicate_groups = cursor.fetchall()
+    archived_rows = 0
+    archived_at = datetime.now(timezone.utc).isoformat()
+
+    for project_id, scene_index, _duplicate_count in duplicate_groups:
+        cursor.execute(
+            """
+            SELECT id, project_id, scene_index, outline, content, summary, status
+            FROM scenes
+            WHERE project_id = ? AND scene_index = ?
+            ORDER BY id
+            """,
+            (project_id, scene_index),
+        )
+        rows = cursor.fetchall()
+        kept = max(rows, key=_scene_quality)
+        kept_id = int(kept[0])
+
+        def best_missing_value(column_index: int):
+            current = kept[column_index]
+            if str(current or "").strip():
+                return current
+            candidates = [
+                row[column_index]
+                for row in rows
+                if str(row[column_index] or "").strip()
+            ]
+            return max(candidates, key=lambda value: len(str(value))) if candidates else current
+
+        cursor.execute(
+            """
+            UPDATE scenes
+            SET outline = ?, content = ?, summary = ?, status = ?
+            WHERE id = ?
+            """,
+            (
+                best_missing_value(3),
+                best_missing_value(4),
+                best_missing_value(5),
+                kept[6],
+                kept_id,
+            ),
+        )
+
+        for row in rows:
+            if int(row[0]) == kept_id:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO scene_duplicate_archive (
+                    source_scene_id, project_id, scene_index, outline, content,
+                    summary, status, kept_scene_id, archived_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*row, kept_id, archived_at, "duplicate project_id/scene_index"),
+            )
+            cursor.execute("DELETE FROM scenes WHERE id = ?", (row[0],))
+            archived_rows += 1
+
+    return len(duplicate_groups), archived_rows
 
 def upgrade_legacy_schema():
     print(f"Checking database schema in {DB_FILE}...")
@@ -134,31 +247,20 @@ def upgrade_legacy_schema():
 
     # 4. Protect scene identity against duplicate concurrent generation.
     if table_exists(cursor, "scenes"):
+        duplicate_groups, archived_rows = resolve_duplicate_scenes(cursor)
+        if duplicate_groups:
+            print(
+                "Resolved duplicate scene indexes: "
+                f"groups={duplicate_groups}, archived_rows={archived_rows}. "
+                "Original rows are preserved in 'scene_duplicate_archive'."
+            )
         cursor.execute(
             """
-            SELECT project_id, scene_index, COUNT(*) AS duplicate_count
-            FROM scenes
-            GROUP BY project_id, scene_index
-            HAVING COUNT(*) > 1
-            LIMIT 1
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_scenes_project_scene_index
+            ON scenes (project_id, scene_index)
             """
         )
-        duplicate_scene = cursor.fetchone()
-        if duplicate_scene:
-            conn.close()
-            raise RuntimeError(
-                "Duplicate scene indexes already exist for project "
-                f"{duplicate_scene[0]} scene {duplicate_scene[1]}. "
-                "Resolve the duplicates before starting the API."
-            )
-        else:
-            cursor.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_scenes_project_scene_index
-                ON scenes (project_id, scene_index)
-                """
-            )
-            print("Checked unique scene index.")
+        print("Checked unique scene index.")
 
     conn.commit()
     conn.close()

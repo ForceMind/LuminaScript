@@ -627,8 +627,8 @@ main() {
     configure_env_file
     configure_admin_policy
     build_frontend
-    start_services
     install_miaobi
+    start_services
     print_finish
 }
 

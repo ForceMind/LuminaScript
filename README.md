@@ -176,6 +176,11 @@ cd backend
 python migrate.py
 ```
 
+旧版本若因并发生成留下相同 `project_id + scene_index` 的重复场次，升级程序会
+保留内容最完整的一条，将其他原始记录写入 SQLite 表
+`scene_duplicate_archive`，再建立唯一索引。该过程会在迁移前自动执行，无需
+手工删除剧本内容。
+
 本地默认使用 SQLite；生产可通过 `DATABASE_URL` 配置
 `postgresql+asyncpg://...`。生成请求会先持久化到 `generation_jobs`，
 再由独立 Worker 原子领取，因此 API 重启不会丢失已入队任务。详细模块边界见
