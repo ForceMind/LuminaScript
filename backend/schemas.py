@@ -150,6 +150,34 @@ class AIConfigTestResponse(BaseModel):
     response_preview: str = ""
 
 
+class AIModelListRequest(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: Optional[str] = Field(default=None, max_length=4096)
+    profile_id: Optional[str] = Field(default=None, max_length=64)
+    timeout_seconds: int = Field(default=90, ge=10, le=600)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_model_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Base URL 必须是有效的 HTTP 或 HTTPS 地址")
+        if parsed.username or parsed.password:
+            raise ValueError("Base URL 不能包含用户名或密码")
+        return normalized
+
+    @field_validator("profile_id")
+    @classmethod
+    def normalize_profile_id(cls, value: Optional[str]) -> Optional[str]:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+
+class AIModelListResponse(BaseModel):
+    models: List[str]
+
+
 class AIProfileUpdate(AIConfigUpdate):
     name: str = Field(min_length=1, max_length=100)
     enabled: bool = True

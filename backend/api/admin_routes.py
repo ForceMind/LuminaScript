@@ -26,6 +26,7 @@ from services.llm_config import (
     LLMRuntimeConfig,
     get_llm_profile_store,
     get_runtime_llm_config,
+    list_llm_models,
     public_llm_config,
     safe_connection_error,
     save_runtime_llm_config,
@@ -317,6 +318,43 @@ async def test_ai_config(
         "message": "连接测试成功",
         "response_preview": preview,
     }
+
+
+@router.post("/ai-config/models", response_model=schemas.AIModelListResponse)
+async def get_ai_models(
+    payload: schemas.AIModelListRequest,
+    _admin: models.User = Depends(require_admin),
+):
+    submitted_key = (payload.api_key or "").strip()
+    stored_key = None
+    if payload.profile_id:
+        store = get_llm_profile_store()
+        profile = next(
+            (item for item in store.profiles if item.profile_id == payload.profile_id),
+            None,
+        )
+        stored_key = profile.api_key if profile else None
+    else:
+        stored_key = get_runtime_llm_config().api_key
+    api_key = submitted_key or stored_key
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+
+    try:
+        model_ids = await list_llm_models(
+            base_url=payload.base_url,
+            api_key=api_key,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning("AI model list request failed: %s", exc.__class__.__name__)
+        raise HTTPException(
+            status_code=502,
+            detail=f"获取模型失败：{safe_connection_error(exc, api_key)}",
+        ) from exc
+    if not model_ids:
+        raise HTTPException(status_code=502, detail="模型接口返回成功，但列表为空")
+    return {"models": model_ids}
 
 
 @router.get("/ai-profiles")

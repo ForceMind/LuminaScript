@@ -24,6 +24,8 @@ const roleUpdatingId = ref<number | null>(null)
 const aiConfigLoading = ref(false)
 const aiConfigSaving = ref(false)
 const aiConfigTesting = ref(false)
+const aiModelsLoading = ref(false)
+const aiModelOptions = ref<string[]>([])
 const aiConfigForm = reactive({
     base_url: '',
     model_id: '',
@@ -45,6 +47,8 @@ const aiRoutes = reactive<Record<string, string[]>>({})
 const activeAiProfile = ref('')
 const profileDialogVisible = ref(false)
 const profileSaving = ref(false)
+const profileModelsLoading = ref(false)
+const profileModelOptions = ref<string[]>([])
 const profileForm = reactive({
     profile_id: '',
     name: '',
@@ -118,6 +122,7 @@ const getApiErrorMessage = (error: any, fallback: string) => {
 const applyAiConfigResponse = (data: any) => {
     aiConfigForm.base_url = String(data?.base_url || '')
     aiConfigForm.model_id = String(data?.model_id || '')
+    aiModelOptions.value = aiConfigForm.model_id ? [aiConfigForm.model_id] : []
     aiConfigForm.api_key = ''
     aiConfigForm.timeout_seconds = Number(data?.timeout_seconds || 90)
     aiConfigForm.max_concurrency = Number(data?.max_concurrency || 5)
@@ -193,6 +198,39 @@ const testAiConfig = async () => {
     }
 }
 
+const fetchAvailableModels = async (target: 'main' | 'profile') => {
+    const form = target === 'main' ? aiConfigForm : profileForm
+    if (!form.base_url.trim()) {
+        ElMessage.warning('请先填写 Base URL')
+        return
+    }
+    const loadingRef = target === 'main' ? aiModelsLoading : profileModelsLoading
+    loadingRef.value = true
+    try {
+        const response = await api.post('/admin/ai-config/models', {
+            base_url: form.base_url.trim(),
+            api_key: form.api_key.trim() || null,
+            profile_id: target === 'profile' ? profileForm.profile_id.trim() : null,
+            timeout_seconds: form.timeout_seconds,
+        })
+        const models = Array.isArray(response.data?.models)
+            ? response.data.models.map((item: any) => String(item)).filter(Boolean)
+            : []
+        if (target === 'main') {
+            aiModelOptions.value = models
+            if (!aiConfigForm.model_id && models.length) aiConfigForm.model_id = models[0]
+        } else {
+            profileModelOptions.value = models
+            if (!profileForm.model_id && models.length) profileForm.model_id = models[0]
+        }
+        ElMessage.success(`已获取 ${models.length} 个模型`)
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '获取模型列表失败'))
+    } finally {
+        loadingRef.value = false
+    }
+}
+
 const clearAiApiKey = async () => {
     try {
         await ElMessageBox.confirm(
@@ -239,6 +277,7 @@ const openProfileDialog = (profile?: any) => {
     profileForm.name = String(profile?.profile_name || '')
     profileForm.base_url = String(profile?.base_url || aiConfigForm.base_url || '')
     profileForm.model_id = String(profile?.model_id || '')
+    profileModelOptions.value = profileForm.model_id ? [profileForm.model_id] : []
     profileForm.api_key = ''
     profileForm.timeout_seconds = Number(profile?.timeout_seconds || 90)
     profileForm.max_concurrency = Number(profile?.max_concurrency || 5)
@@ -778,11 +817,19 @@ onMounted(() => {
                         </el-form-item>
 
                         <el-form-item label="模型 ID" required>
-                            <el-input
-                                v-model="aiConfigForm.model_id"
-                                maxlength="256"
-                                placeholder="例如：gpt-4.1-mini"
-                            />
+                            <div class="flex gap-2 w-full">
+                                <el-select
+                                    v-model="aiConfigForm.model_id"
+                                    filterable
+                                    allow-create
+                                    default-first-option
+                                    class="flex-1"
+                                    placeholder="获取模型或直接输入模型 ID"
+                                >
+                                    <el-option v-for="model in aiModelOptions" :key="model" :label="model" :value="model" />
+                                </el-select>
+                                <el-button :loading="aiModelsLoading" @click="fetchAvailableModels('main')">获取模型</el-button>
+                            </div>
                         </el-form-item>
 
                         <el-form-item label="API Key" :required="!aiConfigMeta.api_key_configured">
@@ -1216,7 +1263,21 @@ onMounted(() => {
                 <el-form-item label="显示名称" required><el-input v-model="profileForm.name" /></el-form-item>
             </div>
             <el-form-item label="Base URL" required><el-input v-model="profileForm.base_url" /></el-form-item>
-            <el-form-item label="模型 ID" required><el-input v-model="profileForm.model_id" /></el-form-item>
+            <el-form-item label="模型 ID" required>
+                <div class="flex gap-2 w-full">
+                    <el-select
+                        v-model="profileForm.model_id"
+                        filterable
+                        allow-create
+                        default-first-option
+                        class="flex-1"
+                        placeholder="获取模型或直接输入模型 ID"
+                    >
+                        <el-option v-for="model in profileModelOptions" :key="model" :label="model" :value="model" />
+                    </el-select>
+                    <el-button :loading="profileModelsLoading" @click="fetchAvailableModels('profile')">获取模型</el-button>
+                </div>
+            </el-form-item>
             <el-form-item label="接口协议" required>
                 <el-select v-model="profileForm.api_protocol" class="!w-full">
                     <el-option label="Chat Completions（/chat/completions）" value="chat_completions" />

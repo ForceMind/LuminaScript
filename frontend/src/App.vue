@@ -754,6 +754,19 @@ const changePassword = async () => {
     }
 }
 
+const handleAccountCommand = (command: string) => {
+    drawerOpen.value = false
+    if (command === 'admin' && user.value?.is_admin) {
+        showAdmin.value = true
+        return
+    }
+    if (command === 'password') {
+        void changePassword()
+        return
+    }
+    if (command === 'logout') logout()
+}
+
 // Start polling if token exists on load
 if (token.value) {
     fetchUser()
@@ -1423,25 +1436,22 @@ const copyText = (value: unknown) => {
                 
                 <!-- Bottom: User & Logout -->
                 <div class="p-4 border-t border-gray-100 bg-gray-50/50">
-                    <div class="flex items-center justify-between px-2">
-                         <div class="flex items-center gap-2 text-sm text-gray-600">
-                             <div class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold">
-                                 <el-icon><User /></el-icon>
-                             </div>
-                             <div class="flex flex-col">
-                                 <span>{{ user?.username || '我的账号' }}</span>
-                                 <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true">
-                                    管理后台
-                                 </el-button>
-                                 <el-button link size="small" class="!px-0 !h-auto" @click="changePassword">
-                                    修改密码
-                                 </el-button>
-                             </div>
-                         </div>
-                         <el-button link class="text-gray-400 hover:text-red-500" @click="logout">
-                             <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
-                         </el-button>
-                    </div>
+                    <el-dropdown trigger="click" class="!w-full" @command="handleAccountCommand">
+                        <el-button link class="!w-full !h-auto !p-2 !justify-start text-gray-600">
+                            <span class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shrink-0">
+                                <el-icon><User /></el-icon>
+                            </span>
+                            <span class="truncate flex-1 text-left mx-2">{{ user?.username || '我的账号' }}</span>
+                            <el-icon class="shrink-0 text-gray-400"><ArrowDown /></el-icon>
+                        </el-button>
+                        <template #dropdown>
+                            <el-dropdown-menu>
+                                <el-dropdown-item v-if="user?.is_admin" command="admin" :icon="DataLine">管理后台</el-dropdown-item>
+                                <el-dropdown-item command="password" :icon="Edit">修改密码</el-dropdown-item>
+                                <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
+                            </el-dropdown-menu>
+                        </template>
+                    </el-dropdown>
                 </div>
             </aside>
 
@@ -1482,23 +1492,22 @@ const copyText = (value: unknown) => {
                     
                     <!-- Mobile Footer -->
                     <div class="p-4 border-t border-gray-100 bg-gray-50 shrink-0">
-                         <div class="flex items-center justify-between px-1">
-                             <div class="flex items-center gap-2 text-sm text-gray-600">
-                                 <el-icon><User /></el-icon>
-                                 <div class="flex flex-col">
-                                     <span>{{ user?.username || '我的账号' }}</span>
-                                      <el-button v-if="user?.is_admin" link type="primary" size="small" class="!px-0 !h-auto" @click="showAdmin = true; drawerOpen=false">
-                                        管理后台
-                                     </el-button>
-                                     <el-button link size="small" class="!px-0 !h-auto" @click="changePassword">
-                                        修改密码
-                                     </el-button>
-                                 </div>
-                             </div>
-                             <el-button link type="danger" @click="logout(); drawerOpen=false">
-                                 <el-icon class="mr-1"><SwitchButton /></el-icon> 退出
-                             </el-button>
-                        </div>
+                        <el-dropdown trigger="click" class="!w-full" @command="handleAccountCommand">
+                            <el-button link class="!w-full !h-auto !p-2 !justify-start text-gray-600">
+                                <span class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shrink-0">
+                                    <el-icon><User /></el-icon>
+                                </span>
+                                <span class="truncate flex-1 text-left mx-2">{{ user?.username || '我的账号' }}</span>
+                                <el-icon class="shrink-0 text-gray-400"><ArrowDown /></el-icon>
+                            </el-button>
+                            <template #dropdown>
+                                <el-dropdown-menu>
+                                    <el-dropdown-item v-if="user?.is_admin" command="admin" :icon="DataLine">管理后台</el-dropdown-item>
+                                    <el-dropdown-item command="password" :icon="Edit">修改密码</el-dropdown-item>
+                                    <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
+                                </el-dropdown-menu>
+                            </template>
+                        </el-dropdown>
                     </div>
                 </div>
             </el-drawer>

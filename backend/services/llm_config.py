@@ -371,6 +371,30 @@ async def test_llm_connection(config: LLMRuntimeConfig) -> str:
         await client.close()
 
 
+async def list_llm_models(
+    *,
+    base_url: str,
+    api_key: str,
+    timeout_seconds: int,
+) -> list[str]:
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
+    try:
+        page = await client.models.list()
+        model_ids: list[str] = []
+        for item in getattr(page, "data", None) or []:
+            model_id = str(getattr(item, "id", "") or "").strip()
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+        return model_ids
+    finally:
+        await client.close()
+
+
 def safe_connection_error(exc: Exception, api_key: Optional[str]) -> str:
     message = str(exc).strip() or exc.__class__.__name__
     if api_key:

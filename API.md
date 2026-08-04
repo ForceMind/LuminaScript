@@ -66,6 +66,7 @@
 - `GET /admin/ai-config`：读取当前配置（API Key 仅返回是否已配置及掩码）
 - `PUT /admin/ai-config`：更新 Base URL、模型 ID、API Key、接口协议、超时和并发数
 - `POST /admin/ai-config/test`：使用提交的配置测试连接，不保存配置
+- `POST /admin/ai-config/models`：使用提交或已保存的密钥读取上游 `/v1/models`
 - API Key 留空表示保留现有密钥；`clear_api_key=true` 表示清除密钥
 
 ### 多 AI 档案与任务路由

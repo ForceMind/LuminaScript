@@ -151,6 +151,8 @@ bash uninstall.sh
 服务，后端 API 与独立生成 Worker 会从下一次请求开始使用新配置。API Key
 不会通过管理接口返回明文。档案可分别选择 Chat Completions 或 Responses API；
 Codex 渠道提示 `/v1/chat/completions endpoint not supported` 时应选择 Responses API。
+“获取模型”会使用当前填写或已安全保存的 Key 请求上游 `/v1/models`，成功后可直接
+搜索和选择模型；不提供模型列表接口的服务仍可手动输入模型 ID。
 对于只接受 SSE 流式输出的自建服务，可启用“仅流式响应”，系统会在服务端聚合
 Chat Completions 分片或 Responses 语义事件后交给原有生成流程。
 

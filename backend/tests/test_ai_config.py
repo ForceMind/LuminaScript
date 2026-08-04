@@ -135,6 +135,74 @@ async def test_admin_can_test_candidate_config_without_saving(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_model_list_uses_stored_profile_key(monkeypatch):
+    profile = llm_config.LLMRuntimeConfig(
+        api_key="profile-secret",
+        base_url="https://models.example.com/v1",
+        model_id="model-a",
+        timeout_seconds=90,
+        max_concurrency=2,
+        profile_id="profile-a",
+    )
+    monkeypatch.setattr(
+        admin_routes,
+        "get_llm_profile_store",
+        lambda: llm_config.LLMProfileStore(
+            active_profile="profile-a",
+            profiles=[profile],
+        ),
+    )
+
+    async def fake_list_models(**kwargs):
+        assert kwargs == {
+            "base_url": "https://models.example.com/v1",
+            "api_key": "profile-secret",
+            "timeout_seconds": 60,
+        }
+        return ["gpt-5.4", "gpt-5.6-sol"]
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    response = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(
+            base_url="https://models.example.com/v1/",
+            profile_id="profile-a",
+            timeout_seconds=60,
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response == {"models": ["gpt-5.4", "gpt-5.6-sol"]}
+
+
+@pytest.mark.asyncio
+async def test_list_llm_models_deduplicates_results(monkeypatch):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["api_key"] == "secret"
+            self.models = SimpleNamespace(list=self.list_models)
+
+        async def list_models(self):
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(id="model-a"),
+                    SimpleNamespace(id="model-b"),
+                    SimpleNamespace(id="model-a"),
+                ]
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(llm_config, "AsyncOpenAI", FakeClient)
+
+    assert await llm_config.list_llm_models(
+        base_url="https://models.example.com/v1",
+        api_key="secret",
+        timeout_seconds=60,
+    ) == ["model-a", "model-b"]
+
+
+@pytest.mark.asyncio
 async def test_generation_reads_runtime_config_for_each_request(monkeypatch):
     captured = {}
 
