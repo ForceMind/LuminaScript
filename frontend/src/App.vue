@@ -1628,25 +1628,21 @@ const copyText = (value: unknown) => {
 
                 <!-- Stage 3: Dashboard/Scripts -->
                 <div v-if="currentProject && !interaction" class="w-full max-w-4xl mt-8 pb-20 animate-fade-in-up">
-                    <div class="flex items-center justify-between mb-6">
-                        <div class="flex items-center gap-4">
-                            <h2 class="text-2xl font-light text-slate-800">{{ currentProjectTitle }}</h2>
-                            <el-button size="small" circle :icon="Plus" @click="startNewProject" title="开启新创意"></el-button>
-                            <el-button size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 min-w-0">
+                        <div class="flex items-center gap-3 min-w-0 flex-1">
+                            <h2 class="text-2xl font-light text-slate-800 truncate min-w-0" :title="currentProjectTitle">
+                                {{ currentProjectTitle }}
+                            </h2>
+                            <el-button class="shrink-0" size="small" circle :icon="Plus" @click="startNewProject" title="开启新创意"></el-button>
+                            <el-button class="shrink-0" size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
                         </div>
-                        <div class="flex items-center gap-3">
-                            <div class="hidden md:flex items-center gap-1 text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded-full">
+                        <div class="flex items-center gap-3 shrink-0 max-w-full">
+                            <div class="hidden md:flex items-center gap-1 text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded-full whitespace-nowrap">
                                 <el-icon><Coin /></el-icon>
                                 <span>消耗 Tokens: {{ currentProject.total_tokens || 0 }}</span>
                             </div>
-                            <!-- Format Genre Label -->
-                             <el-tag v-if="currentProject.genre" effect="dark" round>
-                                {{ 
-                                    currentProject.genre === 'movie' ? '电影剧本' : 
-                                    currentProject.genre === 'short_drama' ? '现代短剧' :
-                                    currentProject.genre.startsWith('style_') ? currentProject.genre.replace('style_', '') : 
-                                    currentProject.genre 
-                                }}
+                            <el-tag v-if="currentProjectTypeDisplay" effect="dark" round class="shrink-0 whitespace-nowrap">
+                                {{ currentProjectTypeDisplay }}
                             </el-tag>
                         </div>
                     </div>
