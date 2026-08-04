@@ -30,5 +30,6 @@ frontend/dist/
 # Backend
 backend/venv/
 backend/__pycache__/
+__pycache__/
 backend/*.pyc
 node_modules/
