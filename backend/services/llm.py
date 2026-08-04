@@ -284,6 +284,48 @@ def _estimate_token_usage(messages, content: str) -> int:
     except Exception:
         return max(1, len(str(content or "")) // 4)
 
+
+def _stream_delta_text(chunk) -> str:
+    parts: list[str] = []
+    for choice in getattr(chunk, "choices", None) or []:
+        delta = getattr(choice, "delta", None)
+        value = getattr(delta, "content", None)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+                elif getattr(item, "text", None):
+                    parts.append(str(item.text))
+    return "".join(parts)
+
+
+async def _create_completion(
+    runtime_client,
+    runtime_config: LLMRuntimeConfig,
+    messages,
+    temperature: float,
+) -> tuple[str, int]:
+    response = await runtime_client.chat.completions.create(
+        model=runtime_config.model_id,
+        messages=messages,
+        temperature=temperature,
+        stream=runtime_config.stream_response,
+    )
+    if not runtime_config.stream_response:
+        content = str(response.choices[0].message.content or "")
+        usage_obj = getattr(response, "usage", None)
+        return content, int(getattr(usage_obj, "total_tokens", 0) or 0)
+
+    content_parts: list[str] = []
+    usage = 0
+    async for chunk in response:
+        content_parts.append(_stream_delta_text(chunk))
+        usage_obj = getattr(chunk, "usage", None)
+        usage = max(usage, int(getattr(usage_obj, "total_tokens", 0) or 0))
+    return "".join(content_parts), usage
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -307,14 +349,12 @@ async def raw_generation(messages, temperature=0.7, json_response=False, task_ty
                     task_type,
                     len(messages),
                 )
-                response = await runtime_client.chat.completions.create(
-                    model=runtime_config.model_id,
-                    messages=messages,
-                    temperature=temperature
+                content, usage = await _create_completion(
+                    runtime_client,
+                    runtime_config,
+                    messages,
+                    temperature,
                 )
-                content = response.choices[0].message.content
-                usage_obj = getattr(response, "usage", None)
-                usage = int(getattr(usage_obj, "total_tokens", 0) or 0)
                 if usage <= 0:
                     usage = _estimate_token_usage(messages, content)
                     logger.info(f"LLM调用: 成功完成 (上游未返回Token，使用估算值: {usage})")

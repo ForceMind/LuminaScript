@@ -30,6 +30,7 @@ const aiConfigForm = reactive({
     api_key: '',
     timeout_seconds: 90,
     max_concurrency: 5,
+    stream_response: false,
 })
 const aiConfigMeta = reactive({
     api_key_configured: false,
@@ -51,6 +52,7 @@ const profileForm = reactive({
     api_key: '',
     timeout_seconds: 90,
     max_concurrency: 5,
+    stream_response: false,
     enabled: true,
     priority: 100,
 })
@@ -117,6 +119,7 @@ const applyAiConfigResponse = (data: any) => {
     aiConfigForm.api_key = ''
     aiConfigForm.timeout_seconds = Number(data?.timeout_seconds || 90)
     aiConfigForm.max_concurrency = Number(data?.max_concurrency || 5)
+    aiConfigForm.stream_response = Boolean(data?.stream_response)
     aiConfigMeta.api_key_configured = Boolean(data?.api_key_configured)
     aiConfigMeta.api_key_masked = String(data?.api_key_masked || '')
     aiConfigMeta.source = String(data?.source || 'environment')
@@ -155,6 +158,7 @@ const buildAiConfigPayload = (clearApiKey = false) => ({
     clear_api_key: clearApiKey,
     timeout_seconds: aiConfigForm.timeout_seconds,
     max_concurrency: aiConfigForm.max_concurrency,
+    stream_response: aiConfigForm.stream_response,
 })
 
 const saveAiConfig = async () => {
@@ -234,6 +238,7 @@ const openProfileDialog = (profile?: any) => {
     profileForm.api_key = ''
     profileForm.timeout_seconds = Number(profile?.timeout_seconds || 90)
     profileForm.max_concurrency = Number(profile?.max_concurrency || 5)
+    profileForm.stream_response = Boolean(profile?.stream_response)
     profileForm.enabled = profile?.enabled !== false
     profileForm.priority = Number(profile?.priority ?? 100)
     profileDialogVisible.value = true
@@ -254,6 +259,7 @@ const saveAiProfile = async () => {
             clear_api_key: false,
             timeout_seconds: profileForm.timeout_seconds,
             max_concurrency: profileForm.max_concurrency,
+            stream_response: profileForm.stream_response,
             enabled: profileForm.enabled,
             priority: profileForm.priority,
         })
@@ -786,7 +792,7 @@ onMounted(() => {
                             </div>
                         </el-form-item>
 
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-5">
                             <el-form-item label="请求超时（秒）">
                                 <el-input-number
                                     v-model="aiConfigForm.timeout_seconds"
@@ -803,6 +809,9 @@ onMounted(() => {
                                     :max="20"
                                     class="!w-full"
                                 />
+                            </el-form-item>
+                            <el-form-item label="仅流式响应">
+                                <el-switch v-model="aiConfigForm.stream_response" />
                             </el-form-item>
                         </div>
 
@@ -842,6 +851,9 @@ onMounted(() => {
                             </template>
                         </el-table-column>
                         <el-table-column prop="priority" label="优先级" width="85" />
+                        <el-table-column label="响应" width="85">
+                            <template #default="scope">{{ scope.row.stream_response ? '流式' : '普通' }}</template>
+                        </el-table-column>
                         <el-table-column label="状态" width="80">
                             <template #default="scope">{{ scope.row.enabled ? '启用' : '停用' }}</template>
                         </el-table-column>
@@ -1192,7 +1204,10 @@ onMounted(() => {
                 <el-form-item label="最大并发"><el-input-number v-model="profileForm.max_concurrency" :min="1" :max="20" class="!w-full" /></el-form-item>
                 <el-form-item label="优先级"><el-input-number v-model="profileForm.priority" :min="0" :max="10000" class="!w-full" /></el-form-item>
             </div>
-            <el-form-item label="启用"><el-switch v-model="profileForm.enabled" /></el-form-item>
+            <div class="flex gap-8">
+                <el-form-item label="启用"><el-switch v-model="profileForm.enabled" /></el-form-item>
+                <el-form-item label="仅流式响应"><el-switch v-model="profileForm.stream_response" /></el-form-item>
+            </div>
         </el-form>
         <template #footer>
             <el-button @click="profileDialogVisible = false">取消</el-button>

@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     llm_model_id: str = "xopglm47blth2"
     llm_timeout_seconds: int = Field(default=90, ge=10, le=600)
     llm_max_concurrency: int = Field(default=5, ge=1, le=20)
+    llm_stream_response: bool = False
 
     login_attempt_window_seconds: int = Field(default=300, ge=60, le=86400)
     login_attempt_max: int = Field(default=10, ge=3, le=100)

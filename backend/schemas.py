@@ -103,6 +103,7 @@ class AIConfigUpdate(BaseModel):
     clear_api_key: bool = False
     timeout_seconds: int = Field(default=90, ge=10, le=600)
     max_concurrency: int = Field(default=5, ge=1, le=20)
+    stream_response: bool = False
 
     @field_validator("base_url")
     @classmethod
@@ -129,6 +130,7 @@ class AIConfigResponse(BaseModel):
     model_id: str
     timeout_seconds: int
     max_concurrency: int
+    stream_response: bool = False
     api_key_configured: bool
     api_key_masked: str = ""
     source: str

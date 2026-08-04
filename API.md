@@ -73,6 +73,7 @@
 - `PUT /admin/ai-profiles/{profile_id}`：新增或更新档案
 - `DELETE /admin/ai-profiles/{profile_id}`：删除档案（至少保留一个）
 - `PUT /admin/ai-routing`：设置默认档案及各任务的候选档案顺序
+- AI 配置中的 `stream_response=true` 表示上游仅接受流式响应；服务端会聚合 SSE 分片
 
 ### 运维、备份和配额
 - `GET /admin/ops/jobs`：最近 200 个生成任务

@@ -24,6 +24,7 @@ class LLMRuntimeConfig(BaseModel):
     model_id: str = Field(min_length=1, max_length=256)
     timeout_seconds: int = Field(ge=10, le=600)
     max_concurrency: int = Field(ge=1, le=20)
+    stream_response: bool = False
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
     source: str = "environment"
@@ -59,6 +60,7 @@ def _environment_config() -> LLMRuntimeConfig:
         model_id=settings.llm_model_id,
         timeout_seconds=settings.llm_timeout_seconds,
         max_concurrency=settings.llm_max_concurrency,
+        stream_response=settings.llm_stream_response,
         source="environment",
         profile_id="environment",
         profile_name="服务器环境变量",
@@ -229,6 +231,7 @@ def public_llm_config(config: LLMRuntimeConfig) -> dict[str, Any]:
         "model_id": config.model_id,
         "timeout_seconds": config.timeout_seconds,
         "max_concurrency": config.max_concurrency,
+        "stream_response": config.stream_response,
         "api_key_configured": bool(key),
         "api_key_masked": masked_key,
         "source": config.source,
@@ -256,8 +259,19 @@ async def test_llm_connection(config: LLMRuntimeConfig) -> str:
             model=config.model_id,
             messages=[{"role": "user", "content": "Reply with OK."}],
             temperature=0,
+            stream=config.stream_response,
         )
-        content = str(response.choices[0].message.content or "").strip()
+        if config.stream_response:
+            parts: list[str] = []
+            async for chunk in response:
+                for choice in getattr(chunk, "choices", None) or []:
+                    delta = getattr(choice, "delta", None)
+                    value = getattr(delta, "content", None)
+                    if value:
+                        parts.append(str(value))
+            content = "".join(parts).strip()
+        else:
+            content = str(response.choices[0].message.content or "").strip()
         return content[:100]
     finally:
         await client.close()
