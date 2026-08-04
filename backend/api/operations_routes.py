@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -23,8 +24,10 @@ from services.backups import (
     save_backup_settings,
 )
 from services.job_queue import enqueue_job
+from services.generation_state import clear_generation_error
 from services.project_access import project_role, require_project_access
 from services.prompt_templates import ALLOWED_TEMPLATE_STAGES
+from services.system_logs import read_system_log
 from services.usage import enforce_user_quota, get_user_usage
 from services.versions import (
     create_project_version,
@@ -215,6 +218,21 @@ async def list_all_jobs(
     return {"items": [serialize_job(job, project) for job, project in rows]}
 
 
+@admin_router.get("/system-logs")
+async def get_system_logs(
+    source: Literal["backend", "worker", "frontend"] = "worker",
+    lines: int = Query(default=300, ge=20, le=2_000),
+    keyword: str = Query(default="", max_length=200),
+    _admin: models.User = Depends(require_admin),
+):
+    return await asyncio.to_thread(
+        read_system_log,
+        source,
+        lines=lines,
+        keyword=keyword,
+    )
+
+
 @admin_router.post("/jobs/{job_id}/cancel")
 async def admin_cancel_job(
     job_id: int,
@@ -269,6 +287,7 @@ async def admin_retry_job(
             .values(status=models.ProcessingStatus.PENDING, content=None, summary=None)
         )
     project.status = models.ProcessingStatus.GENERATING
+    clear_generation_error(project)
     new_job = await enqueue_job(
         db,
         project_id=project.id,
@@ -335,6 +354,7 @@ async def retry_job(
             .values(status=models.ProcessingStatus.PENDING, content=None, summary=None)
         )
     project.status = models.ProcessingStatus.GENERATING
+    clear_generation_error(project)
     new_job = await enqueue_job(
         db,
         project_id=project.id,

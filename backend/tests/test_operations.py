@@ -3,13 +3,20 @@ import io
 import zipfile
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
 
 import database
+import main
 import models
 from api.operations_routes import cancel_job, retry_job
 from services import backups
+from services import system_logs
+from services.project_archives import (
+    create_imported_project,
+    encode_project_archive,
+    parse_project_archive,
+)
 from services.project_access import require_project_access
 from services.prompt_templates import get_prompt_addendum
 from services.usage import enforce_user_quota, get_user_usage
@@ -227,3 +234,91 @@ async def test_encrypted_backup_download_payload_and_safe_copy_restore(tmp_path,
         projects = (await session.scalars(select(models.Project).order_by(models.Project.id))).all()
         assert len(projects) == 2
         assert projects[-1].title.endswith("（恢复副本）")
+
+
+def test_system_log_tail_filter_and_secret_redaction(tmp_path, monkeypatch):
+    worker_log = tmp_path / "worker.log"
+    worker_log.write_text(
+        "\n".join(
+            [f"normal line {index}" for index in range(25)]
+            + ["generation failed api_key=sk-secretvalue123 project 5"]
+        ),
+        encoding="utf-8",
+    )
+    runtime_file = tmp_path / ".lumina_runtime"
+    runtime_file.write_text(f"WORKER_LOG={worker_log}\n", encoding="utf-8")
+    monkeypatch.setattr(system_logs, "RUNTIME_FILES", (runtime_file,))
+
+    result = system_logs.read_system_log("worker", lines=20, keyword="project 5")
+
+    assert result["available"] is True
+    assert result["line_count"] == 1
+    assert "project 5" in result["content"]
+    assert "sk-secretvalue123" not in result["content"]
+    assert "api_key=***" in result["content"]
+
+
+def test_project_json_archive_round_trip_creates_safe_copy():
+    project = models.Project(
+        id=12,
+        owner_id=1,
+        title="原项目",
+        logline="一名调查员寻找真相",
+        project_type="movie",
+        genre="悬疑",
+        global_context={"ending": "真相揭晓"},
+        global_summary="完整故事",
+        status=models.ProcessingStatus.COMPLETED,
+    )
+    project.scenes.append(
+        models.Scene(
+            scene_index=1,
+            outline="发现线索",
+            content="调查员打开旧箱子。",
+            summary="找到关键照片",
+            status=models.ProcessingStatus.COMPLETED,
+        )
+    )
+
+    raw = encode_project_archive(project, exported_at="2026-08-04T00:00:00+00:00")
+    archive = parse_project_archive(raw)
+    imported = create_imported_project(archive, owner_id=99)
+
+    assert imported.owner_id == 99
+    assert imported.title == "原项目（导入副本）"
+    assert imported.total_tokens == 0
+    assert imported.status == models.ProcessingStatus.COMPLETED
+    assert len(imported.scenes) == 1
+    assert imported.scenes[0].content == "调查员打开旧箱子。"
+
+
+@pytest.mark.asyncio
+async def test_project_import_endpoint_persists_archive_as_new_owner_copy():
+    source = models.Project(
+        title="可导入项目",
+        logline="一个完整的故事",
+        project_type="short",
+        status=models.ProcessingStatus.COMPLETED,
+    )
+    source.scenes.append(
+        models.Scene(
+            scene_index=1,
+            outline="开场",
+            content="画面亮起。",
+            status=models.ProcessingStatus.COMPLETED,
+        )
+    )
+    raw = encode_project_archive(source, exported_at="2026-08-04T00:00:00+00:00")
+
+    async with database.SessionLocal() as session:
+        owner = models.User(id=20, username="importer", hashed_password="unused")
+        session.add(owner)
+        await session.commit()
+        upload = UploadFile(filename="project.json", file=io.BytesIO(raw))
+
+        imported = await main.import_project(upload, db=session, current_user=owner)
+
+        assert imported.owner_id == owner.id
+        assert imported.title == "可导入项目（导入副本）"
+        assert len(imported.scenes) == 1
+        assert imported.scenes[0].content == "画面亮起。"

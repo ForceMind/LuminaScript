@@ -31,6 +31,7 @@ from services.llm_config import (
     safe_connection_error,
     save_runtime_llm_config,
     save_llm_profile_store,
+    test_llm_concurrency,
     test_llm_connection,
 )
 
@@ -183,8 +184,11 @@ def schema_query_error(exc: OperationalError) -> HTTPException:
     )
 
 
-def build_llm_config_update(payload: schemas.AIConfigUpdate) -> LLMRuntimeConfig:
-    current = get_runtime_llm_config()
+def build_llm_config_update(
+    payload: schemas.AIConfigUpdate,
+    current: LLMRuntimeConfig | None = None,
+) -> LLMRuntimeConfig:
+    current = current or get_runtime_llm_config()
     submitted_key = (payload.api_key or "").strip()
     if payload.clear_api_key:
         api_key = None
@@ -298,10 +302,23 @@ async def update_ai_config(
 
 @router.post("/ai-config/test", response_model=schemas.AIConfigTestResponse)
 async def test_ai_config(
-    payload: schemas.AIConfigUpdate,
+    payload: schemas.AIConfigTestRequest,
     _admin: models.User = Depends(require_admin),
 ):
-    candidate = build_llm_config_update(payload)
+    current = get_runtime_llm_config()
+    if payload.profile_id:
+        stored_profile = next(
+            (
+                profile
+                for profile in get_llm_profile_store().profiles
+                if profile.profile_id == payload.profile_id
+            ),
+            None,
+        )
+        current = stored_profile or current.model_copy(
+            update={"api_key": None, "profile_id": payload.profile_id}
+        )
+    candidate = build_llm_config_update(payload, current=current)
     try:
         preview = await test_llm_connection(candidate)
     except Exception as exc:
@@ -313,10 +330,51 @@ async def test_ai_config(
             status_code=502,
             detail=f"连接测试失败：{safe_connection_error(exc, candidate.api_key)}",
         ) from exc
+
+    try:
+        concurrency_result = await test_llm_concurrency(
+            candidate,
+            candidate.max_concurrency,
+        )
+    except Exception as exc:
+        safe_error = safe_connection_error(exc, candidate.api_key)
+        logger.warning(
+            "AI configuration concurrency test failed: %s",
+            exc.__class__.__name__,
+        )
+        return {
+            "success": False,
+            "message": "单请求成功，但并发能力测试执行失败",
+            "response_preview": preview,
+            "concurrency_requested": candidate.max_concurrency,
+            "concurrency_succeeded": 0,
+            "concurrency_failed": candidate.max_concurrency,
+            "concurrency_supported": False,
+            "recommended_max_concurrency": 1,
+            "error_messages": [safe_error],
+        }
+    safe_errors = [
+        safe_connection_error(RuntimeError(message), candidate.api_key)
+        for message in concurrency_result["errors"]
+    ]
+    supported = bool(concurrency_result["supported"])
     return {
-        "success": True,
-        "message": "连接测试成功",
-        "response_preview": preview,
+        "success": supported,
+        "message": (
+            f"连接与 {candidate.max_concurrency} 路并发测试均成功"
+            if supported
+            else (
+                f"单请求成功，但 {candidate.max_concurrency} 路并发仅成功 "
+                f"{concurrency_result['succeeded']} 路"
+            )
+        ),
+        "response_preview": preview or concurrency_result["response_preview"],
+        "concurrency_requested": concurrency_result["requested"],
+        "concurrency_succeeded": concurrency_result["succeeded"],
+        "concurrency_failed": concurrency_result["failed"],
+        "concurrency_supported": supported,
+        "recommended_max_concurrency": concurrency_result["recommended_max_concurrency"],
+        "error_messages": safe_errors,
     }
 
 

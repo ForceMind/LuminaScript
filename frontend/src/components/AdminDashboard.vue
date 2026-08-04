@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref, onMounted, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -24,6 +24,7 @@ const roleUpdatingId = ref<number | null>(null)
 const aiConfigLoading = ref(false)
 const aiConfigSaving = ref(false)
 const aiConfigTesting = ref(false)
+const aiTestResult = ref<any | null>(null)
 const aiModelsLoading = ref(false)
 const aiModelOptions = ref<string[]>([])
 const aiConfigForm = reactive({
@@ -47,6 +48,8 @@ const aiRoutes = reactive<Record<string, string[]>>({})
 const activeAiProfile = ref('')
 const profileDialogVisible = ref(false)
 const profileSaving = ref(false)
+const profileTesting = ref(false)
+const profileTestResult = ref<any | null>(null)
 const profileModelsLoading = ref(false)
 const profileModelOptions = ref<string[]>([])
 const profileForm = reactive({
@@ -74,6 +77,23 @@ const backupSettings = reactive({
     encrypt: true,
     mirror_directory: '',
 })
+const systemLogLoading = ref(false)
+const systemLogSource = ref<'backend' | 'worker' | 'frontend'>('worker')
+const systemLogLines = ref(300)
+const systemLogKeyword = ref('')
+const systemLogAutoRefresh = ref(false)
+const systemLogViewer = ref<HTMLElement | null>(null)
+const systemLogData = reactive({
+    path: '',
+    available: false,
+    size_bytes: 0,
+    updated_at: '',
+    line_count: 0,
+    truncated: false,
+    content: '',
+    error: '',
+})
+let systemLogTimer: ReturnType<typeof window.setInterval> | null = null
 const usageItems = ref<any[]>([])
 const quotaSavingId = ref<number | null>(null)
 const promptTemplates = ref<any[]>([])
@@ -176,7 +196,8 @@ const saveAiConfig = async () => {
     try {
         const response = await api.put('/admin/ai-config', buildAiConfigPayload())
         applyAiConfigResponse(response.data)
-        ElMessage.success('AI 配置已保存，将从下一次生成请求开始生效')
+        ElMessage.success('AI 配置已保存，正在测试连接与并发能力')
+        await testAiConfig()
     } catch (error: any) {
         ElMessage.error(getApiErrorMessage(error, '保存 AI 配置失败'))
     } finally {
@@ -189,9 +210,16 @@ const testAiConfig = async () => {
     aiConfigTesting.value = true
     try {
         const response = await api.post('/admin/ai-config/test', buildAiConfigPayload())
-        const preview = String(response.data?.response_preview || '').trim()
-        ElMessage.success(preview ? `连接成功：${preview}` : 'AI 连接测试成功')
+        aiTestResult.value = response.data || null
+        if (response.data?.concurrency_supported) {
+            ElMessage.success(response.data?.message || 'AI 连接与并发测试成功')
+        } else {
+            ElMessage.warning(
+                `${response.data?.message || '并发测试未通过'}，建议最大并发改为 ${response.data?.recommended_max_concurrency || 1}`,
+            )
+        }
     } catch (error: any) {
+        aiTestResult.value = null
         ElMessage.error(getApiErrorMessage(error, 'AI 连接测试失败'))
     } finally {
         aiConfigTesting.value = false
@@ -285,7 +313,51 @@ const openProfileDialog = (profile?: any) => {
     profileForm.stream_response = Boolean(profile?.stream_response)
     profileForm.enabled = profile?.enabled !== false
     profileForm.priority = Number(profile?.priority ?? 100)
+    profileTestResult.value = null
     profileDialogVisible.value = true
+}
+
+const buildProfileConfigPayload = () => ({
+    base_url: profileForm.base_url.trim(),
+    model_id: profileForm.model_id.trim(),
+    api_key: profileForm.api_key.trim() || null,
+    clear_api_key: false,
+    timeout_seconds: profileForm.timeout_seconds,
+    max_concurrency: profileForm.max_concurrency,
+    api_protocol: profileForm.api_protocol,
+    stream_response: profileForm.stream_response,
+    profile_id: profileForm.profile_id.trim() || null,
+})
+
+const testAiProfile = async (): Promise<boolean> => {
+    if (!profileForm.profile_id.trim() || !profileForm.base_url.trim() || !profileForm.model_id.trim()) {
+        ElMessage.warning('请先完整填写档案 ID、Base URL 和模型 ID')
+        return false
+    }
+    const existing = aiProfiles.value.find((item) => item.profile_id === profileForm.profile_id.trim())
+    if (!profileForm.api_key.trim() && !existing?.api_key_configured) {
+        ElMessage.warning('请先填写 API Key')
+        return false
+    }
+    profileTesting.value = true
+    try {
+        const response = await api.post('/admin/ai-config/test', buildProfileConfigPayload())
+        profileTestResult.value = response.data || null
+        if (response.data?.concurrency_supported) {
+            ElMessage.success(response.data?.message || '档案连接与并发测试成功')
+            return true
+        }
+        ElMessage.warning(
+            `${response.data?.message || '并发测试未通过'}，建议最大并发改为 ${response.data?.recommended_max_concurrency || 1}`,
+        )
+        return false
+    } catch (error: any) {
+        profileTestResult.value = null
+        ElMessage.error(getApiErrorMessage(error, '档案连接测试失败'))
+        return false
+    } finally {
+        profileTesting.value = false
+    }
 }
 
 const saveAiProfile = async () => {
@@ -308,10 +380,11 @@ const saveAiProfile = async () => {
             enabled: profileForm.enabled,
             priority: profileForm.priority,
         })
-        profileDialogVisible.value = false
         await fetchAiProfiles()
         await fetchAiConfig()
-        ElMessage.success('AI 配置档案已保存')
+        ElMessage.success('AI 配置档案已保存，正在测试连接与并发能力')
+        const passed = await testAiProfile()
+        if (passed) profileDialogVisible.value = false
     } catch (error: any) {
         ElMessage.error(getApiErrorMessage(error, '保存 AI 配置档案失败'))
     } finally {
@@ -442,6 +515,78 @@ const adminRetryJob = async (item: any) => {
     } catch (error: any) {
         ElMessage.error(getApiErrorMessage(error, '重试任务失败'))
     }
+}
+
+const fetchSystemLogs = async (showError = true) => {
+    if (systemLogLoading.value) return
+    systemLogLoading.value = true
+    try {
+        const response = await api.get('/admin/ops/system-logs', {
+            params: {
+                source: systemLogSource.value,
+                lines: systemLogLines.value,
+                keyword: systemLogKeyword.value.trim() || undefined,
+            },
+        })
+        Object.assign(systemLogData, {
+            path: String(response.data?.path || ''),
+            available: Boolean(response.data?.available),
+            size_bytes: Number(response.data?.size_bytes || 0),
+            updated_at: String(response.data?.updated_at || ''),
+            line_count: Number(response.data?.line_count || 0),
+            truncated: Boolean(response.data?.truncated),
+            content: String(response.data?.content || ''),
+            error: String(response.data?.error || ''),
+        })
+        await nextTick()
+        if (systemLogViewer.value) {
+            systemLogViewer.value.scrollTop = systemLogViewer.value.scrollHeight
+        }
+    } catch (error: any) {
+        if (showError) ElMessage.error(getApiErrorMessage(error, '无法读取系统日志'))
+    } finally {
+        systemLogLoading.value = false
+    }
+}
+
+const stopSystemLogAutoRefresh = () => {
+    if (systemLogTimer !== null) {
+        window.clearInterval(systemLogTimer)
+        systemLogTimer = null
+    }
+}
+
+const syncSystemLogAutoRefresh = () => {
+    stopSystemLogAutoRefresh()
+    if (!systemLogAutoRefresh.value || activeTab.value !== 'system_logs') return
+    systemLogTimer = window.setInterval(() => void fetchSystemLogs(false), 5000)
+}
+
+const copySystemLogs = async () => {
+    if (!systemLogData.content) {
+        ElMessage.warning('当前没有可复制的日志')
+        return
+    }
+    try {
+        await navigator.clipboard.writeText(systemLogData.content)
+        ElMessage.success('日志已复制')
+    } catch {
+        ElMessage.error('复制失败，请在日志区域中手动复制')
+    }
+}
+
+const downloadSystemLogs = () => {
+    if (!systemLogData.content) {
+        ElMessage.warning('当前没有可下载的日志')
+        return
+    }
+    const blob = new Blob([systemLogData.content], { type: 'text/plain;charset=utf-8' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${systemLogSource.value}-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
+    link.click()
+    window.URL.revokeObjectURL(url)
 }
 
 const fetchUsage = async () => {
@@ -708,6 +853,7 @@ const handleTabChange = () => {
         fetchAiProfiles()
     }
     if (activeTab.value === 'operations') fetchOperations()
+    if (activeTab.value === 'system_logs') fetchSystemLogs()
     if (activeTab.value === 'usage') fetchUsage()
     if (activeTab.value === 'prompts') fetchPromptTemplates()
     if (activeTab.value === 'logins') {
@@ -723,6 +869,7 @@ const handleTabChange = () => {
         fetchAiUserStats()
         fetchAiContentLogs()
     }
+    syncSystemLogAutoRefresh()
 }
 
 watch(loginPage, () => fetchLoginLogs())
@@ -730,9 +877,23 @@ watch(aiPage, () => fetchAiLogs())
 watch(aiContentPage, () => {
     if (activeTab.value === 'ai_content') fetchAiContentLogs()
 })
+watch(aiConfigForm, () => {
+    aiTestResult.value = null
+}, { deep: true })
+watch(profileForm, () => {
+    profileTestResult.value = null
+}, { deep: true })
+watch(systemLogAutoRefresh, syncSystemLogAutoRefresh)
+watch(systemLogSource, () => {
+    if (activeTab.value === 'system_logs') fetchSystemLogs()
+})
 
 onMounted(() => {
     fetchUsers()
+})
+
+onUnmounted(() => {
+    stopSystemLogAutoRefresh()
 })
 </script>
 
@@ -883,7 +1044,7 @@ onMounted(() => {
                                 保存配置
                             </el-button>
                             <el-button :loading="aiConfigTesting" @click="testAiConfig">
-                                测试连接
+                                测试连接与并发
                             </el-button>
                             <span class="text-xs text-gray-400">
                                 当前来源：{{ aiConfigMeta.source === 'admin' ? '管理后台配置' : '服务器环境变量' }}
@@ -895,6 +1056,28 @@ onMounted(() => {
                                 </template>
                             </span>
                         </div>
+                        <el-alert
+                            v-if="aiTestResult"
+                            class="mt-4"
+                            :type="aiTestResult.concurrency_supported ? 'success' : 'warning'"
+                            :title="aiTestResult.message"
+                            :description="aiTestResult.concurrency_supported
+                                ? `已验证 ${aiTestResult.concurrency_succeeded}/${aiTestResult.concurrency_requested} 路并发请求。`
+                                : `成功 ${aiTestResult.concurrency_succeeded}/${aiTestResult.concurrency_requested} 路；建议把最大并发改为 ${aiTestResult.recommended_max_concurrency}。${(aiTestResult.error_messages || []).join('；')}`"
+                            :closable="false"
+                            show-icon
+                        />
+                        <el-button
+                            v-if="aiTestResult && !aiTestResult.concurrency_supported"
+                            class="mt-2"
+                            size="small"
+                            type="warning"
+                            plain
+                            @click="aiConfigForm.max_concurrency = aiTestResult.recommended_max_concurrency"
+                        >
+                            采用建议并发 {{ aiTestResult.recommended_max_concurrency }}
+                        </el-button>
+                        <div class="mt-2 text-xs text-gray-400">每次测试会发送 1 个单请求和所填并发数个极短请求。</div>
                     </el-form>
 
                     <el-divider content-position="left">多模型档案与故障切换</el-divider>
@@ -1005,6 +1188,73 @@ onMounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                </div>
+            </el-tab-pane>
+
+            <el-tab-pane label="系统日志" name="system_logs">
+                <div class="space-y-4">
+                    <el-alert
+                        title="日志内容会自动隐藏常见 API Key、令牌和密码；默认显示 Worker 日志，便于排查剧本生成中断。"
+                        type="info"
+                        :closable="false"
+                    />
+                    <div class="flex flex-wrap items-end gap-3">
+                        <el-form-item label="日志来源" class="!mb-0">
+                            <el-select v-model="systemLogSource" class="!w-40">
+                                <el-option label="生成 Worker" value="worker" />
+                                <el-option label="后端 API" value="backend" />
+                                <el-option label="前端服务" value="frontend" />
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="显示行数" class="!mb-0">
+                            <el-select v-model="systemLogLines" class="!w-32" @change="fetchSystemLogs()">
+                                <el-option :value="100" label="100 行" />
+                                <el-option :value="300" label="300 行" />
+                                <el-option :value="1000" label="1000 行" />
+                                <el-option :value="2000" label="2000 行" />
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="关键词" class="!mb-0 flex-1 min-w-64">
+                            <el-input
+                                v-model="systemLogKeyword"
+                                clearable
+                                placeholder="例如：failed、project 5、Traceback"
+                                @keyup.enter="fetchSystemLogs()"
+                            />
+                        </el-form-item>
+                        <el-button type="primary" :loading="systemLogLoading" @click="fetchSystemLogs()">刷新</el-button>
+                        <el-button @click="copySystemLogs">复制</el-button>
+                        <el-button @click="downloadSystemLogs">下载当前内容</el-button>
+                        <div class="flex items-center gap-2 h-8 text-sm text-gray-500">
+                            <el-switch v-model="systemLogAutoRefresh" />
+                            5 秒自动刷新
+                        </div>
+                    </div>
+
+                    <div class="rounded border bg-gray-50 px-3 py-2 text-xs text-gray-500 break-all">
+                        <span>{{ systemLogData.path || '尚未读取日志路径' }}</span>
+                        <template v-if="systemLogData.available">
+                            · {{ systemLogData.line_count }} 行
+                            · {{ Math.ceil(systemLogData.size_bytes / 1024) }} KB
+                            <template v-if="systemLogData.updated_at">
+                                · 更新于 {{ new Date(systemLogData.updated_at).toLocaleString() }}
+                            </template>
+                            <template v-if="systemLogData.truncated"> · 已截取最新内容</template>
+                        </template>
+                    </div>
+
+                    <el-alert
+                        v-if="!systemLogData.available && !systemLogLoading"
+                        :title="systemLogData.error || '日志文件尚不存在；服务启动并写入日志后即可在这里查看。'"
+                        type="warning"
+                        :closable="false"
+                    />
+                    <pre
+                        v-else
+                        ref="systemLogViewer"
+                        v-loading="systemLogLoading"
+                        class="m-0 min-h-96 max-h-[68vh] max-w-full overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-950 p-4 text-xs leading-5 text-slate-100"
+                    >{{ systemLogData.content || '日志文件当前为空。' }}</pre>
                 </div>
             </el-tab-pane>
 
@@ -1294,9 +1544,30 @@ onMounted(() => {
                 <el-form-item label="启用"><el-switch v-model="profileForm.enabled" /></el-form-item>
                 <el-form-item label="仅流式响应"><el-switch v-model="profileForm.stream_response" /></el-form-item>
             </div>
+            <el-alert
+                v-if="profileTestResult"
+                :type="profileTestResult.concurrency_supported ? 'success' : 'warning'"
+                :title="profileTestResult.message"
+                :description="profileTestResult.concurrency_supported
+                    ? `已验证 ${profileTestResult.concurrency_succeeded}/${profileTestResult.concurrency_requested} 路并发请求。`
+                    : `成功 ${profileTestResult.concurrency_succeeded}/${profileTestResult.concurrency_requested} 路；建议最大并发为 ${profileTestResult.recommended_max_concurrency}。${(profileTestResult.error_messages || []).join('；')}`"
+                :closable="false"
+                show-icon
+            />
+            <el-button
+                v-if="profileTestResult && !profileTestResult.concurrency_supported"
+                class="mt-2"
+                size="small"
+                type="warning"
+                plain
+                @click="profileForm.max_concurrency = profileTestResult.recommended_max_concurrency"
+            >
+                采用建议并发 {{ profileTestResult.recommended_max_concurrency }}
+            </el-button>
         </el-form>
         <template #footer>
             <el-button @click="profileDialogVisible = false">取消</el-button>
+            <el-button :loading="profileTesting" @click="testAiProfile">测试连接与并发</el-button>
             <el-button type="primary" :loading="profileSaving" @click="saveAiProfile">保存</el-button>
         </template>
     </el-dialog>

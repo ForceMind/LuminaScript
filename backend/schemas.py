@@ -148,6 +148,22 @@ class AIConfigTestResponse(BaseModel):
     success: bool
     message: str
     response_preview: str = ""
+    concurrency_requested: int = 1
+    concurrency_succeeded: int = 1
+    concurrency_failed: int = 0
+    concurrency_supported: bool = True
+    recommended_max_concurrency: int = 1
+    error_messages: List[str] = Field(default_factory=list)
+
+
+class AIConfigTestRequest(AIConfigUpdate):
+    profile_id: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("profile_id")
+    @classmethod
+    def normalize_test_profile_id(cls, value: Optional[str]) -> Optional[str]:
+        normalized = str(value or "").strip()
+        return normalized or None
 
 
 class AIModelListRequest(BaseModel):

@@ -16,6 +16,7 @@ import {
   SwitchButton,
   DataLine,
   Download,
+  Upload,
   ArrowDown
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -95,6 +96,8 @@ const projectToolsLoading = ref(false)
 const projectVersions = ref<any[]>([])
 const projectMembers = ref<any[]>([])
 const projectJobs = ref<any[]>([])
+const projectImportInput = ref<HTMLInputElement | null>(null)
+const projectImporting = ref(false)
 const myUsage = ref<any>({ daily_tokens: 0, monthly_tokens: 0, daily_limit: 0, monthly_limit: 0 })
 const versionLabel = ref('手动快照')
 const versionDiffVisible = ref(false)
@@ -129,6 +132,42 @@ const isSceneGenerationActive = (project: any) => {
     const scenes = Array.isArray(project.scenes) ? project.scenes : []
     return scenes.some((scene: any) => ['pending', 'generating'].includes(normalizeProjectStatus(scene?.status)))
 }
+
+const latestGenerationJob = computed(() => {
+    const projectId = Number(currentProject.value?.id || 0)
+    if (!projectId) return null
+    return projectJobs.value.find((job: any) => Number(job?.project_id) === projectId) || null
+})
+
+const isCurrentGenerationJobActive = computed(() => {
+    return ['queued', 'running'].includes(normalizeProjectStatus(latestGenerationJob.value?.status))
+})
+
+const generationWaitingText = computed(() => {
+    const status = normalizeProjectStatus(latestGenerationJob.value?.status)
+    if (status === 'queued') {
+        const attempts = Number(latestGenerationJob.value?.attempts || 0)
+        return attempts > 0
+            ? `生成请求正在等待第 ${attempts + 1} 次重试，Worker 会自动继续...`
+            : '生成任务已排队，正在等待 Worker 接取...'
+    }
+    if (status === 'running') {
+        return 'Worker 正在生成剧本，请耐心等待...'
+    }
+    return loadingText.value || 'AI 正在逐场构架剧本，请稍候...'
+})
+
+const generationFailureText = computed(() => {
+    const error = toTextValue(latestGenerationJob.value?.last_error).trim()
+    if (error) return error.slice(0, 800)
+    if (normalizeProjectStatus(latestGenerationJob.value?.status) === 'canceled') {
+        return '最近一次生成任务已取消。'
+    }
+    if (isStatus(currentProject.value?.status, 'completed')) {
+        return '项目被标记为已完成，但没有找到任何场次，请重新生成。'
+    }
+    return '没有可继续执行的生成任务，可能是 Worker 中断或 AI 服务请求失败。'
+})
 
 const upsertProjectListItem = (project: any) => {
     if (!project?.id) return
@@ -613,13 +652,29 @@ const fetchProjectDetail = async (projectId: number) => {
     } catch (e: any) {
         if (e.response?.status === 404) {
             projectList.value = projectList.value.filter((item: any) => item.id !== projectId)
-            if (currentProject.value?.id === projectId) currentProject.value = null
+            if (currentProject.value?.id === projectId) {
+                currentProject.value = null
+                projectJobs.value = []
+            }
             return null
         }
         if (e.response?.status !== 401) {
             console.error(e)
         }
         return null
+    }
+}
+
+const fetchProjectJobs = async (projectId: number) => {
+    if (!token.value || !projectId) return []
+    try {
+        const response = await api.get('/jobs', { params: { project_id: projectId } })
+        const jobs = Array.isArray(response.data?.items) ? response.data.items : []
+        if (currentProject.value?.id === projectId) projectJobs.value = jobs
+        return jobs
+    } catch (e: any) {
+        if (e.response?.status !== 401) console.error(e)
+        return []
     }
 }
 
@@ -639,8 +694,9 @@ const runPollingCycle = async () => {
 
     pollRequestInFlight.value = true
     try {
-        if (currentProject.value?.id && isSceneGenerationActive(currentProject.value)) {
-            await fetchProjectDetail(currentProject.value.id)
+        if (currentProject.value?.id && (isSceneGenerationActive(currentProject.value) || isCurrentGenerationJobActive.value)) {
+            const projectId = currentProject.value.id
+            await Promise.all([fetchProjectDetail(projectId), fetchProjectJobs(projectId)])
             return
         }
         if (hasBackgroundGeneratingProjects()) {
@@ -656,7 +712,7 @@ const startPolling = () => {
     if (!token.value || !isDocumentVisible()) return
 
     let delay = 0
-    if (currentProject.value?.id && isSceneGenerationActive(currentProject.value)) {
+    if (currentProject.value?.id && (isSceneGenerationActive(currentProject.value) || isCurrentGenerationJobActive.value)) {
         delay = ACTIVE_PROJECT_POLL_INTERVAL_MS
     } else if (hasBackgroundGeneratingProjects()) {
         delay = BACKGROUND_LIST_POLL_INTERVAL_MS
@@ -694,6 +750,7 @@ const logout = () => {
     localStorage.removeItem('token')
     projectList.value = []
     currentProject.value = null
+    projectJobs.value = []
     interaction.value = null
     scenePromptMap.value = {}
     scenePromptLoadingMap.value = {}
@@ -861,7 +918,7 @@ const analyzeLogline = async (id: number) => {
             }
         )
 
-        await fetchProjectDetail(id)
+        await Promise.all([fetchProjectDetail(id), fetchProjectJobs(id)])
     } else {
         interaction.value = null
         if (currentProject.value?.id) {
@@ -943,6 +1000,7 @@ const handleOptionSelect = (opt: any) => {
 
 const startNewProject = () => {
     currentProject.value = null
+    projectJobs.value = []
     interaction.value = null
     loading.value = false
     switchingProject.value = false
@@ -975,6 +1033,7 @@ const loadProject = async (p: any) => {
             ...p,
             scenes: Array.isArray(p?.scenes) ? p.scenes : []
         }
+        projectJobs.value = []
         drawerOpen.value = false
         interaction.value = null
 
@@ -983,15 +1042,17 @@ const loadProject = async (p: any) => {
             currentProject.value = detailedProject
             upsertProjectListItem(detailedProject)
         }
+        await fetchProjectJobs(p.id)
 
         // Always check state/resume flow
         const activeProject = detailedProject || currentProject.value
         const activeStatus = normalizeProjectStatus(activeProject?.status)
         const hasScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
+        const latestJobStatus = normalizeProjectStatus(latestGenerationJob.value?.status)
 
-        if (activeStatus === 'generating') {
+        if (activeStatus === 'generating' || ['queued', 'running'].includes(latestJobStatus)) {
             loading.value = false
-        } else if (!hasScenes && activeStatus !== 'completed' && activeStatus !== 'failed') {
+        } else if (!hasScenes && !latestGenerationJob.value && activeStatus !== 'completed' && activeStatus !== 'failed') {
             loading.value = true
             loadingText.value = "正在恢复进度..."
             await analyzeLogline(activeProject.id)
@@ -1022,6 +1083,7 @@ const deleteProject = async () => {
         await api.delete(`/projects/${currentProject.value.id}`)
         ElMessage.success('已删除')
         currentProject.value = null
+        projectJobs.value = []
         await fetchProjects()
         startPolling()
     } catch (e) {
@@ -1123,6 +1185,43 @@ const exportScript = (format: string = 'txt') => {
            window.URL.revokeObjectURL(url);
        })
        .catch(e => ElMessage.error('导出失败'))
+}
+
+const chooseProjectImportFile = () => {
+    projectImportInput.value?.click()
+}
+
+const importProjectArchive = async (event: Event) => {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.json')) {
+        ElMessage.warning('请选择由 LuminaScript 导出的 JSON 项目备份')
+        input.value = ''
+        return
+    }
+
+    projectImporting.value = true
+    try {
+        const formData = new FormData()
+        formData.append('file', file)
+        const response = await api.post('/projects/import', formData, {
+            timeout: 120000,
+        })
+        currentProject.value = response.data
+        projectJobs.value = []
+        interaction.value = null
+        scenePromptMap.value = {}
+        scenePromptLoadingMap.value = {}
+        await fetchProjects()
+        ElMessage.success(`项目“${response.data?.title || file.name}”已作为新副本导入`)
+    } catch (e: any) {
+        console.error(e)
+        ElMessage.error(e.response?.data?.detail || '项目导入失败')
+    } finally {
+        projectImporting.value = false
+        input.value = ''
+    }
 }
 
 // Sorted Key Settings Help
@@ -1301,6 +1400,8 @@ const retryProjectJob = async (job: any) => {
         await api.post(`/jobs/${job.id}/retry`)
         await fetchProjectTools()
         await fetchProjectDetail(currentProject.value.id)
+        startPolling()
+        ElMessage.success('生成任务已重新排队')
     } catch (error: any) {
         ElMessage.error(error?.response?.data?.detail || '重试任务失败')
     }
@@ -1387,16 +1488,29 @@ const copyText = (value: unknown) => {
                  </div>
             </div>
             <div class="flex items-center gap-3">
+                 <input
+                    ref="projectImportInput"
+                    type="file"
+                    accept="application/json,.json"
+                    class="hidden"
+                    @change="importProjectArchive"
+                 />
+                 <el-tooltip content="导入项目备份" placement="bottom">
+                    <el-button plain :icon="Upload" :loading="projectImporting" @click="chooseProjectImportFile">
+                        <span class="hidden xl:inline ml-1">导入</span>
+                    </el-button>
+                 </el-tooltip>
                  <el-button v-if="currentProject?.id" plain @click="openProjectTools">
                     项目工具
                  </el-button>
-                 <el-dropdown v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @command="exportScript">
+                 <el-dropdown v-if="currentProject" @command="exportScript">
                     <el-button plain>
                         <el-icon class="mr-1"><Download /></el-icon> 导出 <el-icon class="el-icon--right"><arrow-down /></el-icon>
                     </el-button>
                     <template #dropdown>
                         <el-dropdown-menu>
-                            <el-dropdown-item command="txt">纯文本 (.txt)</el-dropdown-item>
+                            <el-dropdown-item command="json">项目备份 (.json，可再次导入)</el-dropdown-item>
+                            <el-dropdown-item divided command="txt">纯文本 (.txt)</el-dropdown-item>
                             <el-dropdown-item command="md">Markdown (.md)</el-dropdown-item>
                             <el-dropdown-item command="docx">Word 文档 (.docx)</el-dropdown-item>
                         </el-dropdown-menu>
@@ -1763,14 +1877,33 @@ const copyText = (value: unknown) => {
                         </div>
                         
                         <div v-if="!currentProject.scenes || currentProject.scenes.length === 0" class="text-center py-10 text-gray-400">
-                             <div v-if="switchingProject || loading || isStatus(currentProject.status, 'generating')">
+                             <div v-if="switchingProject || loading || isStatus(currentProject.status, 'generating') || isCurrentGenerationJobActive">
                                 <el-icon class="text-4xl mb-2 animate-spin"><Loading /></el-icon>
-                                <p>{{ switchingProject ? '正在加载历史剧本...' : (loadingText || 'AI 正在逐场构架剧本，请稍候...') }}</p>
+                                <p>{{ switchingProject ? '正在加载历史剧本...' : generationWaitingText }}</p>
                                 <p class="text-xs mt-2 text-gray-400">（受网络速度和模型提供商影响，生成速度无法控制，请耐心等待）</p>
                              </div>
-                             <div v-else class="py-4">
-                                <p class="mb-4 text-gray-500">剧本尚未生成或生成过程中断。</p>
-                                <el-button v-if="currentProject?.id" type="primary" plain round @click="analyzeLogline(currentProject.id)">尝试重新分析</el-button>
+                             <div v-else-if="latestGenerationJob && ['failed', 'canceled'].includes(normalizeProjectStatus(latestGenerationJob.status))" class="py-4 max-w-3xl mx-auto">
+                                <el-alert
+                                    :title="normalizeProjectStatus(latestGenerationJob.status) === 'canceled' ? '剧本生成已取消' : '剧本生成失败'"
+                                    :description="generationFailureText"
+                                    :type="normalizeProjectStatus(latestGenerationJob.status) === 'canceled' ? 'warning' : 'error'"
+                                    :closable="false"
+                                    show-icon
+                                    class="text-left mb-4"
+                                />
+                                <el-button v-if="canEditCurrentProject" type="primary" round @click="retryProjectJob(latestGenerationJob)">重新执行生成任务</el-button>
+                                <el-button v-if="currentProject?.id && canEditCurrentProject" plain round @click="analyzeLogline(currentProject.id)">重新检查基础设定</el-button>
+                             </div>
+                             <div v-else class="py-4 max-w-3xl mx-auto">
+                                <el-alert
+                                    title="当前没有可显示的剧本场次"
+                                    :description="generationFailureText"
+                                    type="warning"
+                                    :closable="false"
+                                    show-icon
+                                    class="text-left mb-4"
+                                />
+                                <el-button v-if="currentProject?.id && canEditCurrentProject" type="primary" plain round @click="analyzeLogline(currentProject.id)">继续设定或重新生成</el-button>
                              </div>
                         </div>
 

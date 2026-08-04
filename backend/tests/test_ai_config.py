@@ -117,9 +117,23 @@ async def test_admin_can_test_candidate_config_without_saving(monkeypatch):
         assert config.api_key == "new-secret"
         return "OK"
 
+    async def fake_concurrency_test(config, concurrency):
+        assert config.api_key == "new-secret"
+        assert concurrency == 5
+        return {
+            "requested": 5,
+            "succeeded": 5,
+            "failed": 0,
+            "supported": True,
+            "recommended_max_concurrency": 5,
+            "response_preview": "OK",
+            "errors": [],
+        }
+
     monkeypatch.setattr(admin_routes, "test_llm_connection", fake_test)
+    monkeypatch.setattr(admin_routes, "test_llm_concurrency", fake_concurrency_test)
     response = await admin_routes.test_ai_config(
-        schemas.AIConfigUpdate(
+        schemas.AIConfigTestRequest(
             base_url="https://example.com/v1",
             model_id="new-model",
             api_key="new-secret",
@@ -129,9 +143,59 @@ async def test_admin_can_test_candidate_config_without_saving(monkeypatch):
 
     assert response == {
         "success": True,
-        "message": "连接测试成功",
+        "message": "连接与 5 路并发测试均成功",
         "response_preview": "OK",
+        "concurrency_requested": 5,
+        "concurrency_succeeded": 5,
+        "concurrency_failed": 0,
+        "concurrency_supported": True,
+        "recommended_max_concurrency": 5,
+        "error_messages": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_concurrency_test_reports_single_request_provider_limit(monkeypatch):
+    active_requests = 0
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs):
+            nonlocal active_requests
+            active_requests += 1
+            overloaded = active_requests > 1
+            try:
+                await __import__("asyncio").sleep(0.01)
+                if overloaded:
+                    raise RuntimeError("provider only allows one request")
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))],
+                    usage=None,
+                )
+            finally:
+                active_requests -= 1
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(llm_config, "AsyncOpenAI", FakeClient)
+    config = llm_config.LLMRuntimeConfig(
+        api_key="secret",
+        base_url="https://single.example.com/v1",
+        model_id="model",
+        timeout_seconds=30,
+        max_concurrency=3,
+    )
+
+    result = await llm_config.test_llm_concurrency(config, 3)
+
+    assert result["requested"] == 3
+    assert result["succeeded"] == 1
+    assert result["failed"] == 2
+    assert result["supported"] is False
+    assert result["recommended_max_concurrency"] == 1
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import logging
@@ -369,6 +370,60 @@ async def test_llm_connection(config: LLMRuntimeConfig) -> str:
         return content.strip()[:100]
     finally:
         await client.close()
+
+
+async def test_llm_concurrency(
+    config: LLMRuntimeConfig,
+    concurrency: int,
+) -> dict[str, Any]:
+    if not config.api_key:
+        raise ValueError("请先填写 API Key")
+
+    requested = max(1, min(int(concurrency), 20))
+    client = AsyncOpenAI(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout=config.timeout_seconds,
+        max_retries=0,
+    )
+
+    async def run_probe(index: int) -> str:
+        content, _usage = await create_llm_text_response(
+            client,
+            config,
+            [{"role": "user", "content": f"Reply with OK. Probe {index}."}],
+            temperature=0,
+        )
+        return content.strip()[:100]
+
+    try:
+        results = await asyncio.gather(
+            *(run_probe(index) for index in range(1, requested + 1)),
+            return_exceptions=True,
+        )
+    finally:
+        await client.close()
+
+    previews: list[str] = []
+    errors: list[str] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            message = str(result).strip() or result.__class__.__name__
+            if message not in errors:
+                errors.append(message)
+        else:
+            previews.append(result)
+
+    succeeded = len(previews)
+    return {
+        "requested": requested,
+        "succeeded": succeeded,
+        "failed": requested - succeeded,
+        "supported": succeeded == requested,
+        "recommended_max_concurrency": requested if succeeded == requested else max(1, succeeded),
+        "response_preview": next((item for item in previews if item), ""),
+        "errors": errors[:5],
+    }
 
 
 async def list_llm_models(

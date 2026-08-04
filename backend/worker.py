@@ -15,6 +15,7 @@ from services.job_queue import (
     prepare_job_attempt,
     recover_stale_jobs,
 )
+from services.generation_state import get_generation_error
 
 
 logging.basicConfig(
@@ -69,8 +70,10 @@ async def execute_job(job: models.GenerationJob) -> None:
         if not project:
             raise RuntimeError(f"Project {job.project_id} no longer exists")
         if project.status != models.ProcessingStatus.COMPLETED:
+            generation_error = get_generation_error(project)
             raise RuntimeError(
-                f"Project generation ended with status {project.status}"
+                generation_error
+                or f"Project generation ended with status {project.status}"
             )
 
 
