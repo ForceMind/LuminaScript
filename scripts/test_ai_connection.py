@@ -141,15 +141,31 @@ def extract_non_stream_content(payload: Any) -> str:
     return ""
 
 
-def extract_sse_content(body: bytes) -> str:
-    text = body.decode("utf-8", errors="replace")
+def extract_responses_content(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
     parts: list[str] = []
-    saw_event = False
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict) or content.get("type") != "output_text":
+                continue
+            value = content.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts)
+
+
+def iter_sse_payloads(body: bytes):
+    text = body.decode("utf-8", errors="replace")
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line.startswith("data:"):
             continue
-        saw_event = True
         data = line[5:].strip()
         if not data or data == "[DONE]":
             continue
@@ -157,17 +173,58 @@ def extract_sse_content(body: bytes) -> str:
             payload = json.loads(data)
         except json.JSONDecodeError:
             continue
+        if isinstance(payload, dict):
+            yield payload
+
+
+def extract_sse_content(body: bytes) -> str:
+    text = body.decode("utf-8", errors="replace")
+    parts: list[str] = []
+    payloads = list(iter_sse_payloads(body))
+    for payload in payloads:
         for choice in payload.get("choices") or []:
             delta = choice.get("delta") or {}
             value = delta.get("content")
             if isinstance(value, str):
                 parts.append(value)
-    if saw_event:
+    if payloads:
         return "".join(parts)
     try:
         return extract_non_stream_content(json.loads(text))
     except Exception:
         return ""
+
+
+def extract_responses_sse_content(body: bytes) -> str:
+    payloads = list(iter_sse_payloads(body))
+    parts: list[str] = []
+    completed = None
+    for payload in payloads:
+        event_type = str(payload.get("type") or "")
+        if event_type == "response.output_text.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                parts.append(delta)
+        elif event_type == "response.completed":
+            completed = payload.get("response")
+    if parts:
+        return "".join(parts)
+    if isinstance(completed, dict):
+        return extract_responses_content(completed)
+    try:
+        return extract_responses_content(parse_json_bytes(body))
+    except Exception:
+        return ""
+
+
+def sse_error(body: bytes, api_key: str) -> str:
+    for payload in iter_sse_payloads(body):
+        if payload.get("type") not in {"error", "response.failed"}:
+            continue
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+        error = response.get("error") if isinstance(response.get("error"), dict) else response
+        return safe_message(error.get("message") or error, api_key)
+    return ""
 
 
 def upstream_error(body: bytes, api_key: str) -> str:
@@ -239,6 +296,68 @@ def probe_chat(
     )
 
 
+def probe_responses(
+    api_base: str,
+    api_key: str,
+    model_id: str,
+    *,
+    stream: bool,
+    timeout: int,
+) -> ProbeResult:
+    payload = {
+        "model": model_id,
+        "input": [{"role": "user", "content": "只回复 OK"}],
+        "stream": stream,
+    }
+    status, _content_type, body, elapsed = request_bytes(
+        "POST",
+        f"{api_base}/responses",
+        api_key,
+        payload=payload,
+        timeout=timeout,
+    )
+    if status != 200:
+        return ProbeResult(
+            ok=False,
+            status=status,
+            elapsed_seconds=elapsed,
+            error=upstream_error(body, api_key),
+        )
+    try:
+        if stream:
+            content = extract_responses_sse_content(body)
+            stream_error = sse_error(body, api_key)
+            if stream_error:
+                return ProbeResult(
+                    ok=False,
+                    status=status,
+                    elapsed_seconds=elapsed,
+                    error=stream_error,
+                )
+        else:
+            content = extract_responses_content(parse_json_bytes(body))
+    except Exception as exc:
+        return ProbeResult(
+            ok=False,
+            status=status,
+            elapsed_seconds=elapsed,
+            error=f"响应解析失败：{safe_message(exc, api_key)}",
+        )
+    if not content.strip():
+        return ProbeResult(
+            ok=False,
+            status=status,
+            elapsed_seconds=elapsed,
+            error="请求成功，但没有解析到正文内容",
+        )
+    return ProbeResult(
+        ok=True,
+        status=status,
+        elapsed_seconds=elapsed,
+        preview=safe_message(content, api_key, limit=160),
+    )
+
+
 def choose_model(model_ids: list[str], preset: str = "") -> str:
     if preset.strip():
         return preset.strip()
@@ -275,29 +394,50 @@ def print_probe(label: str, result: ProbeResult) -> None:
 def print_recommendation(
     api_base: str,
     model_id: str,
-    non_stream: ProbeResult,
-    stream: ProbeResult,
+    chat_non_stream: ProbeResult,
+    chat_stream: ProbeResult,
+    responses_non_stream: ProbeResult,
+    responses_stream: ProbeResult,
     timeout: int,
 ) -> None:
+    protocol_candidates = [
+        ("chat_completions", "Chat Completions（/chat/completions）", chat_non_stream, chat_stream),
+        ("responses", "Responses API（/responses）", responses_non_stream, responses_stream),
+    ]
+    selected = next(
+        (candidate for candidate in protocol_candidates if candidate[2].ok),
+        None,
+    ) or next(
+        (candidate for candidate in protocol_candidates if candidate[3].ok),
+        None,
+    )
+    if selected is None:
+        print("\n" + "=" * 64)
+        print("没有检测到可填写的有效配置")
+        print("=" * 64)
+        print("Chat Completions 与 Responses API 的流式、非流式请求均未通过。")
+        print("请根据上方四项错误修复服务、权限或模型渠道后重新运行脚本。")
+        return
+
+    protocol_value, protocol_label, non_stream, stream = selected
     stream_required = stream.ok and not non_stream.ok
     if stream.ok and non_stream.ok:
         recommended_stream = False
-        note = "两种模式都可用，默认使用普通响应；也可以手动开启流式。"
+        note = f"{protocol_label} 的两种模式都可用，默认使用普通响应；也可以手动开启流式。"
     elif stream_required:
         recommended_stream = True
-        note = "只有流式请求通过，必须开启“仅流式响应”。"
+        note = f"{protocol_label} 只有流式请求通过，必须开启“仅流式响应”。"
     elif non_stream.ok:
         recommended_stream = False
-        note = "只有非流式请求通过，不要开启“仅流式响应”。"
-    else:
-        recommended_stream = True
-        note = "两种模式均未通过，请先根据上方错误修复服务或令牌。"
+        note = f"{protocol_label} 只有非流式请求通过，不要开启“仅流式响应”。"
 
     profile = {
         "档案 ID": profile_id_from_url(api_base),
         "显示名称": urlparse(api_base).hostname or "自建 AI",
         "Base URL": api_base,
         "模型 ID": model_id,
+        "接口协议": protocol_label,
+        "接口协议值": protocol_value,
         "API Key": "填写刚才隐藏输入的 Key（脚本不会回显）",
         "请求超时（秒）": max(90, timeout),
         "最大并发请求数": 2,
@@ -357,16 +497,41 @@ def main() -> int:
             return 2
 
         print(f"\n正在测试模型：{model_id}")
-        non_stream = probe_chat(
+        chat_non_stream = probe_chat(
             api_base, api_key, model_id, stream=False, timeout=args.timeout
         )
-        print_probe("非流式请求", non_stream)
-        stream = probe_chat(
+        print_probe("Chat Completions 非流式请求", chat_non_stream)
+        chat_stream = probe_chat(
             api_base, api_key, model_id, stream=True, timeout=args.timeout
         )
-        print_probe("流式请求", stream)
-        print_recommendation(api_base, model_id, non_stream, stream, args.timeout)
-        return 0 if non_stream.ok or stream.ok else 1
+        print_probe("Chat Completions 流式请求", chat_stream)
+        responses_non_stream = probe_responses(
+            api_base, api_key, model_id, stream=False, timeout=args.timeout
+        )
+        print_probe("Responses API 非流式请求", responses_non_stream)
+        responses_stream = probe_responses(
+            api_base, api_key, model_id, stream=True, timeout=args.timeout
+        )
+        print_probe("Responses API 流式请求", responses_stream)
+        print_recommendation(
+            api_base,
+            model_id,
+            chat_non_stream,
+            chat_stream,
+            responses_non_stream,
+            responses_stream,
+            args.timeout,
+        )
+        succeeded = any(
+            result.ok
+            for result in (
+                chat_non_stream,
+                chat_stream,
+                responses_non_stream,
+                responses_stream,
+            )
+        )
+        return 0 if succeeded else 1
     finally:
         # Best-effort removal of the only live reference. CPython strings cannot
         # be securely zeroed, so the process exits immediately after the test.

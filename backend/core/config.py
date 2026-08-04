@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     llm_model_id: str = "xopglm47blth2"
     llm_timeout_seconds: int = Field(default=90, ge=10, le=600)
     llm_max_concurrency: int = Field(default=5, ge=1, le=20)
+    llm_api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
     llm_stream_response: bool = False
 
     login_attempt_window_seconds: int = Field(default=300, ge=60, le=86400)

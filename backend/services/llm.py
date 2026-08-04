@@ -5,7 +5,11 @@ import re
 
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from services.llm_config import LLMRuntimeConfig, get_routed_llm_configs
+from services.llm_config import (
+    LLMRuntimeConfig,
+    create_llm_text_response,
+    get_routed_llm_configs,
+)
 
 # Configure Configuration
 logging.basicConfig(level=logging.INFO)
@@ -285,46 +289,18 @@ def _estimate_token_usage(messages, content: str) -> int:
         return max(1, len(str(content or "")) // 4)
 
 
-def _stream_delta_text(chunk) -> str:
-    parts: list[str] = []
-    for choice in getattr(chunk, "choices", None) or []:
-        delta = getattr(choice, "delta", None)
-        value = getattr(delta, "content", None)
-        if isinstance(value, str):
-            parts.append(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict) and item.get("text"):
-                    parts.append(str(item["text"]))
-                elif getattr(item, "text", None):
-                    parts.append(str(item.text))
-    return "".join(parts)
-
-
 async def _create_completion(
     runtime_client,
     runtime_config: LLMRuntimeConfig,
     messages,
     temperature: float,
 ) -> tuple[str, int]:
-    response = await runtime_client.chat.completions.create(
-        model=runtime_config.model_id,
-        messages=messages,
+    return await create_llm_text_response(
+        runtime_client,
+        runtime_config,
+        messages,
         temperature=temperature,
-        stream=runtime_config.stream_response,
     )
-    if not runtime_config.stream_response:
-        content = str(response.choices[0].message.content or "")
-        usage_obj = getattr(response, "usage", None)
-        return content, int(getattr(usage_obj, "total_tokens", 0) or 0)
-
-    content_parts: list[str] = []
-    usage = 0
-    async for chunk in response:
-        content_parts.append(_stream_delta_text(chunk))
-        usage_obj = getattr(chunk, "usage", None)
-        usage = max(usage, int(getattr(usage_obj, "total_tokens", 0) or 0))
-    return "".join(content_parts), usage
 
 @retry(
     stop=stop_after_attempt(3),

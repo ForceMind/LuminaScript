@@ -103,6 +103,7 @@ class AIConfigUpdate(BaseModel):
     clear_api_key: bool = False
     timeout_seconds: int = Field(default=90, ge=10, le=600)
     max_concurrency: int = Field(default=5, ge=1, le=20)
+    api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
     stream_response: bool = False
 
     @field_validator("base_url")
@@ -130,6 +131,7 @@ class AIConfigResponse(BaseModel):
     model_id: str
     timeout_seconds: int
     max_concurrency: int
+    api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
     stream_response: bool = False
     api_key_configured: bool
     api_key_masked: str = ""

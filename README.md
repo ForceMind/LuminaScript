@@ -146,11 +146,13 @@ bash uninstall.sh
 
 ### AI 配置管理
 管理员可在“管理后台 → AI 配置”中维护多套 Base URL、模型 ID、API Key、
-请求超时和最大并发数，并为大纲、正文、策划、交互、审核和提示词任务指定
+接口协议、请求超时和最大并发数，并为大纲、正文、策划、交互、审核和提示词任务指定
 首选模型。调用失败时会按路由及优先级切换到下一套可用配置。保存后无需重启
 服务，后端 API 与独立生成 Worker 会从下一次请求开始使用新配置。API Key
-不会通过管理接口返回明文。对于只接受 SSE/流式 Chat Completions 的自建服务，
-可在对应档案中启用“仅流式响应”，系统会在服务端聚合分片后交给原有生成流程。
+不会通过管理接口返回明文。档案可分别选择 Chat Completions 或 Responses API；
+Codex 渠道提示 `/v1/chat/completions endpoint not supported` 时应选择 Responses API。
+对于只接受 SSE 流式输出的自建服务，可启用“仅流式响应”，系统会在服务端聚合
+Chat Completions 分片或 Responses 语义事件后交给原有生成流程。
 
 不希望在命令或聊天中暴露 API Key 时，可使用交互式连接测试工具：
 
@@ -160,8 +162,9 @@ bash uninstall.sh
 bash test-ai-connection.sh
 ```
 
-工具会隐藏读取 Key（不写入文件），列出全部可用模型，分别测试流式与非流式，
-最后打印可直接填写到管理后台的完整配置和非敏感 JSON。
+工具会隐藏读取 Key（不写入文件），列出全部可用模型，并分别测试 Chat Completions
+和 Responses API 的流式与非流式模式，最后只在检测到有效组合时打印可直接填写到
+管理后台的完整配置和非敏感 JSON。
 
 ### 加密服务器备份
 “管理后台 → 运维中心”可立即创建备份，也可按小时间隔自动创建。备份包含

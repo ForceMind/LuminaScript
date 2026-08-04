@@ -48,6 +48,7 @@ def test_runtime_ai_config_is_persisted_without_exposing_api_key(
             model_id="example-model",
             timeout_seconds=120,
             max_concurrency=3,
+            api_protocol="responses",
             stream_response=True,
         ),
         updated_by="administrator",
@@ -60,6 +61,7 @@ def test_runtime_ai_config_is_persisted_without_exposing_api_key(
     assert loaded.base_url == "https://example.com/v1"
     assert public["api_key_configured"] is True
     assert public["api_key_masked"].endswith("alue")
+    assert public["api_protocol"] == "responses"
     assert public["stream_response"] is True
     assert "api_key" not in public
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
@@ -93,6 +95,7 @@ def test_ai_config_update_keeps_existing_key_when_input_is_blank(monkeypatch):
     assert candidate.model_id == "new-model"
     assert candidate.timeout_seconds == 150
     assert candidate.max_concurrency == 7
+    assert candidate.api_protocol == "chat_completions"
     assert candidate.stream_response is False
 
 
@@ -212,6 +215,83 @@ async def test_generation_aggregates_streaming_chunks(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generation_supports_responses_api(monkeypatch):
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output_text="Responses 完成",
+            usage=SimpleNamespace(total_tokens=13),
+        )
+
+    fake_client = SimpleNamespace(
+        responses=SimpleNamespace(create=fake_create),
+    )
+    runtime = llm_config.LLMRuntimeConfig(
+        api_key="runtime-secret",
+        base_url="https://runtime.example.com/v1",
+        model_id="gpt-5.6-sol",
+        timeout_seconds=45,
+        max_concurrency=2,
+        api_protocol="responses",
+    )
+    monkeypatch.setattr(llm, "get_routed_llm_configs", lambda task_type: [runtime])
+    monkeypatch.setattr(llm, "_get_client", lambda config: fake_client)
+
+    messages = [{"role": "user", "content": "hello"}]
+    content, tokens = await llm.raw_generation(messages)
+
+    assert content == "Responses 完成"
+    assert tokens == 13
+    assert captured["model"] == "gpt-5.6-sol"
+    assert captured["input"] == messages
+    assert captured["stream"] is False
+    assert "temperature" not in captured
+
+
+@pytest.mark.asyncio
+async def test_generation_aggregates_responses_stream_events(monkeypatch):
+    captured = {}
+
+    class FakeStream:
+        def __aiter__(self):
+            async def events():
+                yield SimpleNamespace(type="response.output_text.delta", delta="流式")
+                yield SimpleNamespace(type="response.output_text.delta", delta="完成")
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(usage=SimpleNamespace(total_tokens=17)),
+                )
+            return events()
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return FakeStream()
+
+    fake_client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+    runtime = llm_config.LLMRuntimeConfig(
+        api_key="runtime-secret",
+        base_url="https://runtime.example.com/v1",
+        model_id="gpt-5.6-sol",
+        timeout_seconds=45,
+        max_concurrency=2,
+        api_protocol="responses",
+        stream_response=True,
+    )
+    monkeypatch.setattr(llm, "get_routed_llm_configs", lambda task_type: [runtime])
+    monkeypatch.setattr(llm, "_get_client", lambda config: fake_client)
+
+    content, tokens = await llm.raw_generation(
+        [{"role": "user", "content": "hello"}]
+    )
+
+    assert content == "流式完成"
+    assert tokens == 17
+    assert captured["stream"] is True
+
+
+@pytest.mark.asyncio
 async def test_connection_test_supports_stream_only_profile(monkeypatch):
     class FakeStream:
         def __aiter__(self):
@@ -245,6 +325,33 @@ async def test_connection_test_supports_stream_only_profile(monkeypatch):
         timeout_seconds=45,
         max_concurrency=2,
         stream_response=True,
+    )
+
+    assert await llm_config.test_llm_connection(config) == "OK"
+
+
+@pytest.mark.asyncio
+async def test_connection_test_supports_responses_profile(monkeypatch):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs):
+            assert kwargs["input"] == [{"role": "user", "content": "Reply with OK."}]
+            assert kwargs["stream"] is False
+            return SimpleNamespace(output_text="OK", usage=None)
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(llm_config, "AsyncOpenAI", FakeClient)
+    config = llm_config.LLMRuntimeConfig(
+        api_key="responses-secret",
+        base_url="https://responses.example.com/v1",
+        model_id="gpt-5.6-sol",
+        timeout_seconds=45,
+        max_concurrency=2,
+        api_protocol="responses",
     )
 
     assert await llm_config.test_llm_connection(config) == "OK"
@@ -318,3 +425,123 @@ async def test_real_openai_client_parses_sse_stream(monkeypatch):
 
     assert content == "协议通过"
     assert tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_real_openai_client_parses_responses_protocol():
+    def completed_response():
+        return {
+            "id": "resp-local",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "model": "gpt-5.6-sol",
+            "output": [
+                {
+                    "id": "msg-local",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "annotations": [],
+                            "logprobs": [],
+                            "text": "协议通过",
+                        }
+                    ],
+                }
+            ],
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": None, "summary": None},
+            "store": True,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}, "verbosity": "medium"},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": {
+                "input_tokens": 3,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 5,
+            },
+            "metadata": {},
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert request.url.path == "/v1/responses"
+        assert payload["input"] == [{"role": "user", "content": "hello"}]
+        if not payload["stream"]:
+            return httpx.Response(200, json=completed_response())
+
+        events = [
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "item_id": "msg-local",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "协议",
+                "logprobs": [],
+            },
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": "msg-local",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "通过",
+                "logprobs": [],
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": completed_response(),
+            },
+        ]
+        body = "".join(
+            f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            for event in events
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body.encode("utf-8"),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = AsyncOpenAI(
+        api_key="local-test",
+        base_url="http://local.test/v1",
+        http_client=http_client,
+    )
+    try:
+        for stream in (False, True):
+            runtime = llm_config.LLMRuntimeConfig(
+                api_key="local-test",
+                base_url="http://local.test/v1",
+                model_id="gpt-5.6-sol",
+                timeout_seconds=45,
+                max_concurrency=2,
+                api_protocol="responses",
+                stream_response=stream,
+            )
+            content, tokens = await llm_config.create_llm_text_response(
+                client,
+                runtime,
+                [{"role": "user", "content": "hello"}],
+                temperature=0.7,
+            )
+            assert content == "协议通过"
+            assert tokens == 5
+    finally:
+        await client.close()

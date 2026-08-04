@@ -30,6 +30,7 @@ const aiConfigForm = reactive({
     api_key: '',
     timeout_seconds: 90,
     max_concurrency: 5,
+    api_protocol: 'chat_completions',
     stream_response: false,
 })
 const aiConfigMeta = reactive({
@@ -52,6 +53,7 @@ const profileForm = reactive({
     api_key: '',
     timeout_seconds: 90,
     max_concurrency: 5,
+    api_protocol: 'chat_completions',
     stream_response: false,
     enabled: true,
     priority: 100,
@@ -119,6 +121,7 @@ const applyAiConfigResponse = (data: any) => {
     aiConfigForm.api_key = ''
     aiConfigForm.timeout_seconds = Number(data?.timeout_seconds || 90)
     aiConfigForm.max_concurrency = Number(data?.max_concurrency || 5)
+    aiConfigForm.api_protocol = String(data?.api_protocol || 'chat_completions')
     aiConfigForm.stream_response = Boolean(data?.stream_response)
     aiConfigMeta.api_key_configured = Boolean(data?.api_key_configured)
     aiConfigMeta.api_key_masked = String(data?.api_key_masked || '')
@@ -158,6 +161,7 @@ const buildAiConfigPayload = (clearApiKey = false) => ({
     clear_api_key: clearApiKey,
     timeout_seconds: aiConfigForm.timeout_seconds,
     max_concurrency: aiConfigForm.max_concurrency,
+    api_protocol: aiConfigForm.api_protocol,
     stream_response: aiConfigForm.stream_response,
 })
 
@@ -238,6 +242,7 @@ const openProfileDialog = (profile?: any) => {
     profileForm.api_key = ''
     profileForm.timeout_seconds = Number(profile?.timeout_seconds || 90)
     profileForm.max_concurrency = Number(profile?.max_concurrency || 5)
+    profileForm.api_protocol = String(profile?.api_protocol || 'chat_completions')
     profileForm.stream_response = Boolean(profile?.stream_response)
     profileForm.enabled = profile?.enabled !== false
     profileForm.priority = Number(profile?.priority ?? 100)
@@ -259,6 +264,7 @@ const saveAiProfile = async () => {
             clear_api_key: false,
             timeout_seconds: profileForm.timeout_seconds,
             max_concurrency: profileForm.max_concurrency,
+            api_protocol: profileForm.api_protocol,
             stream_response: profileForm.stream_response,
             enabled: profileForm.enabled,
             priority: profileForm.priority,
@@ -753,6 +759,16 @@ onMounted(() => {
                             </div>
                         </el-form-item>
 
+                        <el-form-item label="接口协议" required>
+                            <el-select v-model="aiConfigForm.api_protocol" class="!w-full">
+                                <el-option label="Chat Completions（/chat/completions）" value="chat_completions" />
+                                <el-option label="Responses API（/responses，Codex 渠道）" value="responses" />
+                            </el-select>
+                            <span class="text-xs text-gray-400 mt-1">
+                                遇到 “/v1/chat/completions endpoint not supported” 时请选择 Responses API。
+                            </span>
+                        </el-form-item>
+
                         <el-form-item label="Base URL" required>
                             <el-input
                                 v-model="aiConfigForm.base_url"
@@ -842,6 +858,9 @@ onMounted(() => {
                     <el-table :data="aiProfiles" size="small" border>
                         <el-table-column prop="profile_name" label="名称" min-width="130" />
                         <el-table-column prop="model_id" label="模型" min-width="150" />
+                        <el-table-column label="协议" width="120">
+                            <template #default="scope">{{ scope.row.api_protocol === 'responses' ? 'Responses' : 'Chat' }}</template>
+                        </el-table-column>
                         <el-table-column prop="base_url" label="Base URL" min-width="220" show-overflow-tooltip />
                         <el-table-column label="密钥" width="100">
                             <template #default="scope">
@@ -1198,6 +1217,12 @@ onMounted(() => {
             </div>
             <el-form-item label="Base URL" required><el-input v-model="profileForm.base_url" /></el-form-item>
             <el-form-item label="模型 ID" required><el-input v-model="profileForm.model_id" /></el-form-item>
+            <el-form-item label="接口协议" required>
+                <el-select v-model="profileForm.api_protocol" class="!w-full">
+                    <el-option label="Chat Completions（/chat/completions）" value="chat_completions" />
+                    <el-option label="Responses API（/responses，Codex 渠道）" value="responses" />
+                </el-select>
+            </el-form-item>
             <el-form-item label="API Key"><el-input v-model="profileForm.api_key" type="password" show-password placeholder="编辑时留空则保持原密钥" /></el-form-item>
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <el-form-item label="超时（秒）"><el-input-number v-model="profileForm.timeout_seconds" :min="10" :max="600" class="!w-full" /></el-form-item>

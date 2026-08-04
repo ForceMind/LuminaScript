@@ -64,7 +64,7 @@
 
 ### AI 配置
 - `GET /admin/ai-config`：读取当前配置（API Key 仅返回是否已配置及掩码）
-- `PUT /admin/ai-config`：更新 Base URL、模型 ID、API Key、超时和并发数
+- `PUT /admin/ai-config`：更新 Base URL、模型 ID、API Key、接口协议、超时和并发数
 - `POST /admin/ai-config/test`：使用提交的配置测试连接，不保存配置
 - API Key 留空表示保留现有密钥；`clear_api_key=true` 表示清除密钥
 
@@ -73,6 +73,7 @@
 - `PUT /admin/ai-profiles/{profile_id}`：新增或更新档案
 - `DELETE /admin/ai-profiles/{profile_id}`：删除档案（至少保留一个）
 - `PUT /admin/ai-routing`：设置默认档案及各任务的候选档案顺序
+- AI 配置中的 `api_protocol` 可选 `chat_completions`（默认）或 `responses`
 - AI 配置中的 `stream_response=true` 表示上游仅接受流式响应；服务端会聚合 SSE 分片
 
 ### 运维、备份和配额

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -24,6 +24,7 @@ class LLMRuntimeConfig(BaseModel):
     model_id: str = Field(min_length=1, max_length=256)
     timeout_seconds: int = Field(ge=10, le=600)
     max_concurrency: int = Field(ge=1, le=20)
+    api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
     stream_response: bool = False
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
@@ -60,6 +61,7 @@ def _environment_config() -> LLMRuntimeConfig:
         model_id=settings.llm_model_id,
         timeout_seconds=settings.llm_timeout_seconds,
         max_concurrency=settings.llm_max_concurrency,
+        api_protocol=settings.llm_api_protocol,
         stream_response=settings.llm_stream_response,
         source="environment",
         profile_id="environment",
@@ -231,6 +233,7 @@ def public_llm_config(config: LLMRuntimeConfig) -> dict[str, Any]:
         "model_id": config.model_id,
         "timeout_seconds": config.timeout_seconds,
         "max_concurrency": config.max_concurrency,
+        "api_protocol": config.api_protocol,
         "stream_response": config.stream_response,
         "api_key_configured": bool(key),
         "api_key_masked": masked_key,
@@ -244,6 +247,108 @@ def public_llm_config(config: LLMRuntimeConfig) -> dict[str, Any]:
     }
 
 
+def _object_value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _usage_total_tokens(value: Any) -> int:
+    usage = _object_value(value, "usage")
+    return int(_object_value(usage, "total_tokens", 0) or 0)
+
+
+def _chat_stream_delta_text(chunk: Any) -> str:
+    parts: list[str] = []
+    for choice in _object_value(chunk, "choices", []) or []:
+        delta = _object_value(choice, "delta")
+        value = _object_value(delta, "content")
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                text = _object_value(item, "text")
+                if text:
+                    parts.append(str(text))
+    return "".join(parts)
+
+
+def _responses_output_text(response: Any) -> str:
+    output_text = _object_value(response, "output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+
+    parts: list[str] = []
+    for item in _object_value(response, "output", []) or []:
+        if _object_value(item, "type") != "message":
+            continue
+        for content in _object_value(item, "content", []) or []:
+            if _object_value(content, "type") == "output_text":
+                text = _object_value(content, "text")
+                if text:
+                    parts.append(str(text))
+    return "".join(parts)
+
+
+async def create_llm_text_response(
+    client: AsyncOpenAI,
+    config: LLMRuntimeConfig,
+    messages: list[dict[str, Any]],
+    *,
+    temperature: float,
+) -> tuple[str, int]:
+    """Call the profile's configured OpenAI-compatible text endpoint."""
+    if config.api_protocol == "responses":
+        response = await client.responses.create(
+            model=config.model_id,
+            input=messages,
+            stream=config.stream_response,
+        )
+        if not config.stream_response:
+            return _responses_output_text(response), _usage_total_tokens(response)
+
+        parts: list[str] = []
+        usage = 0
+        completed_response = None
+        async for event in response:
+            event_type = str(_object_value(event, "type", "") or "")
+            if event_type == "response.output_text.delta":
+                delta = _object_value(event, "delta")
+                if delta:
+                    parts.append(str(delta))
+            elif event_type == "response.completed":
+                completed_response = _object_value(event, "response")
+                usage = max(usage, _usage_total_tokens(completed_response))
+            elif event_type in {"response.failed", "error"}:
+                failed_response = _object_value(event, "response", event)
+                error = _object_value(failed_response, "error", failed_response)
+                message = _object_value(error, "message", "Responses API 流式请求失败")
+                raise RuntimeError(str(message))
+        content = "".join(parts)
+        if not content and completed_response is not None:
+            content = _responses_output_text(completed_response)
+        return content, usage
+
+    response = await client.chat.completions.create(
+        model=config.model_id,
+        messages=messages,
+        temperature=temperature,
+        stream=config.stream_response,
+    )
+    if not config.stream_response:
+        choices = _object_value(response, "choices", []) or []
+        message = _object_value(choices[0], "message") if choices else None
+        content = str(_object_value(message, "content", "") or "")
+        return content, _usage_total_tokens(response)
+
+    parts: list[str] = []
+    usage = 0
+    async for chunk in response:
+        parts.append(_chat_stream_delta_text(chunk))
+        usage = max(usage, _usage_total_tokens(chunk))
+    return "".join(parts), usage
+
+
 async def test_llm_connection(config: LLMRuntimeConfig) -> str:
     if not config.api_key:
         raise ValueError("请先填写 API Key")
@@ -255,24 +360,13 @@ async def test_llm_connection(config: LLMRuntimeConfig) -> str:
         max_retries=0,
     )
     try:
-        response = await client.chat.completions.create(
-            model=config.model_id,
-            messages=[{"role": "user", "content": "Reply with OK."}],
+        content, _usage = await create_llm_text_response(
+            client,
+            config,
+            [{"role": "user", "content": "Reply with OK."}],
             temperature=0,
-            stream=config.stream_response,
         )
-        if config.stream_response:
-            parts: list[str] = []
-            async for chunk in response:
-                for choice in getattr(chunk, "choices", None) or []:
-                    delta = getattr(choice, "delta", None)
-                    value = getattr(delta, "content", None)
-                    if value:
-                        parts.append(str(value))
-            content = "".join(parts).strip()
-        else:
-            content = str(response.choices[0].message.content or "").strip()
-        return content[:100]
+        return content.strip()[:100]
     finally:
         await client.close()
 
