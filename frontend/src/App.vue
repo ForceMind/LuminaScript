@@ -16,7 +16,6 @@ import {
   SwitchButton,
   DataLine,
   Download,
-  Upload,
   ArrowDown
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -96,8 +95,6 @@ const projectToolsLoading = ref(false)
 const projectVersions = ref<any[]>([])
 const projectMembers = ref<any[]>([])
 const projectJobs = ref<any[]>([])
-const projectImportInput = ref<HTMLInputElement | null>(null)
-const projectImporting = ref(false)
 const myUsage = ref<any>({ daily_tokens: 0, monthly_tokens: 0, daily_limit: 0, monthly_limit: 0 })
 const versionLabel = ref('手动快照')
 const versionDiffVisible = ref(false)
@@ -1187,43 +1184,6 @@ const exportScript = (format: string = 'txt') => {
        .catch(e => ElMessage.error('导出失败'))
 }
 
-const chooseProjectImportFile = () => {
-    projectImportInput.value?.click()
-}
-
-const importProjectArchive = async (event: Event) => {
-    const input = event.target as HTMLInputElement
-    const file = input.files?.[0]
-    if (!file) return
-    if (!file.name.toLowerCase().endsWith('.json')) {
-        ElMessage.warning('请选择由 LuminaScript 导出的 JSON 项目备份')
-        input.value = ''
-        return
-    }
-
-    projectImporting.value = true
-    try {
-        const formData = new FormData()
-        formData.append('file', file)
-        const response = await api.post('/projects/import', formData, {
-            timeout: 120000,
-        })
-        currentProject.value = response.data
-        projectJobs.value = []
-        interaction.value = null
-        scenePromptMap.value = {}
-        scenePromptLoadingMap.value = {}
-        await fetchProjects()
-        ElMessage.success(`项目“${response.data?.title || file.name}”已作为新副本导入`)
-    } catch (e: any) {
-        console.error(e)
-        ElMessage.error(e.response?.data?.detail || '项目导入失败')
-    } finally {
-        projectImporting.value = false
-        input.value = ''
-    }
-}
-
 // Sorted Key Settings Help
 const keySettingsOrder = [
     'title', 'theme', 'tone', 'time_period', 
@@ -1488,29 +1448,16 @@ const copyText = (value: unknown) => {
                  </div>
             </div>
             <div class="flex items-center gap-3">
-                 <input
-                    ref="projectImportInput"
-                    type="file"
-                    accept="application/json,.json"
-                    class="hidden"
-                    @change="importProjectArchive"
-                 />
-                 <el-tooltip content="导入项目备份" placement="bottom">
-                    <el-button plain :icon="Upload" :loading="projectImporting" @click="chooseProjectImportFile">
-                        <span class="hidden xl:inline ml-1">导入</span>
-                    </el-button>
-                 </el-tooltip>
                  <el-button v-if="currentProject?.id" plain @click="openProjectTools">
                     项目工具
                  </el-button>
-                 <el-dropdown v-if="currentProject" @command="exportScript">
+                 <el-dropdown v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @command="exportScript">
                     <el-button plain>
                         <el-icon class="mr-1"><Download /></el-icon> 导出 <el-icon class="el-icon--right"><arrow-down /></el-icon>
                     </el-button>
                     <template #dropdown>
                         <el-dropdown-menu>
-                            <el-dropdown-item command="json">项目备份 (.json，可再次导入)</el-dropdown-item>
-                            <el-dropdown-item divided command="txt">纯文本 (.txt)</el-dropdown-item>
+                            <el-dropdown-item command="txt">纯文本 (.txt)</el-dropdown-item>
                             <el-dropdown-item command="md">Markdown (.md)</el-dropdown-item>
                             <el-dropdown-item command="docx">Word 文档 (.docx)</el-dropdown-item>
                         </el-dropdown-menu>

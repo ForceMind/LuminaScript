@@ -1,22 +1,23 @@
 from datetime import datetime
 import io
+import json
 import zipfile
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException
 from sqlalchemy import select
 
 import database
-import main
 import models
+import auth
 from api.operations_routes import cancel_job, retry_job
 from services import backups
-from services import system_logs
-from services.project_archives import (
-    create_imported_project,
-    encode_project_archive,
-    parse_project_archive,
+from services.admin_imports import (
+    ADMIN_EXPORT_FORMAT,
+    import_admin_export,
+    parse_admin_export,
 )
+from services import system_logs
 from services.project_access import require_project_access
 from services.prompt_templates import get_prompt_addendum
 from services.usage import enforce_user_quota, get_user_usage
@@ -258,67 +259,94 @@ def test_system_log_tail_filter_and_secret_redaction(tmp_path, monkeypatch):
     assert "api_key=***" in result["content"]
 
 
-def test_project_json_archive_round_trip_creates_safe_copy():
-    project = models.Project(
-        id=12,
-        owner_id=1,
-        title="原项目",
-        logline="一名调查员寻找真相",
-        project_type="movie",
-        genre="悬疑",
-        global_context={"ending": "真相揭晓"},
-        global_summary="完整故事",
-        status=models.ProcessingStatus.COMPLETED,
-    )
-    project.scenes.append(
-        models.Scene(
-            scene_index=1,
-            outline="发现线索",
-            content="调查员打开旧箱子。",
-            summary="找到关键照片",
-            status=models.ProcessingStatus.COMPLETED,
-        )
-    )
-
-    raw = encode_project_archive(project, exported_at="2026-08-04T00:00:00+00:00")
-    archive = parse_project_archive(raw)
-    imported = create_imported_project(archive, owner_id=99)
-
-    assert imported.owner_id == 99
-    assert imported.title == "原项目（导入副本）"
-    assert imported.total_tokens == 0
-    assert imported.status == models.ProcessingStatus.COMPLETED
-    assert len(imported.scenes) == 1
-    assert imported.scenes[0].content == "调查员打开旧箱子。"
-
-
 @pytest.mark.asyncio
-async def test_project_import_endpoint_persists_archive_as_new_owner_copy():
-    source = models.Project(
-        title="可导入项目",
-        logline="一个完整的故事",
-        project_type="short",
-        status=models.ProcessingStatus.COMPLETED,
-    )
-    source.scenes.append(
-        models.Scene(
-            scene_index=1,
-            outline="开场",
-            content="画面亮起。",
-            status=models.ProcessingStatus.COMPLETED,
-        )
-    )
-    raw = encode_project_archive(source, exported_at="2026-08-04T00:00:00+00:00")
+async def test_admin_export_import_safely_merges_users_projects_and_logs():
+    password_hash = auth.get_password_hash("Archived-password-123")
+    manifest = {"format": ADMIN_EXPORT_FORMAT, "exported_by": "old-admin"}
+    users = [
+        {
+            "id": 41,
+            "username": "archived-user",
+            "is_admin": False,
+            "hashed_password": password_hash,
+        }
+    ]
+    projects = [
+        {
+            "id": 88,
+            "owner_id": 41,
+            "owner_username": "archived-user",
+            "title": "归档项目",
+            "logline": "一个被重新导入的故事",
+            "project_type": "movie",
+            "status": "ProcessingStatus.COMPLETED",
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "outline": "开场",
+                    "content": "画面亮起。",
+                    "status": "ProcessingStatus.COMPLETED",
+                }
+            ],
+        }
+    ]
+    login_logs = [
+        {
+            "user_id": 41,
+            "user_name": "archived-user",
+            "ip_address": "127.0.0.1",
+            "status": "success",
+            "timestamp": "2026-08-04T00:00:00",
+        }
+    ]
+    ai_logs = [
+        {
+            "user_id": 41,
+            "project_id": 88,
+            "action": "write_scene_1",
+            "prompt": "prompt",
+            "response": "response",
+            "tokens": 12,
+            "status": "success",
+            "timestamp": "2026-08-04T00:00:01",
+        }
+    ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in {
+            "manifest.json": manifest,
+            "users.json": users,
+            "projects.json": projects,
+            "login_logs.json": login_logs,
+            "ai_logs.json": ai_logs,
+        }.items():
+            archive.writestr(name, json.dumps(content, ensure_ascii=False))
 
+    payload = parse_admin_export(buffer.getvalue())
     async with database.SessionLocal() as session:
-        owner = models.User(id=20, username="importer", hashed_password="unused")
-        session.add(owner)
+        admin = models.User(
+            id=1,
+            username="current-admin",
+            hashed_password="unused",
+            is_admin=1,
+        )
+        session.add(admin)
         await session.commit()
-        upload = UploadFile(filename="project.json", file=io.BytesIO(raw))
 
-        imported = await main.import_project(upload, db=session, current_user=owner)
+        result = await import_admin_export(session, payload, importing_admin=admin)
 
-        assert imported.owner_id == owner.id
-        assert imported.title == "可导入项目（导入副本）"
-        assert len(imported.scenes) == 1
-        assert imported.scenes[0].content == "画面亮起。"
+        imported_user = await session.scalar(
+            select(models.User).where(models.User.username == "archived-user")
+        )
+        imported_project = await session.scalar(
+            select(models.Project).where(models.Project.owner_id == imported_user.id)
+        )
+        imported_ai_log = await session.scalar(select(models.AIInteractionLog))
+        assert result["created_users"] == 1
+        assert result["created_projects"] == 1
+        assert result["created_scenes"] == 1
+        assert result["temporary_passwords"] == []
+        assert imported_user.hashed_password == password_hash
+        assert imported_project.title == "归档项目（后台导入）"
+        assert imported_project.status == models.ProcessingStatus.COMPLETED
+        assert imported_ai_log.project_id == imported_project.id

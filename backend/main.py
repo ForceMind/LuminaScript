@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, File, HTTPException, BackgroundTasks, Query, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
@@ -9,7 +9,6 @@ import asyncio
 import json
 import math
 import re
-from datetime import datetime, timezone
 
 from database import get_db, SessionLocal
 import models
@@ -61,12 +60,6 @@ from services.project_access import (
     require_project_access,
 )
 from services.prompt_templates import get_prompt_addendum
-from services.project_archives import (
-    MAX_ARCHIVE_BYTES,
-    create_imported_project,
-    encode_project_archive,
-    parse_project_archive,
-)
 from services.usage import enforce_user_quota
 from services.versions import create_project_version
 
@@ -772,40 +765,6 @@ async def create_project(
     )
     return result.scalars().first()
 
-
-@app.post("/projects/import", response_model=schemas.ProjectResponse)
-async def import_project(
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
-):
-    filename = str(file.filename or "").lower()
-    if filename and not filename.endswith(".json"):
-        raise HTTPException(status_code=400, detail="请选择 LuminaScript 导出的 JSON 项目备份")
-    raw = await file.read(MAX_ARCHIVE_BYTES + 1)
-    try:
-        archive = parse_project_archive(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    project = create_imported_project(archive, owner_id=current_user.id)
-    db.add(project)
-    await db.commit()
-
-    result = await db.execute(
-        select(models.Project)
-        .where(models.Project.id == project.id)
-        .options(selectinload(models.Project.scenes))
-    )
-    imported = result.scalars().first()
-    imported.access_role = "owner"
-    logger.info(
-        "用户 %s 导入项目 ID=%s，场次数=%s",
-        current_user.username,
-        imported.id,
-        len(imported.scenes or []),
-    )
-    return imported
 
 @app.get("/projects/", response_model=List[schemas.ProjectListResponse])
 async def list_projects(
@@ -1866,17 +1825,6 @@ async def export_project(
     project_scenes = sorted(project.scenes, key=lambda s: s.scene_index)
     context = project.global_context or {}
     
-    if format == "json":
-        content = encode_project_archive(
-            project,
-            exported_at=datetime.now(timezone.utc).isoformat(),
-        )
-        return StreamingResponse(
-            io.BytesIO(content),
-            media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}.json"},
-        )
-
     if format == "docx":
         if not DocxDocument:
             raise HTTPException(501, "Word export library (python-docx) not installed on server.")

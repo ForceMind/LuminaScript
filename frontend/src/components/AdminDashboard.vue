@@ -4,7 +4,7 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import { DataLine, Download } from '@element-plus/icons-vue'
+import { DataLine, Download, Upload } from '@element-plus/icons-vue'
 
 const props = defineProps<{ token: string; currentUserId: number }>()
 const emit = defineEmits(['close'])
@@ -17,6 +17,10 @@ const aiUserStats = ref<any[]>([])
 const aiContentLogs = ref<any[]>([])
 const loading = ref(false)
 const exportLoading = ref(false)
+const adminImportLoading = ref(false)
+const adminImportInput = ref<HTMLInputElement | null>(null)
+const adminImportResultVisible = ref(false)
+const adminImportResult = ref<any | null>(null)
 const aiDetailLoading = ref(false)
 const aiDetailVisible = ref(false)
 const aiDetail = ref<any | null>(null)
@@ -846,6 +850,65 @@ const downloadAllUserData = async () => {
     }
 }
 
+const chooseAdminImportFile = () => {
+    adminImportInput.value?.click()
+}
+
+const importAllUserData = async (event: Event) => {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+        ElMessage.warning('请选择后台导出的 ZIP 文件')
+        input.value = ''
+        return
+    }
+
+    try {
+        await ElMessageBox.confirm(
+            '导入会合并用户、项目和日志；已有同名用户不会被覆盖，项目会创建为“后台导入”副本，日志会追加。不会直接替换当前数据库。确定继续吗？',
+            '导入后台数据',
+            {
+                type: 'warning',
+                confirmButtonText: '开始导入',
+                cancelButtonText: '取消',
+            },
+        )
+        adminImportLoading.value = true
+        const formData = new FormData()
+        formData.append('file', file)
+        const response = await api.post('/admin/import/all', formData, { timeout: 600000 })
+        adminImportResult.value = response.data || {}
+        adminImportResultVisible.value = true
+        await fetchUsers()
+        ElMessage.success(`后台数据导入完成，共导入 ${response.data?.created_projects || 0} 个项目`)
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(getApiErrorMessage(error, '后台数据导入失败'))
+        }
+    } finally {
+        adminImportLoading.value = false
+        input.value = ''
+    }
+}
+
+const downloadTemporaryPasswords = () => {
+    const credentials = Array.isArray(adminImportResult.value?.temporary_passwords)
+        ? adminImportResult.value.temporary_passwords
+        : []
+    if (!credentials.length) return
+    const content = credentials
+        .map((item: any) => `${String(item.username || '')}\t${String(item.password || '')}`)
+        .join('\n')
+    const blob = new Blob([`用户名\t临时密码\n${content}\n`], { type: 'text/plain;charset=utf-8' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `luminascript-import-passwords-${Date.now()}.txt`
+    link.click()
+    window.URL.revokeObjectURL(url)
+}
+
 const handleTabChange = () => {
     if (activeTab.value === 'users') fetchUsers()
     if (activeTab.value === 'ai_config') {
@@ -906,6 +969,16 @@ onUnmounted(() => {
                 系统后台管理
             </h1>
             <div class="flex items-center gap-3 flex-wrap">
+                <input
+                    ref="adminImportInput"
+                    type="file"
+                    accept="application/zip,.zip"
+                    class="hidden"
+                    @change="importAllUserData"
+                />
+                <el-button :icon="Upload" :loading="adminImportLoading" @click="chooseAdminImportFile">
+                    导入后台数据
+                </el-button>
                 <el-button type="primary" :icon="Download" :loading="exportLoading" @click="downloadAllUserData">
                     导出全部用户数据
                 </el-button>
@@ -1504,6 +1577,33 @@ onUnmounted(() => {
                 </div>
             </template>
         </div>
+    </el-dialog>
+
+    <el-dialog v-model="adminImportResultVisible" width="680px" title="后台数据导入结果" destroy-on-close>
+        <div v-if="adminImportResult" class="space-y-4">
+            <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 text-center">
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">新增用户</div><div class="text-xl font-bold">{{ adminImportResult.created_users || 0 }}</div></div>
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">匹配已有用户</div><div class="text-xl font-bold">{{ adminImportResult.matched_users || 0 }}</div></div>
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">导入项目</div><div class="text-xl font-bold">{{ adminImportResult.created_projects || 0 }}</div></div>
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">导入场次</div><div class="text-xl font-bold">{{ adminImportResult.created_scenes || 0 }}</div></div>
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">登录日志</div><div class="text-xl font-bold">{{ adminImportResult.created_login_logs || 0 }}</div></div>
+                <div class="rounded border bg-gray-50 p-3"><div class="text-xs text-gray-400">AI 日志</div><div class="text-xl font-bold">{{ adminImportResult.created_ai_logs || 0 }}</div></div>
+            </div>
+            <template v-if="adminImportResult.temporary_passwords?.length">
+                <el-alert
+                    title="旧版导出包中的新用户没有密码哈希，系统已生成一次性临时密码。请立即下载并妥善保存。"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                />
+                <el-table :data="adminImportResult.temporary_passwords" size="small" border max-height="260">
+                    <el-table-column prop="username" label="用户名" min-width="180" />
+                    <el-table-column prop="password" label="临时密码" min-width="260" />
+                </el-table>
+                <el-button type="warning" plain @click="downloadTemporaryPasswords">下载临时密码</el-button>
+            </template>
+        </div>
+        <template #footer><el-button type="primary" @click="adminImportResultVisible = false">完成</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="profileDialogVisible" width="680px" title="AI 配置档案" destroy-on-close>

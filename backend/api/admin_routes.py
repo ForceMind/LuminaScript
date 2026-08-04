@@ -9,7 +9,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 import zipfile
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -21,6 +21,12 @@ import models
 import schemas
 from api.dependencies import require_admin
 from database import get_db
+from services.admin_imports import (
+    ADMIN_EXPORT_FORMAT,
+    MAX_ADMIN_IMPORT_BYTES,
+    import_admin_export,
+    parse_admin_export,
+)
 from services.llm_config import (
     LLMProfileStore,
     LLMRuntimeConfig,
@@ -699,6 +705,7 @@ async def export_all_data(
     archive_name = f"luminascript_admin_export_{export_time}.zip"
     database_paths = iter_export_database_paths()
     manifest = {
+        "format": ADMIN_EXPORT_FORMAT,
         "exported_at": datetime.now().isoformat(),
         "exported_by": admin.username,
         "counts": {
@@ -728,6 +735,9 @@ async def export_all_data(
                         "id": user.id,
                         "username": user.username,
                         "is_admin": bool(user.is_admin),
+                        "hashed_password": user.hashed_password,
+                        "daily_token_limit": int(user.daily_token_limit or 0),
+                        "monthly_token_limit": int(user.monthly_token_limit or 0),
                     }
                     for user in users
                 ],
@@ -790,3 +800,40 @@ async def export_all_data(
             )
         },
     )
+
+
+@router.post("/import/all")
+async def import_all_data(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    admin: models.User = Depends(require_admin),
+):
+    filename = str(file.filename or "").lower()
+    if filename and not filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="请选择后台导出的 ZIP 文件")
+    raw = await file.read(MAX_ADMIN_IMPORT_BYTES + 1)
+    try:
+        payload = parse_admin_export(raw)
+        result = await import_admin_export(
+            db,
+            payload,
+            importing_admin=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "Administrator %s failed to import admin archive: %s",
+            admin.id,
+            exc.__class__.__name__,
+        )
+        raise HTTPException(status_code=500, detail="后台数据导入失败，所有更改已回滚") from exc
+
+    logger.warning(
+        "Administrator %s imported admin archive: users=%s projects=%s scenes=%s",
+        admin.id,
+        result["created_users"],
+        result["created_projects"],
+        result["created_scenes"],
+    )
+    return result
