@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { reactive, ref, onMounted, watch } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -21,6 +21,64 @@ const aiDetailLoading = ref(false)
 const aiDetailVisible = ref(false)
 const aiDetail = ref<any | null>(null)
 const roleUpdatingId = ref<number | null>(null)
+const aiConfigLoading = ref(false)
+const aiConfigSaving = ref(false)
+const aiConfigTesting = ref(false)
+const aiConfigForm = reactive({
+    base_url: '',
+    model_id: '',
+    api_key: '',
+    timeout_seconds: 90,
+    max_concurrency: 5,
+})
+const aiConfigMeta = reactive({
+    api_key_configured: false,
+    api_key_masked: '',
+    source: 'environment',
+    updated_at: '',
+    updated_by: '',
+})
+const aiProfiles = ref<any[]>([])
+const aiRoutes = reactive<Record<string, string[]>>({})
+const activeAiProfile = ref('')
+const profileDialogVisible = ref(false)
+const profileSaving = ref(false)
+const profileForm = reactive({
+    profile_id: '',
+    name: '',
+    base_url: '',
+    model_id: '',
+    api_key: '',
+    timeout_seconds: 90,
+    max_concurrency: 5,
+    enabled: true,
+    priority: 100,
+})
+const operationsLoading = ref(false)
+const operationJobs = ref<any[]>([])
+const operationAlerts = reactive({ counts: {} as Record<string, number>, recent_failures: [] as any[] })
+const backups = ref<any[]>([])
+const backupCreating = ref(false)
+const backupSettings = reactive({
+    enabled: false,
+    interval_hours: 24,
+    retention_count: 14,
+    encrypt: true,
+    mirror_directory: '',
+})
+const usageItems = ref<any[]>([])
+const quotaSavingId = ref<number | null>(null)
+const promptTemplates = ref<any[]>([])
+const promptDialogVisible = ref(false)
+const promptSaving = ref(false)
+const promptForm = reactive({
+    id: null as number | null,
+    name: '',
+    stage: 'outline',
+    project_type: 'all',
+    content: '',
+    enabled: true,
+})
 
 const loginPage = ref(1)
 const loginPageSize = ref(20)
@@ -44,6 +102,385 @@ api.interceptors.request.use((config) => {
 
 const getAiStatusType = (status?: string) => {
     return status === 'failed' ? 'danger' : 'success'
+}
+
+const getApiErrorMessage = (error: any, fallback: string) => {
+    const detail = error?.response?.data?.detail
+    if (typeof detail === 'string' && detail.trim()) return detail
+    if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg)
+    return fallback
+}
+
+const applyAiConfigResponse = (data: any) => {
+    aiConfigForm.base_url = String(data?.base_url || '')
+    aiConfigForm.model_id = String(data?.model_id || '')
+    aiConfigForm.api_key = ''
+    aiConfigForm.timeout_seconds = Number(data?.timeout_seconds || 90)
+    aiConfigForm.max_concurrency = Number(data?.max_concurrency || 5)
+    aiConfigMeta.api_key_configured = Boolean(data?.api_key_configured)
+    aiConfigMeta.api_key_masked = String(data?.api_key_masked || '')
+    aiConfigMeta.source = String(data?.source || 'environment')
+    aiConfigMeta.updated_at = String(data?.updated_at || '')
+    aiConfigMeta.updated_by = String(data?.updated_by || '')
+}
+
+const fetchAiConfig = async () => {
+    aiConfigLoading.value = true
+    try {
+        const response = await api.get('/admin/ai-config')
+        applyAiConfigResponse(response.data)
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '无法获取 AI 配置'))
+    } finally {
+        aiConfigLoading.value = false
+    }
+}
+
+const validateAiConfig = () => {
+    if (!aiConfigForm.base_url.trim() || !aiConfigForm.model_id.trim()) {
+        ElMessage.warning('请完整填写 Base URL 和模型 ID')
+        return false
+    }
+    if (!aiConfigMeta.api_key_configured && !aiConfigForm.api_key.trim()) {
+        ElMessage.warning('请填写 API Key')
+        return false
+    }
+    return true
+}
+
+const buildAiConfigPayload = (clearApiKey = false) => ({
+    base_url: aiConfigForm.base_url.trim(),
+    model_id: aiConfigForm.model_id.trim(),
+    api_key: aiConfigForm.api_key.trim() || null,
+    clear_api_key: clearApiKey,
+    timeout_seconds: aiConfigForm.timeout_seconds,
+    max_concurrency: aiConfigForm.max_concurrency,
+})
+
+const saveAiConfig = async () => {
+    if (!validateAiConfig()) return
+    aiConfigSaving.value = true
+    try {
+        const response = await api.put('/admin/ai-config', buildAiConfigPayload())
+        applyAiConfigResponse(response.data)
+        ElMessage.success('AI 配置已保存，将从下一次生成请求开始生效')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存 AI 配置失败'))
+    } finally {
+        aiConfigSaving.value = false
+    }
+}
+
+const testAiConfig = async () => {
+    if (!validateAiConfig()) return
+    aiConfigTesting.value = true
+    try {
+        const response = await api.post('/admin/ai-config/test', buildAiConfigPayload())
+        const preview = String(response.data?.response_preview || '').trim()
+        ElMessage.success(preview ? `连接成功：${preview}` : 'AI 连接测试成功')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, 'AI 连接测试失败'))
+    } finally {
+        aiConfigTesting.value = false
+    }
+}
+
+const clearAiApiKey = async () => {
+    try {
+        await ElMessageBox.confirm(
+            '清除后 AI 生成功能将不可用，确定继续吗？',
+            '清除 API Key',
+            { type: 'warning', confirmButtonText: '确定清除', cancelButtonText: '取消' },
+        )
+        aiConfigSaving.value = true
+        const response = await api.put('/admin/ai-config', buildAiConfigPayload(true))
+        applyAiConfigResponse(response.data)
+        ElMessage.success('API Key 已清除')
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(getApiErrorMessage(error, '清除 API Key 失败'))
+        }
+    } finally {
+        aiConfigSaving.value = false
+    }
+}
+
+const aiTaskTypes = [
+    { value: 'planning', label: '故事规划' },
+    { value: 'interaction', label: '交互设定' },
+    { value: 'outline', label: '分场大纲' },
+    { value: 'content', label: '正文生成' },
+    { value: 'review', label: '内容审核' },
+    { value: 'prompt', label: '提示词转写' },
+]
+
+const fetchAiProfiles = async () => {
+    try {
+        const response = await api.get('/admin/ai-profiles')
+        aiProfiles.value = Array.isArray(response.data?.profiles) ? response.data.profiles : []
+        activeAiProfile.value = String(response.data?.active_profile || '')
+        Object.keys(aiRoutes).forEach((key) => delete aiRoutes[key])
+        Object.assign(aiRoutes, response.data?.routes || {})
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '无法获取多模型配置'))
+    }
+}
+
+const openProfileDialog = (profile?: any) => {
+    profileForm.profile_id = String(profile?.profile_id || `model-${Date.now()}`)
+    profileForm.name = String(profile?.profile_name || '')
+    profileForm.base_url = String(profile?.base_url || aiConfigForm.base_url || '')
+    profileForm.model_id = String(profile?.model_id || '')
+    profileForm.api_key = ''
+    profileForm.timeout_seconds = Number(profile?.timeout_seconds || 90)
+    profileForm.max_concurrency = Number(profile?.max_concurrency || 5)
+    profileForm.enabled = profile?.enabled !== false
+    profileForm.priority = Number(profile?.priority ?? 100)
+    profileDialogVisible.value = true
+}
+
+const saveAiProfile = async () => {
+    if (!profileForm.profile_id.trim() || !profileForm.name.trim() || !profileForm.base_url.trim() || !profileForm.model_id.trim()) {
+        ElMessage.warning('请完整填写配置档案信息')
+        return
+    }
+    profileSaving.value = true
+    try {
+        await api.put(`/admin/ai-profiles/${encodeURIComponent(profileForm.profile_id.trim())}`, {
+            name: profileForm.name.trim(),
+            base_url: profileForm.base_url.trim(),
+            model_id: profileForm.model_id.trim(),
+            api_key: profileForm.api_key.trim() || null,
+            clear_api_key: false,
+            timeout_seconds: profileForm.timeout_seconds,
+            max_concurrency: profileForm.max_concurrency,
+            enabled: profileForm.enabled,
+            priority: profileForm.priority,
+        })
+        profileDialogVisible.value = false
+        await fetchAiProfiles()
+        await fetchAiConfig()
+        ElMessage.success('AI 配置档案已保存')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存 AI 配置档案失败'))
+    } finally {
+        profileSaving.value = false
+    }
+}
+
+const deleteAiProfile = async (profile: any) => {
+    try {
+        await ElMessageBox.confirm(`确定删除“${profile.profile_name}”吗？`, '删除 AI 配置档案', { type: 'warning' })
+        await api.delete(`/admin/ai-profiles/${encodeURIComponent(profile.profile_id)}`)
+        await fetchAiProfiles()
+        await fetchAiConfig()
+        ElMessage.success('配置档案已删除')
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(getApiErrorMessage(error, '删除配置档案失败'))
+        }
+    }
+}
+
+const saveAiRouting = async () => {
+    try {
+        await api.put('/admin/ai-routing', {
+            active_profile: activeAiProfile.value,
+            routes: Object.fromEntries(
+                aiTaskTypes.map((item) => [item.value, aiRoutes[item.value] || []]),
+            ),
+        })
+        await fetchAiProfiles()
+        await fetchAiConfig()
+        ElMessage.success('模型路由与故障切换顺序已保存')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存模型路由失败'))
+    }
+}
+
+const fetchOperations = async () => {
+    operationsLoading.value = true
+    try {
+        const [jobsResponse, alertsResponse, backupsResponse, settingsResponse] = await Promise.all([
+            api.get('/admin/ops/jobs'),
+            api.get('/admin/ops/alerts'),
+            api.get('/admin/ops/backups'),
+            api.get('/admin/ops/backup-settings'),
+        ])
+        operationJobs.value = jobsResponse.data?.items || []
+        operationAlerts.counts = alertsResponse.data?.counts || {}
+        operationAlerts.recent_failures = alertsResponse.data?.recent_failures || []
+        backups.value = backupsResponse.data?.items || []
+        Object.assign(backupSettings, settingsResponse.data || {})
+        backupSettings.mirror_directory = String(settingsResponse.data?.mirror_directory || '')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '无法获取运维数据'))
+    } finally {
+        operationsLoading.value = false
+    }
+}
+
+const saveBackupSettings = async () => {
+    try {
+        await api.put('/admin/ops/backup-settings', {
+            ...backupSettings,
+            mirror_directory: backupSettings.mirror_directory.trim() || null,
+        })
+        ElMessage.success('定时备份设置已保存')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存备份设置失败'))
+    }
+}
+
+const createServerBackup = async () => {
+    backupCreating.value = true
+    try {
+        await api.post('/admin/ops/backups')
+        await fetchOperations()
+        ElMessage.success('服务器备份已创建')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '创建服务器备份失败'))
+    } finally {
+        backupCreating.value = false
+    }
+}
+
+const downloadServerBackup = async (item: any) => {
+    try {
+        const response = await api.get(`/admin/ops/backups/${item.id}/download`, { responseType: 'blob' })
+        const url = window.URL.createObjectURL(new Blob([response.data]))
+        const link = document.createElement('a')
+        link.href = url
+        link.download = item.filename
+        link.click()
+        window.URL.revokeObjectURL(url)
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '下载备份失败'))
+    }
+}
+
+const restoreServerBackup = async (item: any) => {
+    try {
+        await ElMessageBox.confirm(
+            '备份中的项目将以“恢复副本”形式导入，不覆盖当前项目。确定继续吗？',
+            '恢复服务器备份',
+            { type: 'warning' },
+        )
+        const response = await api.post(`/admin/ops/backups/${item.id}/restore`, { confirm: true })
+        ElMessage.success(`已恢复 ${response.data?.project_count || 0} 个项目副本`)
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(getApiErrorMessage(error, '恢复备份失败'))
+        }
+    }
+}
+
+const adminCancelJob = async (item: any) => {
+    try {
+        await api.post(`/admin/ops/jobs/${item.id}/cancel`)
+        await fetchOperations()
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '取消任务失败'))
+    }
+}
+
+const adminRetryJob = async (item: any) => {
+    try {
+        await api.post(`/admin/ops/jobs/${item.id}/retry`)
+        await fetchOperations()
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '重试任务失败'))
+    }
+}
+
+const fetchUsage = async () => {
+    loading.value = true
+    try {
+        const response = await api.get('/admin/ops/usage')
+        usageItems.value = response.data?.items || []
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '无法获取用量数据'))
+    } finally {
+        loading.value = false
+    }
+}
+
+const saveUserQuota = async (item: any) => {
+    quotaSavingId.value = item.user_id
+    try {
+        await api.patch(`/admin/ops/users/${item.user_id}/quota`, {
+            daily_token_limit: Number(item.daily_limit || 0),
+            monthly_token_limit: Number(item.monthly_limit || 0),
+        })
+        ElMessage.success('用户额度已保存')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存用户额度失败'))
+    } finally {
+        quotaSavingId.value = null
+    }
+}
+
+const fetchPromptTemplates = async () => {
+    loading.value = true
+    try {
+        const response = await api.get('/admin/ops/prompt-templates')
+        promptTemplates.value = response.data?.items || []
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '无法获取 Prompt 模板'))
+    } finally {
+        loading.value = false
+    }
+}
+
+const openPromptDialog = (item?: any) => {
+    promptForm.id = item?.id || null
+    promptForm.name = String(item?.name || '')
+    promptForm.stage = String(item?.stage || 'outline')
+    promptForm.project_type = String(item?.project_type || 'all')
+    promptForm.content = String(item?.content || '')
+    promptForm.enabled = item?.enabled !== false
+    promptDialogVisible.value = true
+}
+
+const savePromptTemplate = async () => {
+    if (!promptForm.name.trim() || !promptForm.content.trim()) {
+        ElMessage.warning('请填写模板名称和内容')
+        return
+    }
+    promptSaving.value = true
+    try {
+        const payload = {
+            name: promptForm.name.trim(),
+            stage: promptForm.stage,
+            project_type: promptForm.project_type,
+            content: promptForm.content,
+            enabled: promptForm.enabled,
+        }
+        if (promptForm.id) {
+            await api.put(`/admin/ops/prompt-templates/${promptForm.id}`, payload)
+        } else {
+            await api.post('/admin/ops/prompt-templates', payload)
+        }
+        promptDialogVisible.value = false
+        await fetchPromptTemplates()
+        ElMessage.success('Prompt 模板已保存')
+    } catch (error: any) {
+        ElMessage.error(getApiErrorMessage(error, '保存 Prompt 模板失败'))
+    } finally {
+        promptSaving.value = false
+    }
+}
+
+const deletePromptTemplate = async (item: any) => {
+    try {
+        await ElMessageBox.confirm(`确定删除模板“${item.name}”吗？`, '删除模板', { type: 'warning' })
+        await api.delete(`/admin/ops/prompt-templates/${item.id}`)
+        await fetchPromptTemplates()
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(getApiErrorMessage(error, '删除模板失败'))
+        }
+    }
 }
 
 const fetchUsers = async () => {
@@ -215,6 +652,13 @@ const downloadAllUserData = async () => {
 
 const handleTabChange = () => {
     if (activeTab.value === 'users') fetchUsers()
+    if (activeTab.value === 'ai_config') {
+        fetchAiConfig()
+        fetchAiProfiles()
+    }
+    if (activeTab.value === 'operations') fetchOperations()
+    if (activeTab.value === 'usage') fetchUsage()
+    if (activeTab.value === 'prompts') fetchPromptTemplates()
     if (activeTab.value === 'logins') {
         loginPage.value = 1
         fetchLoginLogs()
@@ -280,6 +724,245 @@ onMounted(() => {
                             >
                                 {{ scope.row.is_admin ? '取消管理员' : '设为管理员' }}
                             </el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+            </el-tab-pane>
+
+            <el-tab-pane label="AI 配置" name="ai_config">
+                <div v-loading="aiConfigLoading" class="max-w-3xl py-3">
+                    <el-alert
+                        title="配置保存后无需重启服务，API 与生成 Worker 会在下一次请求时自动使用新配置。"
+                        type="info"
+                        :closable="false"
+                        show-icon
+                        class="mb-6"
+                    />
+
+                    <el-form label-position="top">
+                        <el-form-item label="接口类型">
+                            <div class="flex items-center gap-3">
+                                <el-tag type="primary">OpenAI 兼容接口</el-tag>
+                                <span class="text-xs text-gray-400">支持 OpenAI、兼容网关及私有模型服务</span>
+                            </div>
+                        </el-form-item>
+
+                        <el-form-item label="Base URL" required>
+                            <el-input
+                                v-model="aiConfigForm.base_url"
+                                maxlength="2048"
+                                placeholder="例如：https://api.openai.com/v1"
+                            />
+                        </el-form-item>
+
+                        <el-form-item label="模型 ID" required>
+                            <el-input
+                                v-model="aiConfigForm.model_id"
+                                maxlength="256"
+                                placeholder="例如：gpt-4.1-mini"
+                            />
+                        </el-form-item>
+
+                        <el-form-item label="API Key" :required="!aiConfigMeta.api_key_configured">
+                            <el-input
+                                v-model="aiConfigForm.api_key"
+                                type="password"
+                                show-password
+                                autocomplete="new-password"
+                                maxlength="4096"
+                                :placeholder="aiConfigMeta.api_key_configured ? `已配置 ${aiConfigMeta.api_key_masked}；留空则保持不变` : '请输入 API Key'"
+                            />
+                            <div class="w-full flex items-center justify-between mt-2 gap-4">
+                                <span class="text-xs text-gray-400">出于安全考虑，后台不会返回 API Key 明文。</span>
+                                <el-button
+                                    v-if="aiConfigMeta.api_key_configured"
+                                    link
+                                    type="danger"
+                                    :disabled="aiConfigSaving"
+                                    @click="clearAiApiKey"
+                                >
+                                    清除密钥
+                                </el-button>
+                            </div>
+                        </el-form-item>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                            <el-form-item label="请求超时（秒）">
+                                <el-input-number
+                                    v-model="aiConfigForm.timeout_seconds"
+                                    :min="10"
+                                    :max="600"
+                                    :step="10"
+                                    class="!w-full"
+                                />
+                            </el-form-item>
+                            <el-form-item label="最大并发请求数">
+                                <el-input-number
+                                    v-model="aiConfigForm.max_concurrency"
+                                    :min="1"
+                                    :max="20"
+                                    class="!w-full"
+                                />
+                            </el-form-item>
+                        </div>
+
+                        <div class="flex items-center gap-3 flex-wrap mt-2">
+                            <el-button type="primary" :loading="aiConfigSaving" @click="saveAiConfig">
+                                保存配置
+                            </el-button>
+                            <el-button :loading="aiConfigTesting" @click="testAiConfig">
+                                测试连接
+                            </el-button>
+                            <span class="text-xs text-gray-400">
+                                当前来源：{{ aiConfigMeta.source === 'admin' ? '管理后台配置' : '服务器环境变量' }}
+                                <template v-if="aiConfigMeta.updated_at">
+                                    · {{ new Date(aiConfigMeta.updated_at).toLocaleString() }}
+                                </template>
+                                <template v-if="aiConfigMeta.updated_by">
+                                    · {{ aiConfigMeta.updated_by }}
+                                </template>
+                            </span>
+                        </div>
+                    </el-form>
+
+                    <el-divider content-position="left">多模型档案与故障切换</el-divider>
+                    <div class="flex justify-between items-center mb-3 gap-3 flex-wrap">
+                        <span class="text-sm text-gray-500">同一任务会按路由顺序尝试模型，失败后自动切换到下一个档案。</span>
+                        <el-button type="primary" plain @click="openProfileDialog()">新增配置档案</el-button>
+                    </div>
+                    <el-table :data="aiProfiles" size="small" border>
+                        <el-table-column prop="profile_name" label="名称" min-width="130" />
+                        <el-table-column prop="model_id" label="模型" min-width="150" />
+                        <el-table-column prop="base_url" label="Base URL" min-width="220" show-overflow-tooltip />
+                        <el-table-column label="密钥" width="100">
+                            <template #default="scope">
+                                <el-tag :type="scope.row.api_key_configured ? 'success' : 'danger'" size="small">
+                                    {{ scope.row.api_key_configured ? '已配置' : '未配置' }}
+                                </el-tag>
+                            </template>
+                        </el-table-column>
+                        <el-table-column prop="priority" label="优先级" width="85" />
+                        <el-table-column label="状态" width="80">
+                            <template #default="scope">{{ scope.row.enabled ? '启用' : '停用' }}</template>
+                        </el-table-column>
+                        <el-table-column label="操作" width="140" fixed="right">
+                            <template #default="scope">
+                                <el-button link type="primary" @click="openProfileDialog(scope.row)">编辑</el-button>
+                                <el-button link type="danger" @click="deleteAiProfile(scope.row)">删除</el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+
+                    <div class="mt-5 p-4 rounded border bg-gray-50">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <el-form-item label="默认配置档案" class="!mb-0">
+                                <el-select v-model="activeAiProfile" class="!w-full">
+                                    <el-option v-for="item in aiProfiles" :key="item.profile_id" :label="item.profile_name" :value="item.profile_id" />
+                                </el-select>
+                            </el-form-item>
+                            <el-form-item v-for="task in aiTaskTypes" :key="task.value" :label="`${task.label}路由顺序`" class="!mb-0">
+                                <el-select v-model="aiRoutes[task.value]" multiple class="!w-full" placeholder="默认档案 + 自动故障切换">
+                                    <el-option v-for="item in aiProfiles" :key="item.profile_id" :label="item.profile_name" :value="item.profile_id" />
+                                </el-select>
+                            </el-form-item>
+                        </div>
+                        <el-button class="mt-4" type="primary" @click="saveAiRouting">保存模型路由</el-button>
+                    </div>
+                </div>
+            </el-tab-pane>
+
+            <el-tab-pane label="运维中心" name="operations">
+                <div v-loading="operationsLoading">
+                    <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+                        <div v-for="(count, status) in operationAlerts.counts" :key="status" class="rounded border p-3 bg-gray-50">
+                            <div class="text-xs text-gray-400">{{ status }}</div>
+                            <div class="text-2xl font-bold mt-1">{{ count }}</div>
+                        </div>
+                    </div>
+
+                    <div class="flex justify-between items-center mb-3">
+                        <h3 class="font-semibold">生成任务监控</h3>
+                        <el-button @click="fetchOperations">刷新</el-button>
+                    </div>
+                    <el-table :data="operationJobs" size="small" border max-height="360">
+                        <el-table-column prop="id" label="任务" width="70" />
+                        <el-table-column prop="project_title" label="项目" min-width="150" show-overflow-tooltip />
+                        <el-table-column prop="kind" label="类型" width="150" />
+                        <el-table-column prop="status" label="状态" width="100" />
+                        <el-table-column label="尝试" width="80">
+                            <template #default="scope">{{ scope.row.attempts }}/{{ scope.row.max_attempts }}</template>
+                        </el-table-column>
+                        <el-table-column prop="last_error" label="错误" min-width="220" show-overflow-tooltip />
+                        <el-table-column label="操作" width="150" fixed="right">
+                            <template #default="scope">
+                                <el-button v-if="['queued', 'running'].includes(scope.row.status)" link type="danger" @click="adminCancelJob(scope.row)">取消</el-button>
+                                <el-button v-if="['failed', 'canceled'].includes(scope.row.status)" link type="primary" @click="adminRetryJob(scope.row)">重试</el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+
+                    <el-divider content-position="left">服务器备份与恢复</el-divider>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+                        <el-form-item label="启用定时备份" class="!mb-0"><el-switch v-model="backupSettings.enabled" /></el-form-item>
+                        <el-form-item label="间隔（小时）" class="!mb-0"><el-input-number v-model="backupSettings.interval_hours" :min="1" :max="720" class="!w-full" /></el-form-item>
+                        <el-form-item label="保留份数" class="!mb-0"><el-input-number v-model="backupSettings.retention_count" :min="1" :max="365" class="!w-full" /></el-form-item>
+                        <el-form-item label="加密保存" class="!mb-0"><el-switch v-model="backupSettings.encrypt" /></el-form-item>
+                    </div>
+                    <el-form-item label="异地镜像目录（可填已挂载的 NAS/云盘目录）">
+                        <el-input v-model="backupSettings.mirror_directory" placeholder="留空则只保存在本机 backups/server" />
+                    </el-form-item>
+                    <div class="flex gap-3 mb-4">
+                        <el-button type="primary" @click="saveBackupSettings">保存备份设置</el-button>
+                        <el-button :loading="backupCreating" @click="createServerBackup">立即创建备份</el-button>
+                    </div>
+                    <el-table :data="backups" size="small" border max-height="320">
+                        <el-table-column prop="created_at" label="时间" min-width="180" />
+                        <el-table-column prop="filename" label="文件" min-width="260" show-overflow-tooltip />
+                        <el-table-column prop="backup_type" label="类型" width="100" />
+                        <el-table-column label="大小" width="110"><template #default="scope">{{ Math.ceil(scope.row.size_bytes / 1024) }} KB</template></el-table-column>
+                        <el-table-column label="操作" width="150" fixed="right">
+                            <template #default="scope">
+                                <el-button link type="primary" @click="downloadServerBackup(scope.row)">下载</el-button>
+                                <el-button link type="warning" @click="restoreServerBackup(scope.row)">恢复副本</el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </div>
+            </el-tab-pane>
+
+            <el-tab-pane label="用量与额度" name="usage">
+                <el-alert title="额度填 0 表示不限制；达到日额度或月额度后将暂停新的 AI 请求。" type="info" :closable="false" class="mb-4" />
+                <el-table :data="usageItems" stripe v-loading="loading">
+                    <el-table-column prop="username" label="用户" min-width="130" />
+                    <el-table-column prop="daily_tokens" label="今日 Tokens" min-width="120" />
+                    <el-table-column prop="monthly_tokens" label="本月 Tokens" min-width="120" />
+                    <el-table-column label="每日额度" min-width="170">
+                        <template #default="scope"><el-input-number v-model="scope.row.daily_limit" :min="0" :max="2000000000" class="!w-full" /></template>
+                    </el-table-column>
+                    <el-table-column label="每月额度" min-width="170">
+                        <template #default="scope"><el-input-number v-model="scope.row.monthly_limit" :min="0" :max="2000000000" class="!w-full" /></template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="100">
+                        <template #default="scope"><el-button link type="primary" :loading="quotaSavingId === scope.row.user_id" @click="saveUserQuota(scope.row)">保存</el-button></template>
+                    </el-table-column>
+                </el-table>
+            </el-tab-pane>
+
+            <el-tab-pane label="Prompt 模板" name="prompts">
+                <div class="flex justify-between items-center mb-4">
+                    <span class="text-sm text-gray-500">启用后会自动追加到对应剧本类型和生成阶段。</span>
+                    <el-button type="primary" @click="openPromptDialog()">新增模板</el-button>
+                </div>
+                <el-table :data="promptTemplates" stripe v-loading="loading">
+                    <el-table-column prop="name" label="名称" min-width="150" />
+                    <el-table-column prop="stage" label="阶段" width="110" />
+                    <el-table-column prop="project_type" label="剧本类型" width="110" />
+                    <el-table-column prop="content" label="内容" min-width="260" show-overflow-tooltip />
+                    <el-table-column label="状态" width="80"><template #default="scope">{{ scope.row.enabled ? '启用' : '停用' }}</template></el-table-column>
+                    <el-table-column label="操作" width="130" fixed="right">
+                        <template #default="scope">
+                            <el-button link type="primary" @click="openPromptDialog(scope.row)">编辑</el-button>
+                            <el-button link type="danger" @click="deletePromptTemplate(scope.row)">删除</el-button>
                         </template>
                     </el-table-column>
                 </el-table>
@@ -493,6 +1176,54 @@ onMounted(() => {
                 </div>
             </template>
         </div>
+    </el-dialog>
+
+    <el-dialog v-model="profileDialogVisible" width="680px" title="AI 配置档案" destroy-on-close>
+        <el-form label-position="top">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <el-form-item label="档案 ID" required><el-input v-model="profileForm.profile_id" :disabled="aiProfiles.some((item) => item.profile_id === profileForm.profile_id)" /></el-form-item>
+                <el-form-item label="显示名称" required><el-input v-model="profileForm.name" /></el-form-item>
+            </div>
+            <el-form-item label="Base URL" required><el-input v-model="profileForm.base_url" /></el-form-item>
+            <el-form-item label="模型 ID" required><el-input v-model="profileForm.model_id" /></el-form-item>
+            <el-form-item label="API Key"><el-input v-model="profileForm.api_key" type="password" show-password placeholder="编辑时留空则保持原密钥" /></el-form-item>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <el-form-item label="超时（秒）"><el-input-number v-model="profileForm.timeout_seconds" :min="10" :max="600" class="!w-full" /></el-form-item>
+                <el-form-item label="最大并发"><el-input-number v-model="profileForm.max_concurrency" :min="1" :max="20" class="!w-full" /></el-form-item>
+                <el-form-item label="优先级"><el-input-number v-model="profileForm.priority" :min="0" :max="10000" class="!w-full" /></el-form-item>
+            </div>
+            <el-form-item label="启用"><el-switch v-model="profileForm.enabled" /></el-form-item>
+        </el-form>
+        <template #footer>
+            <el-button @click="profileDialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="profileSaving" @click="saveAiProfile">保存</el-button>
+        </template>
+    </el-dialog>
+
+    <el-dialog v-model="promptDialogVisible" width="720px" title="Prompt 模板" destroy-on-close>
+        <el-form label-position="top">
+            <el-form-item label="模板名称" required><el-input v-model="promptForm.name" /></el-form-item>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <el-form-item label="生成阶段" required>
+                    <el-select v-model="promptForm.stage" class="!w-full">
+                        <el-option label="分场大纲" value="outline" /><el-option label="正文生成" value="content" />
+                        <el-option label="内容审核" value="review" /><el-option label="交互设定" value="interaction" /><el-option label="提示词转写" value="prompt" />
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="剧本类型">
+                    <el-select v-model="promptForm.project_type" class="!w-full">
+                        <el-option label="全部" value="all" /><el-option label="电影" value="movie" /><el-option label="剧集" value="tv" />
+                        <el-option label="短剧" value="short" /><el-option label="短视频" value="short_video" />
+                    </el-select>
+                </el-form-item>
+            </div>
+            <el-form-item label="附加指令" required><el-input v-model="promptForm.content" type="textarea" :rows="10" maxlength="50000" show-word-limit /></el-form-item>
+            <el-form-item label="启用"><el-switch v-model="promptForm.enabled" /></el-form-item>
+        </el-form>
+        <template #footer>
+            <el-button @click="promptDialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="promptSaving" @click="savePromptTemplate">保存</el-button>
+        </template>
     </el-dialog>
 </div>
 </template>

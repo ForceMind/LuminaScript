@@ -27,6 +27,7 @@
 ### 获取项目列表
 - `GET /projects/`
 - 返回轻量列表，不包含分场内容
+- 包含 `access_role`：`owner`、`editor` 或 `viewer`
 
 ### 获取单个项目详情
 - `GET /projects/{project_id}`
@@ -60,6 +61,57 @@
 - `PATCH /admin/users/{user_id}/role`
 - JSON 参数：`is_admin`
 - 不能取消自己的管理员权限，系统至少保留一名管理员
+
+### AI 配置
+- `GET /admin/ai-config`：读取当前配置（API Key 仅返回是否已配置及掩码）
+- `PUT /admin/ai-config`：更新 Base URL、模型 ID、API Key、超时和并发数
+- `POST /admin/ai-config/test`：使用提交的配置测试连接，不保存配置
+- API Key 留空表示保留现有密钥；`clear_api_key=true` 表示清除密钥
+
+### 多 AI 档案与任务路由
+- `GET /admin/ai-profiles`：读取档案、默认档案和任务路由
+- `PUT /admin/ai-profiles/{profile_id}`：新增或更新档案
+- `DELETE /admin/ai-profiles/{profile_id}`：删除档案（至少保留一个）
+- `PUT /admin/ai-routing`：设置默认档案及各任务的候选档案顺序
+
+### 运维、备份和配额
+- `GET /admin/ops/jobs`：最近 200 个生成任务
+- `POST /admin/ops/jobs/{job_id}/cancel`
+- `POST /admin/ops/jobs/{job_id}/retry`
+- `GET /admin/ops/alerts`：各状态数量及最近失败任务
+- `GET|PUT /admin/ops/backup-settings`
+- `POST /admin/ops/backups`：立即创建服务器备份
+- `GET /admin/ops/backups`：备份列表
+- `GET /admin/ops/backups/{backup_id}/download`
+- `POST /admin/ops/backups/{backup_id}/restore`：以副本方式恢复项目，JSON 需 `confirm=true`
+- `GET /admin/ops/usage`：所有用户的当日/当月用量及额度
+- `PATCH /admin/ops/users/{user_id}/quota`：设置每日/月度 Token 额度；`0` 表示不限
+
+### Prompt 模板管理
+- `GET /admin/ops/prompt-templates`
+- `POST /admin/ops/prompt-templates`
+- `PUT|DELETE /admin/ops/prompt-templates/{template_id}`
+- 阶段：`outline`、`content`、`review`、`interaction`、`prompt`
+
+## 项目工具接口
+以下接口需要项目访问权限；写操作要求 `editor` 或 `owner`。
+
+### 版本
+- `GET|POST /projects/{project_id}/versions`
+- `GET /projects/{project_id}/versions/{version_id}/diff`
+- `POST /projects/{project_id}/versions/{version_id}/restore`，JSON 需 `confirm=true`
+
+### 协作成员
+- `GET|POST /projects/{project_id}/members`
+- `PATCH|DELETE /projects/{project_id}/members/{member_id}`
+- 只有所有者可管理成员；角色为 `viewer` 或 `editor`
+
+### 任务与用量
+- `GET /jobs?project_id={project_id}`
+- `POST /jobs/{job_id}/cancel`
+- `POST /jobs/{job_id}/retry`
+- `GET /usage/me`
+- `GET /prompt-templates?stage=content&project_type=movie`
 
 ### 登录日志
 - `GET /admin/logs/login?page=1&page_size=20`

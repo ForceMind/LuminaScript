@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import models
@@ -9,12 +9,18 @@ import models
 async def claim_generation(
     db: AsyncSession,
     project_id: int,
-    owner_id: int,
+    actor_id: int,
 ) -> bool:
+    editor_membership = exists(
+        select(models.ProjectMember.id)
+        .where(models.ProjectMember.project_id == models.Project.id)
+        .where(models.ProjectMember.user_id == actor_id)
+        .where(models.ProjectMember.role == "editor")
+    )
     result = await db.execute(
         update(models.Project)
         .where(models.Project.id == project_id)
-        .where(models.Project.owner_id == owner_id)
+        .where(or_(models.Project.owner_id == actor_id, editor_membership))
         .where(models.Project.status != models.ProcessingStatus.GENERATING)
         .values(status=models.ProcessingStatus.GENERATING)
         .execution_options(synchronize_session=False)

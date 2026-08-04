@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -37,9 +37,27 @@ from services.generation_state import invalidate_scene_prompt_cache
 from services.audit import log_ai_action
 from api.auth_routes import router as auth_router
 from api.admin_routes import router as admin_router
+from api.operations_routes import admin_router as admin_operations_router
+from api.operations_routes import router as operations_router
 from migrate import run_migrations
 from services.admin_provisioning import ensure_admin_policy
 from services.job_queue import CONTENT_JOB, OUTLINE_JOB, enqueue_job
+from services.continuity import (
+    build_content_continuity_context,
+    build_outline_continuity_context,
+    build_story_bible,
+    looks_like_story_restart,
+    summarize_scene_for_continuity,
+)
+from services.backups import backup_scheduler_loop
+from services.project_access import (
+    accessible_project_condition,
+    project_role,
+    require_project_access,
+)
+from services.prompt_templates import get_prompt_addendum
+from services.usage import enforce_user_quota
+from services.versions import create_project_version
 
 # Configure Logging
 logging.basicConfig(
@@ -688,13 +706,23 @@ async def lifespan(_: FastAPI):
 
     await recover_interrupted_generations()
     logger.info("数据库初始化完成，服务准备就绪。")
-    yield
+    backup_task = asyncio.create_task(backup_scheduler_loop())
+    try:
+        yield
+    finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
 
 
 # Initialize App after the startup helpers are defined.
 app = FastAPI(title="LuminaScript API", version="0.1.0", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(operations_router)
+app.include_router(admin_operations_router)
 
 @app.get("/")
 async def root():
@@ -740,12 +768,13 @@ async def list_projects(
 ):
     result = await db.execute(
         select(models.Project)
-        .where(models.Project.owner_id == current_user.id)
+        .where(accessible_project_condition(current_user.id))
         .order_by(models.Project.id.desc())
     )
     projects = result.scalars().all()
     title_updated = False
     for project in projects:
+        project.access_role = await project_role(db, project, current_user.id) or "viewer"
         title_updated = normalize_project_title(project) or title_updated
         title_updated = normalize_project_context(project) or title_updated
 
@@ -761,15 +790,13 @@ async def get_project(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    result = await db.execute(
-        select(models.Project)
-        .where(models.Project.id == project_id)
-        .where(models.Project.owner_id == current_user.id)
-        .options(selectinload(models.Project.scenes))
+    project, role = await require_project_access(
+        db,
+        project_id,
+        current_user.id,
+        load_scenes=True,
     )
-    project = result.scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project.access_role = role
 
     normalized = False
     if normalize_project_title(project):
@@ -788,10 +815,10 @@ async def delete_project(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    project = await db.get(models.Project, project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
+    project, role = await require_project_access(db, project_id, current_user.id)
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="只有项目所有者可以删除项目")
+
     # Mark as failed/deleted to stop background tasks
     project.status = models.ProcessingStatus.FAILED 
     await db.delete(project)
@@ -813,9 +840,13 @@ async def update_project(
     )
     project = result.scalars().first()
 
-    if not project or project.owner_id != current_user.id:
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+    role = await project_role(db, project, current_user.id)
+    if role not in {"owner", "editor"}:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project.access_role = role
+
     if project_update.project_type:
         project.project_type = project_update.project_type
     
@@ -841,14 +872,24 @@ class ContentReviewRequest(BaseModel):
 @app.post("/content/review")
 async def review_content(
     payload: ContentReviewRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
     """
     Review free user text and return whether it should be rewritten,
     plus an AI-generated safe rewrite suggestion.
     """
+    await enforce_user_quota(db, current_user.id)
     try:
-        result = await llm.review_user_input(payload.text)
+        template_instructions = await get_prompt_addendum(
+            db,
+            stage="review",
+            project_type="all",
+        )
+        result = await llm.review_user_input(
+            payload.text,
+            template_instructions=template_instructions,
+        )
         return result
     except Exception as e:
         logger.error(f"Content review failed: {e}")
@@ -863,13 +904,12 @@ async def submit_interaction(
 ):
     logger.info(f"收到项目 {project_id} 的交互回答: Key={interaction.context_key}, Answer={interaction.answer}")
     
-    result = await db.execute(
-        select(models.Project).where(models.Project.id == project_id)
+    project, _ = await require_project_access(
+        db,
+        project_id,
+        current_user.id,
+        minimum_role="editor",
     )
-    project = result.scalars().first()
-    
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Project not found")
 
     # Update context
     # Note: sqlalchemy JSON field needs reassignment to trigger update
@@ -946,9 +986,13 @@ async def analyze_logline(
     Phase 1: Deep Analysis & Setup.
     Iteratively helps the user build the 'Project Bible' by asking questions.
     """
-    project = await db.get(models.Project, project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project, _ = await require_project_access(
+        db,
+        project_id,
+        current_user.id,
+        minimum_role="editor",
+    )
+    await enforce_user_quota(db, project.owner_id)
 
     def with_runtime_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(payload or {})
@@ -1172,6 +1216,11 @@ async def analyze_logline(
     prompt_context = f"Logline: {project.logline}\nCurrent Settings: {json.dumps(normalized_context, ensure_ascii=False)}"
     
     logger.info(f"正在调用 LLM 为步骤 {next_step['key']} 生成选项...")
+    interaction_template = await get_prompt_addendum(
+        db,
+        stage="interaction",
+        project_type=project.project_type,
+    )
     
     # 3.2 For other steps, use LLM to generate context-aware options
     question_data = None
@@ -1182,7 +1231,8 @@ async def analyze_logline(
             question_data, usage = await llm.generate_interaction_options(
                 step_key=next_step["key"],
                 base_question=next_step["question"],
-                context_str=prompt_context
+                context_str=prompt_context,
+                template_instructions=interaction_template,
             )
             background_tasks.add_task(
                 log_ai_action,
@@ -1278,8 +1328,13 @@ async def generate_scenes(
     logger.info(f"收到生成分场大纲请求，项目ID: {project_id}")
     # 1. Update project genre/style based on selected_option
     project = await db.get(models.Project, project_id)
-    if not project or project.owner_id != current_user.id:
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    role = await project_role(db, project, current_user.id)
+    if role not in {"owner", "editor"}:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project.access_role = role
+    await enforce_user_quota(db, project.owner_id)
 
     if not await claim_generation(db, project_id, current_user.id):
         await db.rollback()
@@ -1362,6 +1417,21 @@ async def generate_scenes(
 
     # Force clearing of any old scenes from a previous attempt
     try:
+        existing_scene_count = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(models.Scene)
+                .where(models.Scene.project_id == project_id)
+            )
+            or 0
+        )
+        if existing_scene_count:
+            await create_project_version(
+                db,
+                project_id,
+                current_user.id,
+                "重新生成前自动快照",
+            )
         await db.execute(delete(models.Scene).where(models.Scene.project_id == project_id))
         job = await enqueue_job(
             db,
@@ -1406,7 +1476,18 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
         # Using 1 allows frontend to see each scene pop up.
         batch_size = 1 
         current_idx = 1
-        last_context = "Start of story."
+        generated_scenes: list[models.Scene] = []
+        story_bible = build_story_bible(
+            logline=project.logline,
+            project_type=project.project_type,
+            genre=style_context,
+            global_context=project.global_context or {},
+        )
+        template_instructions = await get_prompt_addendum(
+            db,
+            stage="outline",
+            project_type=project.project_type,
+        )
         
         try:
             while current_idx <= target_count:
@@ -1418,15 +1499,74 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
 
                 end_idx = min(current_idx + batch_size - 1, target_count)
                 logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
+                await enforce_user_quota(db, project.owner_id)
 
+                continuity_context = build_outline_continuity_context(
+                    story_bible=story_bible,
+                    prior_scenes=generated_scenes,
+                    current_index=current_idx,
+                    total_scenes=target_count,
+                )
                 batch_scenes, usage = await llm.generate_scene_batch(
                     project.logline, 
                     style_context, 
                     current_idx, 
                     end_idx, 
-                    previous_context=last_context,
-                    total_target=target_count
+                    previous_context=continuity_context,
+                    total_target=target_count,
+                    template_instructions=template_instructions,
                 )
+                await db.refresh(project)
+                if project.status != models.ProcessingStatus.GENERATING:
+                    logger.info(
+                        "[Task] Outline result for scene %s discarded after cancellation.",
+                        current_idx,
+                    )
+                    return
+
+                first_outline = str(
+                    (batch_scenes or [{}])[0].get("outline", "") or ""
+                )
+                if looks_like_story_restart(first_outline, current_idx):
+                    logger.warning(
+                        "[Task] Scene %s looked like a story restart; regenerating once.",
+                        current_idx,
+                    )
+                    guarded_context = build_outline_continuity_context(
+                        story_bible=story_bible,
+                        prior_scenes=generated_scenes,
+                        current_index=current_idx,
+                        total_scenes=target_count,
+                        extra_warning=(
+                            "上一次结果疑似重新开篇。必须改为承接上一场的新事件，"
+                            "禁止使用‘故事开始、序幕、初次相遇、第一次见面’等重启表达。"
+                        ),
+                    )
+                    retry_scenes, retry_usage = await llm.generate_scene_batch(
+                        project.logline,
+                        style_context,
+                        current_idx,
+                        end_idx,
+                        previous_context=guarded_context,
+                        total_target=target_count,
+                        template_instructions=template_instructions,
+                    )
+                    await db.refresh(project)
+                    if project.status != models.ProcessingStatus.GENERATING:
+                        logger.info(
+                            "[Task] Retried outline for scene %s discarded after cancellation.",
+                            current_idx,
+                        )
+                        return
+                    usage += int(retry_usage or 0)
+                    batch_scenes = retry_scenes
+                    first_outline = str(
+                        (batch_scenes or [{}])[0].get("outline", "") or ""
+                    )
+                    if looks_like_story_restart(first_outline, current_idx):
+                        raise RuntimeError(
+                            "连续性守卫拒绝了疑似重新开篇的场次大纲"
+                        )
 
                 if len(batch_scenes or []) != batch_size:
                     raise RuntimeError(
@@ -1450,10 +1590,21 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                         status=models.ProcessingStatus.PENDING
                     )
                     db.add(new_scene)
+                    generated_scenes.append(new_scene)
 
-                summaries = [str(item.get("outline", "") or "") for item in batch_scenes]
-                last_context = "; ".join(summaries)
                 await db.commit()
+                try:
+                    await log_ai_action(
+                        user_id=user_id,
+                        project_id=project_id,
+                        action=f"outline_scene_{current_idx}",
+                        prompt=f"scene={current_idx}/{target_count}",
+                        response=first_outline,
+                        tokens=usage,
+                        step_key=f"outline:{current_idx}",
+                    )
+                except Exception as log_exc:
+                    logger.error("[Task] Failed to persist outline usage: %s", log_exc)
 
                 current_idx += batch_size
         except Exception as exc:
@@ -1491,10 +1642,11 @@ async def regenerate_scene(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    project = await db.get(models.Project, project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Project not found")
-        
+    project, _ = await require_project_access(
+        db, project_id, current_user.id, minimum_role="editor"
+    )
+    await enforce_user_quota(db, project.owner_id)
+
     result = await db.execute(
         select(models.Scene)
         .where(models.Scene.project_id == project_id)
@@ -1507,6 +1659,13 @@ async def regenerate_scene(
     if not await claim_generation(db, project_id, current_user.id):
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
+
+    await create_project_version(
+        db,
+        project_id,
+        current_user.id,
+        f"重写第{scene_index}场前自动快照",
+    )
 
     # Reset status
     scene.status = models.ProcessingStatus.PENDING
@@ -1546,9 +1705,10 @@ async def rewrite_scene_to_prompt(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    project = await db.get(models.Project, project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project, _ = await require_project_access(
+        db, project_id, current_user.id, minimum_role="editor"
+    )
+    await enforce_user_quota(db, project.owner_id)
 
     result = await db.execute(
         select(models.Scene)
@@ -1578,6 +1738,11 @@ async def rewrite_scene_to_prompt(
         f"project_id={project_id}, scene_index={scene_index}, "
         f"outline={scene.outline or ''}, content={scene.content or ''}"
     )
+    prompt_template = await get_prompt_addendum(
+        db,
+        stage="prompt",
+        project_type=project.project_type,
+    )
 
     try:
         prompt_text, usage = await llm.rewrite_scene_to_ai_prompt(
@@ -1586,7 +1751,8 @@ async def rewrite_scene_to_prompt(
             style_guide=project.genre or "",
             scene_outline=scene.outline or "",
             scene_content=scene.content or "",
-            scene_index=scene_index
+            scene_index=scene_index,
+            template_instructions=prompt_template,
         )
     except Exception as exc:
         await log_ai_action(
@@ -1642,7 +1808,7 @@ async def export_project(
     )
     project = result.scalars().first()
     
-    if not project or project.owner_id != current_user.id:
+    if not project or not await project_role(db, project, current_user.id):
         raise HTTPException(status_code=404, detail="Project not found")
 
     filename_raw = project.title or 'Untitled_Script'
@@ -1752,7 +1918,19 @@ async def _run_generation_loop(project_id: int):
             logger.error(f"[后台任务] 项目 {project_id} 没有可生成的场次")
             return
 
-        cumulative_context = ""
+        completed_scenes: list[models.Scene] = []
+        story_bible = build_story_bible(
+            logline=project.logline,
+            project_type=project.project_type,
+            genre=project.genre or "",
+            global_context=project.global_context or {},
+        )
+        total_scenes = len(scenes)
+        template_instructions = await get_prompt_addendum(
+            db,
+            stage="content",
+            project_type=project.project_type,
+        )
 
         for scene in scenes:
             try:
@@ -1767,10 +1945,7 @@ async def _run_generation_loop(project_id: int):
 
             await db.refresh(scene)
             if scene.status == models.ProcessingStatus.COMPLETED:
-                cumulative_context += (
-                    f"\n[Scene {scene.scene_index} Summary]: "
-                    f"{scene.summary or scene.outline}"
-                )
+                completed_scenes.append(scene)
                 continue
 
             scene_id = scene.id
@@ -1782,34 +1957,101 @@ async def _run_generation_loop(project_id: int):
 
             generated_content = ""
             usage = 0
+            continuity_context = ""
             try:
+                await enforce_user_quota(db, project.owner_id)
+                continuity_context = build_content_continuity_context(
+                    story_bible=story_bible,
+                    completed_scenes=completed_scenes,
+                    current_index=scene_index,
+                    total_scenes=total_scenes,
+                )
                 if project.project_type == "short_video":
                     generated_content, usage = await llm.write_short_video_prompt(
                         logline=project.logline,
                         style_guide=project.genre,
                         current_scene_outline=scene_outline,
                         clip_index=scene_index,
-                        previous_context=cumulative_context
+                        previous_context=continuity_context,
+                        template_instructions=template_instructions,
                     )
                 else:
                     generated_content, usage = await llm.write_scene_content(
                         logline=project.logline,
                         style_guide=project.genre,
                         current_scene_outline=scene_outline,
-                        previous_context=cumulative_context
+                        previous_context=continuity_context,
+                        scene_index=scene_index,
+                        total_scenes=total_scenes,
+                        template_instructions=template_instructions,
                     )
+
+                await db.refresh(project)
+                if project.status != models.ProcessingStatus.GENERATING:
+                    logger.info(
+                        "[后台任务] 第 %s 场结果因任务已取消而丢弃。",
+                        scene_index,
+                    )
+                    return
 
                 generated_content = str(generated_content or "").strip()
                 if not generated_content:
                     raise RuntimeError("LLM returned empty scene content")
+                if looks_like_story_restart(generated_content, scene_index):
+                    logger.warning(
+                        "[后台任务] 第 %s 场正文疑似重新开篇，启用连续性守卫重写一次。",
+                        scene_index,
+                    )
+                    guarded_context = continuity_context + (
+                        "\n【连续性守卫】上一次正文疑似重新开篇。请直接承接上一场的最后动作，"
+                        "禁止使用‘故事开始、序幕、初次相遇、第一次见面’等重启表达，"
+                        "并保留人物当前的记忆、关系、位置、伤情、道具和未解线索。"
+                    )
+                    if project.project_type == "short_video":
+                        retry_content, retry_usage = await llm.write_short_video_prompt(
+                            logline=project.logline,
+                            style_guide=project.genre,
+                            current_scene_outline=scene_outline,
+                            clip_index=scene_index,
+                            previous_context=guarded_context,
+                            template_instructions=template_instructions,
+                        )
+                    else:
+                        retry_content, retry_usage = await llm.write_scene_content(
+                            logline=project.logline,
+                            style_guide=project.genre,
+                            current_scene_outline=scene_outline,
+                            previous_context=guarded_context,
+                            scene_index=scene_index,
+                            total_scenes=total_scenes,
+                            template_instructions=template_instructions,
+                        )
+                    await db.refresh(project)
+                    if project.status != models.ProcessingStatus.GENERATING:
+                        logger.info(
+                            "[后台任务] 第 %s 场重写结果因任务已取消而丢弃。",
+                            scene_index,
+                        )
+                        return
+                    usage += int(retry_usage or 0)
+                    generated_content = str(retry_content or "").strip()
+                    if not generated_content or looks_like_story_restart(
+                        generated_content, scene_index
+                    ):
+                        raise RuntimeError("连续性守卫拒绝了疑似重新开篇的场次正文")
 
                 await increment_project_tokens(db, project, usage)
                 scene.content = generated_content
-                scene.summary = scene_outline
-                scene.status = models.ProcessingStatus.COMPLETED
-                cumulative_context += (
-                    f"\n[Scene {scene_index} Summary]: {scene.summary}"
+                scene.summary = summarize_scene_for_continuity(
+                    scene_outline,
+                    generated_content,
                 )
+                scene.status = models.ProcessingStatus.COMPLETED
+                completed_scenes.append(scene)
+                project.global_summary = "\n".join(
+                    f"第{item.scene_index}场：{item.summary or item.outline}"
+                    for item in completed_scenes[-12:]
+                )[:12000]
                 await db.commit()
                 logger.info(f"[后台任务] 第 {scene_index} 场生成完成")
             except Exception as exc:
@@ -1834,7 +2076,7 @@ async def _run_generation_loop(project_id: int):
                         action=f"write_scene_{scene_index}",
                         prompt=(
                             f"Outline: {scene_outline}, "
-                            f"PrevContextLength: {len(cumulative_context)}"
+                            f"PrevContextLength: {len(continuity_context)}"
                         ),
                         response=generated_content,
                         tokens=usage,
@@ -1854,7 +2096,7 @@ async def _run_generation_loop(project_id: int):
                     action=f"write_scene_{scene_index}",
                     prompt=(
                         f"Outline: {scene_outline}, "
-                        f"PrevContextLength: {len(cumulative_context)}"
+                        f"PrevContextLength: {len(continuity_context)}"
                     ),
                     response=generated_content,
                     tokens=usage,

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -104,6 +106,123 @@ async def test_content_failure_marks_project_and_scene_failed(monkeypatch):
         scene = scene_result.scalars().one()
         assert project.status == models.ProcessingStatus.FAILED
         assert scene.status == models.ProcessingStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_late_scene_restart_is_rewritten_once(monkeypatch):
+    calls = 0
+
+    async def write_content(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "序幕。故事开始，主角第一次见到搭档。", 5
+        return "内景·仓库·夜\n主角握紧上一场拿到的钥匙，继续逼近密室。", 7
+
+    monkeypatch.setattr(main.llm, "write_scene_content", write_content)
+    monkeypatch.setattr(main, "log_ai_action", no_op_log)
+
+    async with database.SessionLocal() as session:
+        await seed_user(session)
+        session.add(
+            models.Project(
+                id=1,
+                title="long story",
+                logline="持续追查真相",
+                project_type="movie",
+                owner_id=1,
+                status=models.ProcessingStatus.GENERATING,
+            )
+        )
+        await session.flush()
+        for index in range(1, 51):
+            completed = index < 50
+            session.add(
+                models.Scene(
+                    project_id=1,
+                    scene_index=index,
+                    outline=f"推进线索 {index}",
+                    content=(f"第{index}场结尾，主角保留关键物品。" if completed else None),
+                    summary=(f"线索推进到第{index}步" if completed else None),
+                    status=(
+                        models.ProcessingStatus.COMPLETED
+                        if completed
+                        else models.ProcessingStatus.PENDING
+                    ),
+                )
+            )
+        await session.commit()
+
+    await main.run_generation_loop(1)
+
+    async with database.SessionLocal() as session:
+        scene = await session.scalar(
+            select(models.Scene)
+            .where(models.Scene.project_id == 1)
+            .where(models.Scene.scene_index == 50)
+        )
+        project = await session.get(models.Project, 1)
+        assert calls == 2
+        assert "上一场拿到的钥匙" in scene.content
+        assert scene.status == models.ProcessingStatus.COMPLETED
+        assert project.status == models.ProcessingStatus.COMPLETED
+        assert project.total_tokens == 12
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_llm_call_discards_returned_content(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_content(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "这段内容不应在取消后保存", 9
+
+    monkeypatch.setattr(main.llm, "write_scene_content", delayed_content)
+    monkeypatch.setattr(main, "log_ai_action", no_op_log)
+
+    async with database.SessionLocal() as session:
+        await seed_user(session)
+        session.add(
+            models.Project(
+                id=1,
+                title="cancel",
+                logline="story",
+                project_type="movie",
+                owner_id=1,
+                status=models.ProcessingStatus.GENERATING,
+            )
+        )
+        await session.flush()
+        session.add(
+            models.Scene(
+                project_id=1,
+                scene_index=1,
+                outline="scene",
+                status=models.ProcessingStatus.PENDING,
+            )
+        )
+        await session.commit()
+
+    generation_task = asyncio.create_task(main.run_generation_loop(1))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    async with database.SessionLocal() as session:
+        project = await session.get(models.Project, 1)
+        scene = await session.scalar(select(models.Scene))
+        project.status = models.ProcessingStatus.FAILED
+        scene.status = models.ProcessingStatus.PENDING
+        await session.commit()
+    release.set()
+    await asyncio.wait_for(generation_task, timeout=2)
+
+    async with database.SessionLocal() as session:
+        project = await session.get(models.Project, 1)
+        scene = await session.scalar(select(models.Scene))
+        assert project.status == models.ProcessingStatus.FAILED
+        assert scene.status == models.ProcessingStatus.PENDING
+        assert scene.content is None
+        assert project.total_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -372,6 +491,10 @@ def test_fresh_database_is_created_by_alembic(tmp_path, monkeypatch):
         "login_logs",
         "ai_logs",
         "generation_jobs",
+        "project_members",
+        "project_versions",
+        "prompt_templates",
+        "backup_records",
         "alembic_version",
     }.issubset(tables)
     assert revision == migrate.HEAD_REVISION

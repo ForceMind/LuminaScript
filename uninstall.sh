@@ -109,6 +109,8 @@ echo "椤圭洰鐩綍: $PROJECT_DIR"
 
 echo -e "${YELLOW}[1/4] 澶囦唤鍏抽敭鏁版嵁...${NC}"
 backup_if_exists "$BACKEND_DIR/.env"
+backup_if_exists "$BACKEND_DIR/.llm_runtime.json"
+backup_if_exists "$BACKEND_DIR/.backup_runtime.json"
 backup_if_exists "$BACKEND_DIR/lumina_v2.db"
 backup_if_exists "$BACKEND_DIR/lumina.db"
 backup_if_exists "$PROJECT_DIR/lumina_v2.db"
@@ -137,14 +139,14 @@ if confirm "鏄惁鍒犻櫎鍓嶇鏋勫缓浜х墿涓庝緷璧?(frontend/d
     echo "宸插垹闄ゅ墠绔瀯寤轰骇鐗╀笌渚濊禆"
 fi
 
-if confirm "鏄惁鍒犻櫎杩愯鏃ュ織 (backend.log, worker.log, frontend.log)"; then
+if confirm "是否删除运行日志 (backend.log, worker.log, frontend.log)"; then
     rm -f "$PROJECT_DIR/backend.log" "$PROJECT_DIR/worker.log" "$PROJECT_DIR/frontend.log"
-    echo "宸插垹闄よ繍琛屾棩蹇?
+    echo "已删除运行日志"
 fi
 
-if confirm "鏄惁鍒犻櫎鏁版嵁搴撲笌閰嶇疆鏂囦欢 (.env, *.db)"; then
-    rm -f "$BACKEND_DIR/.env" "$BACKEND_DIR/lumina_v2.db" "$BACKEND_DIR/lumina.db" "$PROJECT_DIR/lumina_v2.db" "$PROJECT_DIR/lumina.db"
-    echo "宸插垹闄ゆ暟鎹簱涓庨厤缃枃浠?
+if confirm "是否删除数据库与配置文件 (.env, .llm_runtime.json, .backup_runtime.json, *.db)"; then
+    rm -f "$BACKEND_DIR/.env" "$BACKEND_DIR/.llm_runtime.json" "$BACKEND_DIR/.backup_runtime.json" "$BACKEND_DIR/lumina_v2.db" "$BACKEND_DIR/lumina.db" "$PROJECT_DIR/lumina_v2.db" "$PROJECT_DIR/lumina.db"
+    echo "已删除数据库与配置文件"
 fi
 
 echo -e "${YELLOW}[4/4] 鍗歌浇瀹屾垚${NC}"

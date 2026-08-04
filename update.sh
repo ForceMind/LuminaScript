@@ -64,7 +64,7 @@ backup_if_exists() {
 is_runtime_data_path() {
     local path="$1"
     case "$path" in
-        backend/.env|.lumina_runtime|*.db|*.sqlite|*.sqlite3|*.log|frontend/dist/*|frontend/node_modules/*|backend/venv/*|backend/__pycache__/*|node_modules/*|backups/*)
+        backend/.env|backend/.llm_runtime.json|backend/.backup_runtime.json|.lumina_runtime|*.db|*.sqlite|*.sqlite3|*.log|frontend/dist/*|frontend/node_modules/*|backend/venv/*|backend/__pycache__/*|node_modules/*|backups/*)
             return 0
             ;;
         *)
@@ -280,6 +280,8 @@ echo "当前分支: $CURRENT_BRANCH"
 
 echo -e "${YELLOW}[2/6] 备份用户数据和配置...${NC}"
 backup_if_exists "$BACKEND_DIR/.env"
+backup_if_exists "$BACKEND_DIR/.llm_runtime.json"
+backup_if_exists "$BACKEND_DIR/.backup_runtime.json"
 backup_if_exists "$BACKEND_DIR/lumina.db"
 backup_if_exists "$BACKEND_DIR/lumina_v2.db"
 backup_if_exists "$PROJECT_DIR/lumina.db"
@@ -318,6 +320,8 @@ VENV_PIP="$VENV_DIR/bin/pip"
 "$VENV_PIP" install -r "$BACKEND_DIR/requirements.txt"
 "$VENV_PYTHON" "$BACKEND_DIR/bootstrap_security.py"
 chmod 600 "$BACKEND_DIR/.env" 2>/dev/null || true
+chmod 600 "$BACKEND_DIR/.llm_runtime.json" 2>/dev/null || true
+chmod 600 "$BACKEND_DIR/.backup_runtime.json" 2>/dev/null || true
 "$VENV_PYTHON" "$BACKEND_DIR/migrate.py"
 set +e
 "$VENV_PYTHON" "$BACKEND_DIR/upgrade_admin.py"

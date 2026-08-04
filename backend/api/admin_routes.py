@@ -3,6 +3,8 @@ import io
 import json
 import logging
 from pathlib import Path
+import sqlite3
+import tempfile
 from typing import Any, Optional
 from urllib.parse import quote
 import zipfile
@@ -19,6 +21,17 @@ import models
 import schemas
 from api.dependencies import require_admin
 from database import get_db
+from services.llm_config import (
+    LLMProfileStore,
+    LLMRuntimeConfig,
+    get_llm_profile_store,
+    get_runtime_llm_config,
+    public_llm_config,
+    safe_connection_error,
+    save_runtime_llm_config,
+    save_llm_profile_store,
+    test_llm_connection,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -113,32 +126,52 @@ def serialize_project(
 
 
 def iter_export_database_paths() -> list[Path]:
-    candidates: list[Path] = []
     sqlite_prefix = "sqlite+aiosqlite:///"
     if database.DATABASE_URL.startswith(sqlite_prefix):
-        candidates.append(Path(database.DATABASE_URL[len(sqlite_prefix):]))
+        configured_path = Path(
+            database.DATABASE_URL[len(sqlite_prefix):].split("?", 1)[0]
+        ).resolve()
+        if configured_path.exists():
+            return [configured_path]
 
     backend_dir = Path(__file__).resolve().parents[1]
     project_dir = backend_dir.parent
-    candidates.extend(
-        [
-            backend_dir / "lumina_v2.db",
-            backend_dir / "lumina.db",
-            project_dir / "lumina_v2.db",
-            project_dir / "lumina.db",
-        ]
-    )
-
-    unique_paths: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
+    for candidate in (
+        backend_dir / "lumina_v2.db",
+        backend_dir / "lumina.db",
+        project_dir / "lumina_v2.db",
+        project_dir / "lumina.db",
+    ):
         resolved = candidate.resolve()
-        key = resolved.as_posix()
-        if key in seen or not resolved.exists():
-            continue
-        seen.add(key)
-        unique_paths.append(resolved)
-    return unique_paths
+        if resolved.exists():
+            return [resolved]
+    return []
+
+
+def create_sqlite_snapshot(database_path: Path) -> bytes:
+    temporary = tempfile.NamedTemporaryFile(
+        prefix="luminascript_export_",
+        suffix=".db",
+        delete=False,
+    )
+    snapshot_path = Path(temporary.name)
+    temporary.close()
+    source = None
+    destination = None
+    try:
+        source = sqlite3.connect(database_path)
+        destination = sqlite3.connect(snapshot_path)
+        source.backup(destination)
+        destination.commit()
+        destination.close()
+        destination = None
+        return snapshot_path.read_bytes()
+    finally:
+        if destination is not None:
+            destination.close()
+        if source is not None:
+            source.close()
+        snapshot_path.unlink(missing_ok=True)
 
 
 def schema_query_error(exc: OperationalError) -> HTTPException:
@@ -147,6 +180,40 @@ def schema_query_error(exc: OperationalError) -> HTTPException:
         status_code=500,
         detail="数据库结构异常，请先执行迁移命令后重试。",
     )
+
+
+def build_llm_config_update(payload: schemas.AIConfigUpdate) -> LLMRuntimeConfig:
+    current = get_runtime_llm_config()
+    submitted_key = (payload.api_key or "").strip()
+    if payload.clear_api_key:
+        api_key = None
+    elif submitted_key:
+        api_key = submitted_key
+    else:
+        api_key = current.api_key
+
+    return LLMRuntimeConfig(
+        api_key=api_key,
+        base_url=payload.base_url,
+        model_id=payload.model_id,
+        timeout_seconds=payload.timeout_seconds,
+        max_concurrency=payload.max_concurrency,
+        updated_at=current.updated_at,
+        updated_by=current.updated_by,
+        source=current.source,
+        profile_id=current.profile_id,
+        profile_name=current.profile_name,
+        enabled=current.enabled,
+        priority=current.priority,
+    )
+
+
+def public_profile_store(store: LLMProfileStore) -> dict[str, Any]:
+    return {
+        "active_profile": store.active_profile,
+        "routes": store.routes,
+        "profiles": [public_llm_config(profile) for profile in store.profiles],
+    }
 
 
 @router.get("/users", response_model=list[schemas.UserResponse])
@@ -197,6 +264,141 @@ async def update_user_role(
         requested_value,
     )
     return target
+
+
+@router.get("/ai-config", response_model=schemas.AIConfigResponse)
+async def get_ai_config(
+    _admin: models.User = Depends(require_admin),
+):
+    return public_llm_config(get_runtime_llm_config())
+
+
+@router.put("/ai-config", response_model=schemas.AIConfigResponse)
+async def update_ai_config(
+    payload: schemas.AIConfigUpdate,
+    admin: models.User = Depends(require_admin),
+):
+    candidate = build_llm_config_update(payload)
+    saved = save_runtime_llm_config(candidate, updated_by=admin.username)
+    logger.warning(
+        "Administrator %s updated AI config: base_url=%s model_id=%s "
+        "timeout=%s concurrency=%s key_configured=%s",
+        admin.id,
+        saved.base_url,
+        saved.model_id,
+        saved.timeout_seconds,
+        saved.max_concurrency,
+        bool(saved.api_key),
+    )
+    return public_llm_config(saved)
+
+
+@router.post("/ai-config/test", response_model=schemas.AIConfigTestResponse)
+async def test_ai_config(
+    payload: schemas.AIConfigUpdate,
+    _admin: models.User = Depends(require_admin),
+):
+    candidate = build_llm_config_update(payload)
+    try:
+        preview = await test_llm_connection(candidate)
+    except Exception as exc:
+        logger.warning(
+            "AI configuration connection test failed: %s",
+            exc.__class__.__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"连接测试失败：{safe_connection_error(exc, candidate.api_key)}",
+        ) from exc
+    return {
+        "success": True,
+        "message": "连接测试成功",
+        "response_preview": preview,
+    }
+
+
+@router.get("/ai-profiles")
+async def list_ai_profiles(
+    _admin: models.User = Depends(require_admin),
+):
+    return public_profile_store(get_llm_profile_store())
+
+
+@router.put("/ai-profiles/{profile_id}")
+async def upsert_ai_profile(
+    profile_id: str,
+    payload: schemas.AIProfileUpdate,
+    admin: models.User = Depends(require_admin),
+):
+    normalized_id = profile_id.strip()
+    if not normalized_id or len(normalized_id) > 64 or not normalized_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=422, detail="配置档案 ID 只能包含字母、数字、横线和下划线")
+    store = get_llm_profile_store()
+    existing = next((item for item in store.profiles if item.profile_id == normalized_id), None)
+    submitted_key = (payload.api_key or "").strip()
+    api_key = None if payload.clear_api_key else (submitted_key or (existing.api_key if existing else None))
+    profile = LLMRuntimeConfig(
+        api_key=api_key,
+        base_url=payload.base_url,
+        model_id=payload.model_id,
+        timeout_seconds=payload.timeout_seconds,
+        max_concurrency=payload.max_concurrency,
+        updated_at=datetime.now().astimezone().isoformat(),
+        updated_by=admin.username,
+        source="admin",
+        profile_id=normalized_id,
+        profile_name=payload.name,
+        enabled=payload.enabled,
+        priority=payload.priority,
+    )
+    if existing:
+        store.profiles[store.profiles.index(existing)] = profile
+    else:
+        store.profiles.append(profile)
+    if len(store.profiles) == 1:
+        store.active_profile = normalized_id
+    save_llm_profile_store(store)
+    return public_profile_store(store)
+
+
+@router.delete("/ai-profiles/{profile_id}")
+async def delete_ai_profile(
+    profile_id: str,
+    _admin: models.User = Depends(require_admin),
+):
+    store = get_llm_profile_store()
+    remaining = [item for item in store.profiles if item.profile_id != profile_id]
+    if len(remaining) == len(store.profiles):
+        raise HTTPException(status_code=404, detail="AI 配置档案不存在")
+    if not remaining:
+        raise HTTPException(status_code=400, detail="至少保留一个 AI 配置档案")
+    store.profiles = remaining
+    if store.active_profile == profile_id:
+        store.active_profile = remaining[0].profile_id
+    store.routes = {
+        task: [item for item in profile_ids if item != profile_id]
+        for task, profile_ids in store.routes.items()
+    }
+    save_llm_profile_store(store)
+    return public_profile_store(store)
+
+
+@router.put("/ai-routing")
+async def update_ai_routing(
+    payload: schemas.AIRoutingUpdate,
+    _admin: models.User = Depends(require_admin),
+):
+    store = get_llm_profile_store()
+    profile_ids = {profile.profile_id for profile in store.profiles}
+    if payload.active_profile not in profile_ids:
+        raise HTTPException(status_code=422, detail="默认 AI 配置档案不存在")
+    for route_profiles in payload.routes.values():
+        if any(profile_id not in profile_ids for profile_id in route_profiles):
+            raise HTTPException(status_code=422, detail="路由中包含不存在的 AI 配置档案")
+    store.active_profile = payload.active_profile
+    store.routes = payload.routes
+    save_llm_profile_store(store)
+    return public_profile_store(store)
 
 
 @router.get("/logs/login", response_model=schemas.PaginatedLoginLogs)
@@ -473,9 +675,9 @@ async def export_all_data(
             ),
         )
         for database_path in database_paths:
-            archive.write(
-                database_path,
-                arcname=f"database/{database_path.name}",
+            archive.writestr(
+                f"database/{database_path.name}",
+                create_sqlite_snapshot(database_path),
             )
 
     buffer.seek(0)

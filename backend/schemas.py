@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import List, Optional, Any, Dict, Literal
+from urllib.parse import urlparse
 from models import ProcessingStatus
 
 # --- Core Data Schemas ---
@@ -41,6 +42,7 @@ class ProjectListResponse(ProjectBase):
     owner_id: int
     total_tokens: int = 0
     status: ProcessingStatus = ProcessingStatus.PENDING
+    access_role: str = "owner"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -92,6 +94,78 @@ class UserResponse(BaseModel):
 
 class AdminRoleUpdate(BaseModel):
     is_admin: bool
+
+
+class AIConfigUpdate(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2048)
+    model_id: str = Field(min_length=1, max_length=256)
+    api_key: Optional[str] = Field(default=None, max_length=4096)
+    clear_api_key: bool = False
+    timeout_seconds: int = Field(default=90, ge=10, le=600)
+    max_concurrency: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_ai_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Base URL 必须是有效的 HTTP 或 HTTPS 地址")
+        if parsed.username or parsed.password:
+            raise ValueError("Base URL 不能包含用户名或密码")
+        return normalized
+
+    @field_validator("model_id")
+    @classmethod
+    def strip_ai_config_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("配置项不能为空")
+        return normalized
+
+
+class AIConfigResponse(BaseModel):
+    base_url: str
+    model_id: str
+    timeout_seconds: int
+    max_concurrency: int
+    api_key_configured: bool
+    api_key_masked: str = ""
+    source: str
+    updated_at: Optional[str] = None
+    updated_by: Optional[str] = None
+    profile_id: str = "default"
+    profile_name: str = "默认配置"
+    enabled: bool = True
+    priority: int = 100
+
+
+class AIConfigTestResponse(BaseModel):
+    success: bool
+    message: str
+    response_preview: str = ""
+
+
+class AIProfileUpdate(AIConfigUpdate):
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+    priority: int = Field(default=100, ge=0, le=10000)
+
+
+class AIRoutingUpdate(BaseModel):
+    active_profile: str = Field(min_length=1, max_length=64)
+    routes: Dict[str, List[str]] = Field(default_factory=dict)
+
+    @field_validator("routes")
+    @classmethod
+    def validate_routes(cls, value: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        allowed = {"default", "planning", "interaction", "outline", "content", "review", "prompt"}
+        normalized: Dict[str, List[str]] = {}
+        for task_type, profile_ids in value.items():
+            if task_type not in allowed:
+                raise ValueError(f"不支持的任务类型: {task_type}")
+            normalized[task_type] = [str(item).strip() for item in profile_ids if str(item).strip()]
+        return normalized
 
 
 class LoginLogResponse(BaseModel):

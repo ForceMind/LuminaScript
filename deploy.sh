@@ -427,6 +427,8 @@ start_services() {
 
     "$VENV_DIR/bin/python" "$BACKEND_DIR/bootstrap_security.py"
     chmod 600 "$ENV_FILE" 2>/dev/null || true
+    chmod 600 "$BACKEND_DIR/.llm_runtime.json" 2>/dev/null || true
+    chmod 600 "$BACKEND_DIR/.backup_runtime.json" 2>/dev/null || true
     "$VENV_DIR/bin/python" "$BACKEND_DIR/migrate.py"
 
     UPDATE_ADMIN="$UPDATE_ADMIN" ADMIN_USER="$ADMIN_USER" ADMIN_PASS="$ADMIN_PASS" \

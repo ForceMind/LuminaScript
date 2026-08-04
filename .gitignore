@@ -16,6 +16,8 @@
 .env
 .env.*
 .lumina_runtime
+.llm_runtime.json
+.backup_runtime.json
 
 # OS
 .DS_Store

@@ -89,6 +89,19 @@ const scenePromptMap = ref<Record<number, string>>({})
 const scenePromptLoadingMap = ref<Record<number, boolean>>({})
 const pollTimer = ref<any>(null)
 const isStarted = ref(false)
+const projectToolsVisible = ref(false)
+const projectToolsTab = ref('versions')
+const projectToolsLoading = ref(false)
+const projectVersions = ref<any[]>([])
+const projectMembers = ref<any[]>([])
+const projectJobs = ref<any[]>([])
+const myUsage = ref<any>({ daily_tokens: 0, monthly_tokens: 0, daily_limit: 0, monthly_limit: 0 })
+const versionLabel = ref('手动快照')
+const versionDiffVisible = ref(false)
+const versionDiffText = ref('')
+const memberForm = ref({ username: '', role: 'viewer' })
+const canEditCurrentProject = computed(() => ['owner', 'editor'].includes(currentProject.value?.access_role || 'owner'))
+const ownsCurrentProject = computed(() => (currentProject.value?.access_role || 'owner') === 'owner')
 
 const pollRequestInFlight = ref(false)
 const ACTIVE_PROJECT_POLL_INTERVAL_MS = 8000
@@ -1153,6 +1166,133 @@ const sortedContext = computed(() => {
     })
 })
 
+const fetchProjectTools = async () => {
+    if (!currentProject.value?.id) return
+    projectToolsLoading.value = true
+    try {
+        const projectId = currentProject.value.id
+        const [versionsResponse, membersResponse, jobsResponse, usageResponse] = await Promise.all([
+            api.get(`/projects/${projectId}/versions`),
+            api.get(`/projects/${projectId}/members`),
+            api.get(`/jobs?project_id=${projectId}`),
+            api.get('/usage/me'),
+        ])
+        projectVersions.value = versionsResponse.data?.items || []
+        projectMembers.value = membersResponse.data?.items || []
+        projectJobs.value = jobsResponse.data?.items || []
+        myUsage.value = usageResponse.data || {}
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '无法获取项目工具数据')
+    } finally {
+        projectToolsLoading.value = false
+    }
+}
+
+const openProjectTools = async () => {
+    projectToolsVisible.value = true
+    await fetchProjectTools()
+}
+
+const createProjectVersion = async () => {
+    if (!currentProject.value?.id) return
+    try {
+        await api.post(`/projects/${currentProject.value.id}/versions`, {
+            label: versionLabel.value.trim() || '手动快照',
+        })
+        await fetchProjectTools()
+        ElMessage.success('项目版本快照已创建')
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '创建版本失败')
+    }
+}
+
+const showVersionDiff = async (version: any) => {
+    try {
+        const response = await api.get(`/projects/${currentProject.value.id}/versions/${version.id}/diff`)
+        versionDiffText.value = String(response.data?.diff || '当前内容与该版本一致')
+        versionDiffVisible.value = true
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '获取版本差异失败')
+    }
+}
+
+const restoreProjectVersion = async (version: any) => {
+    try {
+        await ElMessageBox.confirm(
+            `确定恢复到“${version.label}”吗？当前内容会先自动保存为快照。`,
+            '恢复项目版本',
+            { type: 'warning' },
+        )
+        await api.post(`/projects/${currentProject.value.id}/versions/${version.id}/restore`, { confirm: true })
+        await fetchProjectDetail(currentProject.value.id)
+        await fetchProjectTools()
+        ElMessage.success('项目版本已恢复')
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(error?.response?.data?.detail || '恢复版本失败')
+        }
+    }
+}
+
+const addProjectMember = async () => {
+    if (!memberForm.value.username.trim()) {
+        ElMessage.warning('请输入用户名')
+        return
+    }
+    try {
+        await api.post(`/projects/${currentProject.value.id}/members`, {
+            username: memberForm.value.username.trim(),
+            role: memberForm.value.role,
+        })
+        memberForm.value.username = ''
+        await fetchProjectTools()
+        ElMessage.success('协作成员已保存')
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '添加协作成员失败')
+    }
+}
+
+const updateProjectMember = async (member: any) => {
+    try {
+        await api.patch(`/projects/${currentProject.value.id}/members/${member.id}`, { role: member.role })
+        ElMessage.success('成员权限已更新')
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '更新成员权限失败')
+    }
+}
+
+const removeProjectMember = async (member: any) => {
+    try {
+        await ElMessageBox.confirm(`确定移除“${member.username}”吗？`, '移除协作成员', { type: 'warning' })
+        await api.delete(`/projects/${currentProject.value.id}/members/${member.id}`)
+        await fetchProjectTools()
+    } catch (error: any) {
+        if (error !== 'cancel' && error !== 'close') {
+            ElMessage.error(error?.response?.data?.detail || '移除成员失败')
+        }
+    }
+}
+
+const cancelProjectJob = async (job: any) => {
+    try {
+        await api.post(`/jobs/${job.id}/cancel`)
+        await fetchProjectTools()
+        await fetchProjectDetail(currentProject.value.id)
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '取消任务失败')
+    }
+}
+
+const retryProjectJob = async (job: any) => {
+    try {
+        await api.post(`/jobs/${job.id}/retry`)
+        await fetchProjectTools()
+        await fetchProjectDetail(currentProject.value.id)
+    } catch (error: any) {
+        ElMessage.error(error?.response?.data?.detail || '重试任务失败')
+    }
+}
+
 const copyText = (value: unknown) => {
     const text = toTextValue(value)
     if (!text) return
@@ -1234,6 +1374,9 @@ const copyText = (value: unknown) => {
                  </div>
             </div>
             <div class="flex items-center gap-3">
+                 <el-button v-if="currentProject?.id" plain @click="openProjectTools">
+                    项目工具
+                 </el-button>
                  <el-dropdown v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @command="exportScript">
                     <el-button plain>
                         <el-icon class="mr-1"><Download /></el-icon> 导出 <el-icon class="el-icon--right"><arrow-down /></el-icon>
@@ -1702,6 +1845,89 @@ const copyText = (value: unknown) => {
 
         </div>
     </div>
+
+    <el-dialog v-model="projectToolsVisible" width="min(900px, 94vw)" title="项目工具" destroy-on-close>
+        <div v-loading="projectToolsLoading" class="min-h-64">
+            <el-alert
+                :title="`当前权限：${currentProject?.access_role === 'viewer' ? '只读成员' : currentProject?.access_role === 'editor' ? '协作编辑' : '项目所有者'}`"
+                type="info"
+                :closable="false"
+                class="mb-4"
+            />
+            <el-tabs v-model="projectToolsTab">
+                <el-tab-pane label="版本历史" name="versions">
+                    <div v-if="canEditCurrentProject" class="flex gap-3 mb-4">
+                        <el-input v-model="versionLabel" placeholder="版本说明" />
+                        <el-button type="primary" @click="createProjectVersion">创建快照</el-button>
+                    </div>
+                    <el-table :data="projectVersions" size="small" border>
+                        <el-table-column prop="created_at" label="时间" min-width="180" />
+                        <el-table-column prop="label" label="说明" min-width="180" />
+                        <el-table-column prop="scene_count" label="场数" width="80" />
+                        <el-table-column label="操作" width="150">
+                            <template #default="scope">
+                                <el-button link type="primary" @click="showVersionDiff(scope.row)">对比</el-button>
+                                <el-button v-if="canEditCurrentProject" link type="warning" @click="restoreProjectVersion(scope.row)">恢复</el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </el-tab-pane>
+
+                <el-tab-pane label="协作成员" name="members">
+                    <div v-if="ownsCurrentProject" class="grid grid-cols-1 sm:grid-cols-[1fr_160px_auto] gap-3 mb-4">
+                        <el-input v-model="memberForm.username" placeholder="已注册用户名" />
+                        <el-select v-model="memberForm.role"><el-option label="只读" value="viewer" /><el-option label="可编辑" value="editor" /></el-select>
+                        <el-button type="primary" @click="addProjectMember">添加成员</el-button>
+                    </div>
+                    <el-table :data="projectMembers" size="small" border>
+                        <el-table-column prop="username" label="用户" min-width="160" />
+                        <el-table-column label="权限" min-width="160">
+                            <template #default="scope">
+                                <el-select v-model="scope.row.role" :disabled="!ownsCurrentProject" @change="updateProjectMember(scope.row)">
+                                    <el-option label="只读" value="viewer" /><el-option label="可编辑" value="editor" />
+                                </el-select>
+                            </template>
+                        </el-table-column>
+                        <el-table-column v-if="ownsCurrentProject" label="操作" width="100"><template #default="scope"><el-button link type="danger" @click="removeProjectMember(scope.row)">移除</el-button></template></el-table-column>
+                    </el-table>
+                </el-tab-pane>
+
+                <el-tab-pane label="生成任务" name="jobs">
+                    <div class="flex justify-end mb-3"><el-button @click="fetchProjectTools">刷新</el-button></div>
+                    <el-table :data="projectJobs" size="small" border>
+                        <el-table-column prop="id" label="任务" width="70" />
+                        <el-table-column prop="kind" label="类型" min-width="150" />
+                        <el-table-column prop="status" label="状态" width="100" />
+                        <el-table-column label="尝试" width="80"><template #default="scope">{{ scope.row.attempts }}/{{ scope.row.max_attempts }}</template></el-table-column>
+                        <el-table-column prop="last_error" label="错误" min-width="220" show-overflow-tooltip />
+                        <el-table-column v-if="canEditCurrentProject" label="操作" width="120">
+                            <template #default="scope">
+                                <el-button v-if="['queued', 'running'].includes(scope.row.status)" link type="danger" @click="cancelProjectJob(scope.row)">取消</el-button>
+                                <el-button v-if="['failed', 'canceled'].includes(scope.row.status)" link type="primary" @click="retryProjectJob(scope.row)">重试</el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </el-tab-pane>
+
+                <el-tab-pane label="AI 用量" name="usage">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div class="rounded border p-5 bg-gray-50">
+                            <div class="text-sm text-gray-400">今日 Tokens</div><div class="text-3xl font-bold mt-2">{{ myUsage.daily_tokens || 0 }}</div>
+                            <div class="text-xs text-gray-400 mt-2">额度：{{ myUsage.daily_limit || '不限' }}</div>
+                        </div>
+                        <div class="rounded border p-5 bg-gray-50">
+                            <div class="text-sm text-gray-400">本月 Tokens</div><div class="text-3xl font-bold mt-2">{{ myUsage.monthly_tokens || 0 }}</div>
+                            <div class="text-xs text-gray-400 mt-2">额度：{{ myUsage.monthly_limit || '不限' }}</div>
+                        </div>
+                    </div>
+                </el-tab-pane>
+            </el-tabs>
+        </div>
+    </el-dialog>
+
+    <el-dialog v-model="versionDiffVisible" width="min(900px, 94vw)" title="版本差异" append-to-body>
+        <pre class="text-xs whitespace-pre-wrap bg-gray-950 text-gray-100 p-4 rounded max-h-[65vh] overflow-auto">{{ versionDiffText }}</pre>
+    </el-dialog>
     
     <AdminDashboard
         v-if="showAdmin"

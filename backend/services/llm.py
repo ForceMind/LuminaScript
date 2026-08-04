@@ -5,39 +5,40 @@ import re
 
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from core.config import settings
+from services.llm_config import LLMRuntimeConfig, get_routed_llm_configs
 
 # Configure Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load Config
-API_KEY = settings.llm_api_key
-BASE_URL = settings.llm_base_url
-MODEL_ID = settings.llm_model_id
-REQUEST_TIMEOUT_SECONDS = settings.llm_timeout_seconds
-MAX_CONCURRENT_REQUESTS = settings.llm_max_concurrency
+_client_cache: dict[tuple[str, str, int], AsyncOpenAI] = {}
+_semaphore_cache: dict[tuple[int, int], asyncio.Semaphore] = {}
 
-if not API_KEY:
-    logger.warning("⚠️ LLM_API_KEY implies not set. LLM features will fail. Please set it in .env file.")
-else:
-    logger.info(
-        "LLM 服务配置加载: Model=%s, BaseURL=%s, KeyConfigured=true",
-        MODEL_ID,
-        BASE_URL,
-    )
 
-client = AsyncOpenAI(
-    api_key=API_KEY if API_KEY else "dummy_key", # Prevent client init failure, fail at request time
-    base_url=BASE_URL,
-    timeout=REQUEST_TIMEOUT_SECONDS,
-    max_retries=0,
-)
+def _get_client(config: LLMRuntimeConfig) -> AsyncOpenAI:
+    if not config.api_key:
+        raise RuntimeError("AI API Key 未配置，请管理员在后台的 AI 配置页面中设置。")
+    cache_key = (config.api_key, config.base_url, config.timeout_seconds)
+    runtime_client = _client_cache.get(cache_key)
+    if runtime_client is None:
+        runtime_client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=config.timeout_seconds,
+            max_retries=0,
+        )
+        _client_cache[cache_key] = runtime_client
+    return runtime_client
 
-# Semantic Semaphore to limit concurrency globally (Max 20 concurrent requests)
-# We initialize it lazily or at module level if we are in an event loop, 
-# but safely we can use a bounded semaphore.
-_sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+def _get_semaphore(max_concurrency: int) -> asyncio.Semaphore:
+    loop_key = id(asyncio.get_running_loop())
+    cache_key = (loop_key, max_concurrency)
+    semaphore = _semaphore_cache.get(cache_key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(max_concurrency)
+        _semaphore_cache[cache_key] = semaphore
+    return semaphore
 
 _PORN_PATTERNS = [
     r'色情', r'裸聊', r'约炮', r'性奴', r'乱伦', r'援交',
@@ -288,54 +289,64 @@ def _estimate_token_usage(messages, content: str) -> int:
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(Exception)
 )
-async def raw_generation(messages, temperature=0.7, json_response=False):
+async def raw_generation(messages, temperature=0.7, json_response=False, task_type="default"):
     """
     Generic wrapper for LLM calls with Concurrency Control and Retries.
     Returns (content, usage_count).
     """
-    async with _sem:
+    runtime_configs = get_routed_llm_configs(task_type)
+    last_error = None
+    for runtime_config in runtime_configs:
         try:
-            logger.info(f"LLM调用: 开始生成... (消息数: {len(messages)})")
-            # Note: Removing response_format as some providers (like current Xunfei gateway) do not support it
-            # We use extra_body={"response_format": ...} only if supported, but here currently disabled for stability
-            response = await client.chat.completions.create(
-                model=MODEL_ID,
-                messages=messages,
-                temperature=temperature
-            )
-            content = response.choices[0].message.content
-            usage_obj = getattr(response, "usage", None)
-            usage = int(getattr(usage_obj, "total_tokens", 0) or 0)
-            if usage <= 0:
-                usage = _estimate_token_usage(messages, content)
-                logger.info(f"LLM调用: 成功完成 (上游未返回Token，使用估算值: {usage})")
-            else:
-                logger.info(f"LLM调用: 成功完成 (消耗Token: {usage})")
-            
-            # If user expects JSON, we try to clean it up lightly
-            if json_response and content:
-                 content = content.replace("```json", "").replace("```", "").strip()
-                 # Try to find the first '{' and last '}' to extract valid JSON
-                 import re
-                 json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                 if json_match:
-                     content = json_match.group(0)
-            
-            return content, usage
-        except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            logger.error(f"❌ LLM调用失败 Details:\nERROR_TYPE: {type(e).__name__}\nMESSAGE: {str(e)}\nTRACE:\n{error_details}")
-            
-            # Additional debug info for specific failures
-            if "401" in str(e):
-                logger.error("💡 提示: 401 错误通常意味着 API Key 无效或过期。请检查 .env 文件。")
-            elif "404" in str(e):
-                logger.error(f"💡 提示: 404 错误通常意味着 Base URL ({BASE_URL}) 不正确或模型 ID ({MODEL_ID}) 错误。")
-            
-            raise e # Raise to trigger retry
+            runtime_client = _get_client(runtime_config)
+            semaphore = _get_semaphore(runtime_config.max_concurrency)
+            async with semaphore:
+                logger.info(
+                    "LLM调用: 档案=%s 任务=%s 消息数=%s",
+                    runtime_config.profile_name,
+                    task_type,
+                    len(messages),
+                )
+                response = await runtime_client.chat.completions.create(
+                    model=runtime_config.model_id,
+                    messages=messages,
+                    temperature=temperature
+                )
+                content = response.choices[0].message.content
+                usage_obj = getattr(response, "usage", None)
+                usage = int(getattr(usage_obj, "total_tokens", 0) or 0)
+                if usage <= 0:
+                    usage = _estimate_token_usage(messages, content)
+                    logger.info(f"LLM调用: 成功完成 (上游未返回Token，使用估算值: {usage})")
+                else:
+                    logger.info(f"LLM调用: 成功完成 (消耗Token: {usage})")
 
-async def review_user_input(text: str):
+                if json_response and content:
+                    content = content.replace("```json", "").replace("```", "").strip()
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        content = json_match.group(0)
+                return content, usage
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "LLM 档案 %s 调用失败，尝试下一候选档案: %s",
+                runtime_config.profile_name,
+                type(e).__name__,
+            )
+            if "401" in str(e):
+                logger.error("💡 提示: 401 错误通常意味着 API Key 无效或过期，请检查后台 AI 配置。")
+            elif "404" in str(e):
+                logger.error(
+                    "💡 提示: 404 错误通常意味着 Base URL (%s) 不正确或模型 ID (%s) 错误。",
+                    runtime_config.base_url,
+                    runtime_config.model_id,
+                )
+    if last_error:
+        raise last_error
+    raise RuntimeError("没有可用的 AI 配置档案")
+
+async def review_user_input(text: str, template_instructions: str = ""):
     """
     Review user input for policy risks and produce a safe rewrite suggestion.
     Returns:
@@ -384,6 +395,10 @@ async def review_user_input(text: str):
       "suggested_rewrite": "改写后的文本"
     }
     """
+    system_prompt += (
+        "\n项目自定义审核要求："
+        + (template_instructions or "使用默认审核规则")
+    )
     user_prompt = f"待审核文本：\n{raw_text}"
 
     try:
@@ -393,7 +408,8 @@ async def review_user_input(text: str):
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.2,
-            json_response=True
+            json_response=True,
+            task_type="review",
         )
         if content:
             parsed = json.loads(content)
@@ -474,7 +490,8 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
             {"role": "user", "content": user_prompt}
         ],
         temperature=0.7,
-        json_response=True
+        json_response=True,
+        task_type="planning",
     )
 
     if not content:
@@ -556,7 +573,8 @@ async def extract_setup_from_long_input(long_input: str):
             {"role": "user", "content": user_prompt}
         ],
         temperature=0.2,
-        json_response=True
+        json_response=True,
+        task_type="planning",
     )
 
     if not content:
@@ -602,7 +620,12 @@ async def analyze_script_requirements(logline: str, project_type: str="movie"):
         {"role": "user", "content": f"Logline: {logline}"}
     ]
     
-    content, usage = await raw_generation(messages, temperature=0.7, json_response=True)
+    content, usage = await raw_generation(
+        messages,
+        temperature=0.7,
+        json_response=True,
+        task_type="interaction",
+    )
     if content:
         try:
             return json.loads(content), usage
@@ -611,7 +634,15 @@ async def analyze_script_requirements(logline: str, project_type: str="movie"):
              return None, usage
     return None, 0
 
-async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, end_idx: int, previous_context: str = "", total_target: int = 0):
+async def generate_scene_batch(
+    logline: str,
+    style_guide: str,
+    start_idx: int,
+    end_idx: int,
+    previous_context: str = "",
+    total_target: int = 0,
+    template_instructions: str = "",
+):
     """
     Generate a specific batch of scenes.
     """
@@ -624,9 +655,18 @@ async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, e
     
     Context: {logline}
     Style/Settings: {style_guide}
-    Previous Scene Arc: {previous_context}
+    Story Bible, Timeline and Continuity State:
+    {previous_context}
     
     IMPORTANT: Output in Chinese (Simplified).
+    CONTINUITY IS MANDATORY:
+    - Item #{start_idx} is an exact absolute scene number, never restart numbering at 1.
+    - If #{start_idx} is beyond the opening, continue the established plot immediately.
+    - Never repeat the inciting incident or reintroduce established characters as strangers.
+    - Respect all character knowledge, relationships, injuries, locations, props and open threads.
+    - Advance the story according to the stated progress and narrative phase.
+    Project-specific workflow instructions:
+    {template_instructions or 'Use the default professional screenwriting workflow.'}
     Return ONLY a JSON object:
     {{
         "scenes": [
@@ -637,7 +677,12 @@ async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, e
     }}
     """
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": "Generate scenes."}]
-    content, usage = await raw_generation(messages, temperature=0.7, json_response=True)
+    content, usage = await raw_generation(
+        messages,
+        temperature=0.7,
+        json_response=True,
+        task_type="outline",
+    )
     if content:
         try:
             import re
@@ -649,7 +694,15 @@ async def generate_scene_batch(logline: str, style_guide: str, start_idx: int, e
             logger.error(f"Batch {start_idx}-{end_idx} JSON Error: {e}")
     return [], usage
 
-async def write_scene_content(logline: str, style_guide: str, current_scene_outline: str, previous_context: str = ""):
+async def write_scene_content(
+    logline: str,
+    style_guide: str,
+    current_scene_outline: str,
+    previous_context: str = "",
+    scene_index: int = 1,
+    total_scenes: int = 1,
+    template_instructions: str = "",
+):
     """
     Step 3: Write the actual script for a scene. Returns (content, usage).
     """
@@ -659,7 +712,9 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
     Project Logline: {logline}
     Style: {style_guide}
     
-    Context from previous scenes:
+    Current Position: Scene {scene_index} of {total_scenes}.
+
+    Story Bible, Timeline and Continuity State:
     {previous_context}
     
     Current Scene Goal:
@@ -668,6 +723,11 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
     Instructions:
     - Write in professional Screenplay format.
     - Be concise but dramatic.
+    - This is Scene {scene_index}, NOT Scene 1. Continue directly from the previous ending.
+    - Do not repeat the opening, inciting incident, character introductions or already resolved events.
+    - Preserve character state, knowledge, relationships, injuries, props, locations and unresolved threads.
+    - Make the ending state explicit enough for Scene {scene_index + 1} to continue.
+    - Apply these project-specific workflow instructions: {template_instructions or 'default screenplay workflow'}
     - IMPORTANT: Write mainly in Chinese (Dialogues and Actions).
     - TRANSLATE SCENE HEADERS: Convert 'INT.' to '内景', 'EXT.' to '外景', 'DAY' to '日', 'NIGHT' to '夜'.
     - FORCE: The output language MUST be Chinese (Simplified) for everything including Headers, Transitions, Dialogue and Actions.
@@ -679,7 +739,7 @@ async def write_scene_content(logline: str, style_guide: str, current_scene_outl
         {"role": "user", "content": "Action! Write in Chinese."}
     ]
     
-    return await raw_generation(messages, temperature=0.8)
+    return await raw_generation(messages, temperature=0.8, task_type="content")
 
 
 async def write_short_video_prompt(
@@ -688,6 +748,7 @@ async def write_short_video_prompt(
     current_scene_outline: str,
     clip_index: int,
     previous_context: str = "",
+    template_instructions: str = "",
 ):
     """
     Generate a single 15-second short-video prompt block.
@@ -701,6 +762,7 @@ async def write_short_video_prompt(
     - 风格与设定: {style_guide}
     - 前文衔接: {previous_context}
     - 本条剧情目标: {current_scene_outline}
+    - 项目工作流要求: {template_instructions or '默认短视频工作流'}
 
     运镜术语库（优先从下列术语中选择并组合）：
     - 推镜头 / 慢推
@@ -749,7 +811,7 @@ async def write_short_video_prompt(
         {"role": "user", "content": "请生成这一条15秒短视频提示词。"}
     ]
 
-    return await raw_generation(messages, temperature=0.7)
+    return await raw_generation(messages, temperature=0.7, task_type="content")
 
 async def rewrite_scene_to_ai_prompt(
     project_type: str,
@@ -758,6 +820,7 @@ async def rewrite_scene_to_ai_prompt(
     scene_outline: str,
     scene_content: str,
     scene_index: int,
+    template_instructions: str = "",
 ):
     """
     Rewrite an existing scene into an AI-generation friendly prompt block.
@@ -805,6 +868,7 @@ async def rewrite_scene_to_ai_prompt(
     3. 运镜语言必须使用专业术语（推镜头/拉镜头/跟拍/环绕/俯拍/仰拍/特写等）。
     4. 描述要具体可执行，避免空泛词。
     {timeline_instruction}
+    项目自定义提示词要求：{template_instructions or '使用默认提示词转写规则'}
     """
 
     user_prompt = f"""
@@ -826,9 +890,14 @@ async def rewrite_scene_to_ai_prompt(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    return await raw_generation(messages, temperature=0.4)
+    return await raw_generation(messages, temperature=0.4, task_type="prompt")
 
-async def generate_interaction_options(step_key: str, base_question: str, context_str: str):
+async def generate_interaction_options(
+    step_key: str,
+    base_question: str,
+    context_str: str,
+    template_instructions: str = "",
+):
     """
     Generates tailored options for a specific step in the Project Bible creation.
     Follows "Snowflake Method" principles (Iterative Expansion).
@@ -866,6 +935,10 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
     The 'value' MUST be the FULL, DETAILED text of the option, not a summary.
     For 'character_details', the 'value' should list all characters with their traits.
     """
+    system_prompt += (
+        "\nProject-specific workflow instructions: "
+        + (template_instructions or "default interaction workflow")
+    )
     
     user_prompt = f"""
     Context:
@@ -904,7 +977,12 @@ async def generate_interaction_options(step_key: str, base_question: str, contex
         {"role": "user", "content": user_prompt}
     ]
 
-    content, usage = await raw_generation(messages, temperature=0.3, json_response=True)
+    content, usage = await raw_generation(
+        messages,
+        temperature=0.3,
+        json_response=True,
+        task_type="interaction",
+    )
     if not content:
         raise InteractionGenerationError(
             f"Empty interaction payload for step: {step_key}",
