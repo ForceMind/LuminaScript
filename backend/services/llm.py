@@ -6,6 +6,7 @@ import re
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from services.llm_config import (
+    AI_CLIENT_USER_AGENT,
     LLMRuntimeConfig,
     create_llm_text_response,
     get_routed_llm_configs,
@@ -30,6 +31,7 @@ def _get_client(config: LLMRuntimeConfig) -> AsyncOpenAI:
             base_url=config.base_url,
             timeout=config.timeout_seconds,
             max_retries=0,
+            default_headers={"User-Agent": AI_CLIENT_USER_AGENT},
         )
         _client_cache[cache_key] = runtime_client
     return runtime_client

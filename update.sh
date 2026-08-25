@@ -231,6 +231,11 @@ if [ ! -d "$PROJECT_DIR/.git" ]; then
     exit 1
 fi
 
+# All Git operations below must run inside the detected project repository.
+# This keeps `miaobi update` and `bash /path/to/update.sh` independent of the
+# caller's current working directory.
+cd "$PROJECT_DIR"
+
 AUTO_RESTORE_PATHS=()
 BLOCKING_CHANGES=()
 

@@ -10,7 +10,7 @@ from urllib.parse import quote
 import zipfile
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +30,7 @@ from services.admin_imports import (
 from services.llm_config import (
     LLMProfileStore,
     LLMRuntimeConfig,
+    connection_error_details,
     get_llm_profile_store,
     get_runtime_llm_config,
     list_llm_models,
@@ -221,6 +222,39 @@ def build_llm_config_update(
     )
 
 
+def ai_config_error_response(
+    exc: Exception,
+    *,
+    api_key: Optional[str],
+    operation: str,
+) -> JSONResponse:
+    status_code, code, message = connection_error_details(exc, api_key)
+    logger.warning(
+        "AI %s failed: status=%s code=%s exception=%s summary=%s",
+        operation,
+        status_code,
+        code,
+        exc.__class__.__name__,
+        safe_connection_error(exc, api_key),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+def ai_config_validation_error(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
 def public_profile_store(store: LLMProfileStore) -> dict[str, Any]:
     return {
         "active_profile": store.active_profile,
@@ -328,14 +362,24 @@ async def test_ai_config(
     try:
         preview = await test_llm_connection(candidate)
     except Exception as exc:
-        logger.warning(
-            "AI configuration connection test failed: %s",
-            exc.__class__.__name__,
+        return ai_config_error_response(
+            exc,
+            api_key=candidate.api_key,
+            operation="connection test",
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"连接测试失败：{safe_connection_error(exc, candidate.api_key)}",
-        ) from exc
+
+    if candidate.max_concurrency == 1:
+        return {
+            "success": True,
+            "message": "连接测试成功",
+            "response_preview": preview,
+            "concurrency_requested": 1,
+            "concurrency_succeeded": 1,
+            "concurrency_failed": 0,
+            "concurrency_supported": True,
+            "recommended_max_concurrency": 1,
+            "error_messages": [],
+        }
 
     try:
         concurrency_result = await test_llm_concurrency(
@@ -390,19 +434,34 @@ async def get_ai_models(
     _admin: models.User = Depends(require_admin),
 ):
     submitted_key = (payload.api_key or "").strip()
+    if not submitted_key and not payload.profile_id:
+        return ai_config_validation_error(
+            status_code=400,
+            code="api_key_or_profile_required",
+            message="api_key 和 profile_id 至少提供一个",
+        )
+
     stored_key = None
-    if payload.profile_id:
+    if not submitted_key and payload.profile_id:
         store = get_llm_profile_store()
         profile = next(
             (item for item in store.profiles if item.profile_id == payload.profile_id),
             None,
         )
-        stored_key = profile.api_key if profile else None
-    else:
-        stored_key = get_runtime_llm_config().api_key
+        if profile is None:
+            return ai_config_validation_error(
+                status_code=422,
+                code="profile_not_found",
+                message="指定的 AI 配置档案不存在",
+            )
+        stored_key = profile.api_key
     api_key = submitted_key or stored_key
     if not api_key:
-        raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+        return ai_config_validation_error(
+            status_code=400,
+            code="api_key_required",
+            message="请先填写或保存 API Key",
+        )
 
     try:
         model_ids = await list_llm_models(
@@ -411,13 +470,17 @@ async def get_ai_models(
             timeout_seconds=payload.timeout_seconds,
         )
     except Exception as exc:
-        logger.warning("AI model list request failed: %s", exc.__class__.__name__)
-        raise HTTPException(
-            status_code=502,
-            detail=f"获取模型失败：{safe_connection_error(exc, api_key)}",
-        ) from exc
+        return ai_config_error_response(
+            exc,
+            api_key=api_key,
+            operation="model list request",
+        )
     if not model_ids:
-        raise HTTPException(status_code=502, detail="模型接口返回成功，但列表为空")
+        return ai_config_validation_error(
+            status_code=502,
+            code="upstream_empty_response",
+            message="模型接口返回成功，但列表为空",
+        )
     return {"models": model_ids}
 
 

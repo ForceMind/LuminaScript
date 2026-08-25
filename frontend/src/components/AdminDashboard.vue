@@ -43,6 +43,7 @@ const aiConfigForm = reactive({
 const aiConfigMeta = reactive({
     api_key_configured: false,
     api_key_masked: '',
+    profile_id: '',
     source: 'environment',
     updated_at: '',
     updated_by: '',
@@ -137,6 +138,8 @@ const getAiStatusType = (status?: string) => {
 }
 
 const getApiErrorMessage = (error: any, fallback: string) => {
+    const structuredMessage = error?.response?.data?.error?.message
+    if (typeof structuredMessage === 'string' && structuredMessage.trim()) return structuredMessage
     const detail = error?.response?.data?.detail
     if (typeof detail === 'string' && detail.trim()) return detail
     if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg)
@@ -154,6 +157,7 @@ const applyAiConfigResponse = (data: any) => {
     aiConfigForm.stream_response = Boolean(data?.stream_response)
     aiConfigMeta.api_key_configured = Boolean(data?.api_key_configured)
     aiConfigMeta.api_key_masked = String(data?.api_key_masked || '')
+    aiConfigMeta.profile_id = String(data?.profile_id || '')
     aiConfigMeta.source = String(data?.source || 'environment')
     aiConfigMeta.updated_at = String(data?.updated_at || '')
     aiConfigMeta.updated_by = String(data?.updated_by || '')
@@ -242,7 +246,9 @@ const fetchAvailableModels = async (target: 'main' | 'profile') => {
         const response = await api.post('/admin/ai-config/models', {
             base_url: form.base_url.trim(),
             api_key: form.api_key.trim() || null,
-            profile_id: target === 'profile' ? profileForm.profile_id.trim() : null,
+            profile_id: target === 'profile'
+                ? profileForm.profile_id.trim()
+                : aiConfigMeta.profile_id || null,
             timeout_seconds: form.timeout_seconds,
         })
         const models = Array.isArray(response.data?.models)

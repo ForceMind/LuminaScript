@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import inspect
 import json
 import logging
 import os
+import re
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel, Field, field_validator
 
 from core.config import BASE_DIR, settings
@@ -17,6 +19,20 @@ from core.config import BASE_DIR, settings
 
 logger = logging.getLogger(__name__)
 RUNTIME_CONFIG_PATH = BASE_DIR / ".llm_runtime.json"
+AI_CLIENT_USER_AGENT = "LuminaScript/0.1"
+
+_SENSITIVE_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"),
+    re.compile(
+        r"(?i)((?:api[_-]?key|access[_-]?token|jwt|password)\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+    ),
+    re.compile(
+        r"(?i)(\"(?:api[_-]?key|access[_-]?token|jwt|password)\"\s*:\s*)"
+        r"\"[^\"]*\""
+    ),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+\-/=]+"),
+)
 
 
 class LLMRuntimeConfig(BaseModel):
@@ -284,11 +300,19 @@ def _responses_output_text(response: Any) -> str:
         if _object_value(item, "type") != "message":
             continue
         for content in _object_value(item, "content", []) or []:
-            if _object_value(content, "type") == "output_text":
-                text = _object_value(content, "text")
-                if text:
-                    parts.append(str(text))
+            text = _object_value(content, "text")
+            if text:
+                parts.append(str(text))
     return "".join(parts)
+
+
+async def _close_async_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 async def create_llm_text_response(
@@ -311,20 +335,23 @@ async def create_llm_text_response(
         parts: list[str] = []
         usage = 0
         completed_response = None
-        async for event in response:
-            event_type = str(_object_value(event, "type", "") or "")
-            if event_type == "response.output_text.delta":
-                delta = _object_value(event, "delta")
-                if delta:
-                    parts.append(str(delta))
-            elif event_type == "response.completed":
-                completed_response = _object_value(event, "response")
-                usage = max(usage, _usage_total_tokens(completed_response))
-            elif event_type in {"response.failed", "error"}:
-                failed_response = _object_value(event, "response", event)
-                error = _object_value(failed_response, "error", failed_response)
-                message = _object_value(error, "message", "Responses API 流式请求失败")
-                raise RuntimeError(str(message))
+        try:
+            async for event in response:
+                event_type = str(_object_value(event, "type", "") or "")
+                if event_type == "response.output_text.delta":
+                    delta = _object_value(event, "delta")
+                    if delta:
+                        parts.append(str(delta))
+                elif event_type == "response.completed":
+                    completed_response = _object_value(event, "response")
+                    usage = max(usage, _usage_total_tokens(completed_response))
+                elif event_type in {"response.failed", "error"}:
+                    failed_response = _object_value(event, "response", event)
+                    error = _object_value(failed_response, "error", failed_response)
+                    message = _object_value(error, "message", "Responses API 流式请求失败")
+                    raise RuntimeError(str(message))
+        finally:
+            await _close_async_stream(response)
         content = "".join(parts)
         if not content and completed_response is not None:
             content = _responses_output_text(completed_response)
@@ -344,9 +371,12 @@ async def create_llm_text_response(
 
     parts: list[str] = []
     usage = 0
-    async for chunk in response:
-        parts.append(_chat_stream_delta_text(chunk))
-        usage = max(usage, _usage_total_tokens(chunk))
+    try:
+        async for chunk in response:
+            parts.append(_chat_stream_delta_text(chunk))
+            usage = max(usage, _usage_total_tokens(chunk))
+    finally:
+        await _close_async_stream(response)
     return "".join(parts), usage
 
 
@@ -359,15 +389,19 @@ async def test_llm_connection(config: LLMRuntimeConfig) -> str:
         base_url=config.base_url,
         timeout=config.timeout_seconds,
         max_retries=0,
+        default_headers={"User-Agent": AI_CLIENT_USER_AGENT},
     )
     try:
         content, _usage = await create_llm_text_response(
             client,
             config,
-            [{"role": "user", "content": "Reply with OK."}],
+            [{"role": "user", "content": "Reply with exactly: OK"}],
             temperature=0,
         )
-        return content.strip()[:100]
+        preview = content.strip()[:100]
+        if not preview:
+            raise RuntimeError("上游返回成功，但未读取到文本内容")
+        return preview
     finally:
         await client.close()
 
@@ -385,6 +419,7 @@ async def test_llm_concurrency(
         base_url=config.base_url,
         timeout=config.timeout_seconds,
         max_retries=0,
+        default_headers={"User-Agent": AI_CLIENT_USER_AGENT},
     )
 
     async def run_probe(index: int) -> str:
@@ -437,6 +472,7 @@ async def list_llm_models(
         base_url=base_url,
         timeout=timeout_seconds,
         max_retries=0,
+        default_headers={"User-Agent": AI_CLIENT_USER_AGENT},
     )
     try:
         page = await client.models.list()
@@ -451,7 +487,44 @@ async def list_llm_models(
 
 
 def safe_connection_error(exc: Exception, api_key: Optional[str]) -> str:
-    message = str(exc).strip() or exc.__class__.__name__
+    message = re.sub(r"[\r\n]+", " ", str(exc)).strip() or exc.__class__.__name__
     if api_key:
         message = message.replace(api_key, "***")
+    for pattern in _SENSITIVE_PATTERNS:
+        message = pattern.sub(
+            lambda match: f"{match.group(1)}***" if match.lastindex else "Bearer ***",
+            message,
+        )
     return message[:500]
+
+
+def connection_error_details(
+    exc: Exception,
+    api_key: Optional[str],
+) -> tuple[int, str, str]:
+    """Map an expected upstream failure to a safe public HTTP error."""
+    if isinstance(exc, (APITimeoutError, asyncio.TimeoutError, TimeoutError)):
+        return 504, "upstream_timeout", "上游 AI 服务请求超时"
+
+    upstream_status = getattr(exc, "status_code", None)
+    if isinstance(exc, APIStatusError) or isinstance(upstream_status, int):
+        safe_message = safe_connection_error(exc, api_key)
+        if upstream_status == 400:
+            return 400, "upstream_bad_request", safe_message
+        if upstream_status in {401, 403}:
+            return 401, "upstream_authentication_failed", safe_message
+        if upstream_status == 422:
+            return 422, "upstream_validation_failed", safe_message
+        if upstream_status in {408, 504}:
+            return 504, "upstream_timeout", "上游 AI 服务请求超时"
+        return 502, "upstream_request_failed", safe_message
+
+    if isinstance(exc, (APIConnectionError, ConnectionError, OSError)):
+        return 502, "upstream_request_failed", "无法连接上游 AI 服务"
+    if isinstance(exc, ValueError):
+        return 400, "invalid_ai_configuration", safe_connection_error(exc, api_key)
+    return (
+        502,
+        "upstream_request_failed",
+        f"上游 AI 请求失败（{exc.__class__.__name__}）",
+    )

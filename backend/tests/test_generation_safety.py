@@ -554,10 +554,11 @@ def test_legacy_upgrade_archives_and_resolves_duplicate_scenes(tmp_path):
 
 
 def test_modular_routers_preserve_public_api_paths():
+    public_paths = main.app.openapi()["paths"]
     routes = {
-        (method, route.path)
-        for route in main.app.routes
-        for method in (route.methods or set())
+        (method.upper(), path)
+        for path, operations in public_paths.items()
+        for method in operations
     }
     assert ("POST", "/token") in routes
     assert ("POST", "/auth/register") in routes

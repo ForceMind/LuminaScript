@@ -51,12 +51,30 @@ app.use('/api', createProxyMiddleware({
     pathRewrite: { '^/api': '' },
     proxyTimeout: 600000,
     timeout: 600000,
-    onProxyReq: (proxyReq, req, res) => {
-        // console.log('Proxy:', req.path, '->', API_URL + req.path);
-    },
-    onError: (err, req, res) => {
-        console.error('Proxy Error:', err);
-        res.status(500).send('Proxy Error');
+    on: {
+        error: (err, req, res) => {
+            const errorCode = String(err && err.code || 'UNKNOWN');
+            const timedOut = errorCode === 'ETIMEDOUT' || errorCode === 'ESOCKETTIMEDOUT';
+            const statusCode = timedOut ? 504 : 502;
+            console.error('API proxy request failed:', {
+                method: String(req && req.method || ''),
+                path: String(req && req.url || '').split('?')[0],
+                error_code: errorCode,
+                status: statusCode,
+            });
+            if (!res || res.destroyed) return;
+            if (res.headersSent) {
+                res.end();
+                return;
+            }
+            res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                error: {
+                    code: timedOut ? 'api_backend_timeout' : 'api_backend_unavailable',
+                    message: timedOut ? 'API 后端响应超时' : 'API 后端暂时不可用',
+                },
+            }));
+        },
     }
 }));
 

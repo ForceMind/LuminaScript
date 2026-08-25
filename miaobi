@@ -151,6 +151,7 @@ run_project_script() {
         echo -e "${YELLOW}当前项目目录: $PROJECT_DIR${NC}"
         return 1
     fi
+    cd "$PROJECT_DIR"
     exec bash "$script_path"
 }
 

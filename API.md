@@ -68,6 +68,10 @@
 - `POST /admin/ai-config/test`：使用提交的配置测试连接，不保存配置
 - `POST /admin/ai-config/models`：使用提交或已保存的密钥读取上游 `/v1/models`
 - API Key 留空表示保留现有密钥；`clear_api_key=true` 表示清除密钥
+- 模型列表请求必须至少提交 `api_key` 或 `profile_id`；显式 `api_key` 优先，
+  `profile_id` 用于从安全存储读取对应密钥
+- AI 上游失败统一返回 `{"error":{"code":"...","message":"..."}}`；上游参数、
+  认证、连接与超时错误分别使用合适的 4xx、502 或 504，响应和日志不会包含完整密钥
 
 ### 多 AI 档案与任务路由
 - `GET /admin/ai-profiles`：读取档案、默认档案和任务路由

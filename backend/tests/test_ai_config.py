@@ -1,9 +1,12 @@
+import asyncio
 import json
+import logging
 import sqlite3
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from openai import AsyncOpenAI
 
 import models
@@ -155,6 +158,45 @@ async def test_admin_can_test_candidate_config_without_saving(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connection_test_returns_structured_timeout(monkeypatch):
+    monkeypatch.setattr(
+        admin_routes,
+        "get_runtime_llm_config",
+        lambda: llm_config.LLMRuntimeConfig(
+            api_key=None,
+            base_url="https://provider.example/v1",
+            model_id="gpt-5.6",
+            timeout_seconds=90,
+            max_concurrency=1,
+        ),
+    )
+
+    async def fake_test(config):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(admin_routes, "test_llm_connection", fake_test)
+    response = await admin_routes.test_ai_config(
+        schemas.AIConfigTestRequest(
+            base_url="https://provider.example/v1",
+            model_id="gpt-5.6",
+            api_key="request-secret",
+            timeout_seconds=90,
+            max_concurrency=1,
+            api_protocol="responses",
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response.status_code == 504
+    assert json.loads(response.body) == {
+        "error": {
+            "code": "upstream_timeout",
+            "message": "上游 AI 服务请求超时",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_concurrency_test_reports_single_request_provider_limit(monkeypatch):
     active_requests = 0
 
@@ -243,6 +285,9 @@ async def test_list_llm_models_deduplicates_results(monkeypatch):
     class FakeClient:
         def __init__(self, **kwargs):
             assert kwargs["api_key"] == "secret"
+            assert kwargs["default_headers"] == {
+                "User-Agent": llm_config.AI_CLIENT_USER_AGENT
+            }
             self.models = SimpleNamespace(list=self.list_models)
 
         async def list_models(self):
@@ -264,6 +309,279 @@ async def test_list_llm_models_deduplicates_results(monkeypatch):
         api_key="secret",
         timeout_seconds=60,
     ) == ["model-a", "model-b"]
+
+
+@pytest.mark.asyncio
+async def test_model_list_base_url_with_v1_does_not_duplicate_path(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"object": "list", "data": [{"id": "gpt-5.6"}]})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = AsyncOpenAI(
+        api_key="path-test-secret",
+        base_url="https://provider.example/v1",
+        http_client=http_client,
+    )
+
+    def client_factory(**kwargs):
+        assert kwargs["base_url"] == "https://provider.example/v1"
+        assert kwargs["default_headers"] == {
+            "User-Agent": llm_config.AI_CLIENT_USER_AGENT
+        }
+        return client
+
+    monkeypatch.setattr(llm_config, "AsyncOpenAI", client_factory)
+    model_ids = await llm_config.list_llm_models(
+        base_url="https://provider.example/v1",
+        api_key="path-test-secret",
+        timeout_seconds=90,
+    )
+
+    assert model_ids == ["gpt-5.6"]
+
+
+@pytest.mark.asyncio
+async def test_model_list_prefers_explicit_key(monkeypatch):
+    stored_profile = llm_config.LLMRuntimeConfig(
+        api_key="stored-secret",
+        base_url="https://provider.example/v1",
+        model_id="gpt-5.6",
+        timeout_seconds=90,
+        max_concurrency=1,
+        profile_id="stored-profile",
+    )
+    monkeypatch.setattr(
+        admin_routes,
+        "get_llm_profile_store",
+        lambda: llm_config.LLMProfileStore(
+            active_profile="stored-profile",
+            profiles=[stored_profile],
+        ),
+    )
+
+    async def fake_list_models(**kwargs):
+        assert kwargs["api_key"] == "explicit-secret"
+        return ["gpt-5.6"]
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    result = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(
+            base_url="https://provider.example/v1",
+            api_key="explicit-secret",
+            profile_id="stored-profile",
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert result == {"models": ["gpt-5.6"]}
+
+
+@pytest.mark.asyncio
+async def test_model_list_requires_api_key_or_profile(monkeypatch):
+    monkeypatch.setattr(
+        admin_routes,
+        "get_runtime_llm_config",
+        lambda: pytest.fail("active profile must not be used implicitly"),
+    )
+    response = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(base_url="https://provider.example/v1"),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": {
+            "code": "api_key_or_profile_required",
+            "message": "api_key 和 profile_id 至少提供一个",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_list_rejects_unknown_profile(monkeypatch):
+    monkeypatch.setattr(
+        admin_routes,
+        "get_llm_profile_store",
+        lambda: llm_config.LLMProfileStore(active_profile="missing", profiles=[]),
+    )
+    response = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(
+            base_url="https://provider.example/v1/",
+            profile_id="missing",
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response.status_code == 422
+    assert json.loads(response.body)["error"]["code"] == "profile_not_found"
+
+
+class FakeUpstreamStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+async def test_model_list_wraps_upstream_400_as_json(monkeypatch):
+    async def fake_list_models(**kwargs):
+        raise FakeUpstreamStatusError(400, "invalid model list request")
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    response = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(
+            base_url="https://provider.example/v1",
+            api_key="request-secret",
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "upstream_bad_request"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_code"),
+    [
+        (ConnectionError("connection refused"), 502, "upstream_request_failed"),
+        (asyncio.TimeoutError(), 504, "upstream_timeout"),
+    ],
+)
+async def test_model_list_maps_network_failures_to_json(
+    monkeypatch,
+    failure,
+    expected_status,
+    expected_code,
+):
+    async def fake_list_models(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    response = await admin_routes.get_ai_models(
+        schemas.AIModelListRequest(
+            base_url="https://provider.example/v1",
+            api_key="request-secret",
+        ),
+        models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+    )
+
+    assert response.status_code == expected_status
+    assert json.loads(response.body)["error"]["code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_ai_error_logs_and_response_redact_credentials(monkeypatch, caplog):
+    secret = "sk-sensitive-value-that-must-not-leak"
+
+    async def fake_list_models(**kwargs):
+        raise FakeUpstreamStatusError(
+            401,
+            f"Authorization: Bearer {secret}; api_key={secret}; "
+            "password=database-secret; jwt=header.payload.signature",
+        )
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    with caplog.at_level(logging.WARNING):
+        response = await admin_routes.get_ai_models(
+            schemas.AIModelListRequest(
+                base_url="https://provider.example/v1",
+                api_key=secret,
+            ),
+            models.User(id=1, username="admin", hashed_password="unused", is_admin=1),
+        )
+
+    serialized_response = response.body.decode("utf-8")
+    log_text = caplog.text
+    assert secret not in serialized_response
+    assert secret not in log_text
+    assert "database-secret" not in serialized_response
+    assert "database-secret" not in log_text
+    assert "header.payload.signature" not in serialized_response
+    assert "header.payload.signature" not in log_text
+    assert "***" in serialized_response
+    assert "***" in log_text
+    assert response.status_code == 401
+    assert json.loads(response.body)["error"]["code"] == "upstream_authentication_failed"
+
+
+@pytest.mark.asyncio
+async def test_expected_handler_error_does_not_stop_service(monkeypatch):
+    attempts = 0
+
+    async def fake_list_models(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("connection refused")
+        return ["gpt-5.6"]
+
+    async def fake_admin():
+        return models.User(
+            id=1,
+            username="admin",
+            hashed_password="unused",
+            is_admin=1,
+        )
+
+    monkeypatch.setattr(admin_routes, "list_llm_models", fake_list_models)
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = fake_admin
+    transport = httpx.ASGITransport(app=app)
+    payload = {
+        "base_url": "https://provider.example/v1",
+        "api_key": "request-secret",
+        "timeout_seconds": 90,
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        failed = await client.post("/admin/ai-config/models", json=payload)
+        succeeded = await client.post("/admin/ai-config/models", json=payload)
+
+    assert failed.status_code == 502
+    assert failed.json()["error"]["code"] == "upstream_request_failed"
+    assert succeeded.status_code == 200
+    assert succeeded.json() == {"models": ["gpt-5.6"]}
+
+
+def test_runtime_client_cache_does_not_share_different_api_keys(monkeypatch):
+    created = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.api_key_marker = kwargs["api_key"]
+            self.user_agent = kwargs["default_headers"]["User-Agent"]
+            created.append(self)
+
+    monkeypatch.setattr(llm, "AsyncOpenAI", FakeClient)
+    llm._client_cache.clear()
+    first = llm._get_client(
+        llm_config.LLMRuntimeConfig(
+            api_key="first-user-secret",
+            base_url="https://provider.example/v1",
+            model_id="gpt-5.6",
+            timeout_seconds=90,
+            max_concurrency=1,
+        )
+    )
+    second = llm._get_client(
+        llm_config.LLMRuntimeConfig(
+            api_key="second-user-secret",
+            base_url="https://provider.example/v1",
+            model_id="gpt-5.6",
+            timeout_seconds=90,
+            max_concurrency=1,
+        )
+    )
+
+    assert first is not second
+    assert first.api_key_marker == "first-user-secret"
+    assert second.api_key_marker == "second-user-secret"
+    assert first.user_agent == llm_config.AI_CLIENT_USER_AGENT
+    assert second.user_agent == llm_config.AI_CLIENT_USER_AGENT
+    assert len(created) == 2
+    llm._client_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -385,8 +703,13 @@ async def test_generation_supports_responses_api(monkeypatch):
 @pytest.mark.asyncio
 async def test_generation_aggregates_responses_stream_events(monkeypatch):
     captured = {}
+    stream_closed = False
 
     class FakeStream:
+        async def close(self):
+            nonlocal stream_closed
+            stream_closed = True
+
         def __aiter__(self):
             async def events():
                 yield SimpleNamespace(type="response.output_text.delta", delta="流式")
@@ -421,6 +744,7 @@ async def test_generation_aggregates_responses_stream_events(monkeypatch):
     assert content == "流式完成"
     assert tokens == 17
     assert captured["stream"] is True
+    assert stream_closed is True
 
 
 @pytest.mark.asyncio
@@ -469,7 +793,9 @@ async def test_connection_test_supports_responses_profile(monkeypatch):
             self.responses = SimpleNamespace(create=self.create)
 
         async def create(self, **kwargs):
-            assert kwargs["input"] == [{"role": "user", "content": "Reply with OK."}]
+            assert kwargs["input"] == [
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
             assert kwargs["stream"] is False
             return SimpleNamespace(output_text="OK", usage=None)
 
