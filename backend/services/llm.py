@@ -1024,3 +1024,92 @@ async def generate_interaction_options(
         raise
 
     return normalized_payload, usage
+
+
+async def generate_quick_setup_draft(
+    *,
+    logline: str,
+    current_context: dict,
+    field_specs: list[dict],
+    template_instructions: str = "",
+) -> tuple[dict[str, str], int]:
+    """Generate one coherent project-bible draft for all requested fields."""
+    requested_fields = [
+        {
+            "key": str(item.get("key", "")).strip(),
+            "question": str(item.get("question", "")).strip(),
+        }
+        for item in field_specs
+        if str(item.get("key", "")).strip()
+    ]
+    system_prompt = """
+    你是一名专业编剧顾问和故事架构师。请根据用户创意，一次性生成一份内部一致的完整剧本设定草案。
+
+    关键规则：
+    1. 所有字段必须属于同一个连贯方案；剧情、人物、关键转折、主题和视觉风格不得互相矛盾。
+    2. current_context 中已有的非空值是用户已经确认的约束，必须原样保留，不能改写。
+    3. project_type 只能是 movie、tv、short、short_video 之一。
+    4. 根据 project_type 填写对应规模字段：
+       - movie：movie_duration、scene_count_target
+       - tv/short：episode_count、episode_duration
+       - short_video：video_duration_seconds
+       不相关的规模字段可以为空字符串。
+    5. story_expansion 必须包含完整推进逻辑；character_details 必须包含主角、对手和关键配角；
+       plot_details 必须包含关键冲突、转折和高潮。
+    6. title 只填写题目本身，不要附带解释。
+    7. 全部内容使用简体中文。
+    8. 只返回 JSON，不要 Markdown，不要额外解释。
+
+    返回格式：
+    {
+      "fields": {
+        "project_type": "movie",
+        "字段名": "完整字段值"
+      }
+    }
+    """
+    if template_instructions:
+        system_prompt += f"\n项目专属要求：{template_instructions}\n"
+
+    user_prompt = (
+        f"用户创意：\n{logline}\n\n"
+        f"已经确认的设定：\n{json.dumps(current_context or {}, ensure_ascii=False)}\n\n"
+        f"需要完成的字段：\n{json.dumps(requested_fields, ensure_ascii=False)}"
+    )
+    content, usage = await raw_generation(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.35,
+        json_response=True,
+        task_type="interaction",
+    )
+    if not content:
+        raise InteractionGenerationError(
+            "Empty quick setup draft",
+            error_type="empty_quick_setup_draft",
+        )
+
+    parsed = _load_json_payload(content)
+    if not isinstance(parsed, dict):
+        raise InteractionGenerationError(
+            "Invalid quick setup draft JSON",
+            raw_content=content,
+            error_type="quick_setup_json_parse_failed",
+        )
+    raw_fields = parsed.get("fields", parsed)
+    if not isinstance(raw_fields, dict):
+        raise InteractionGenerationError(
+            "Quick setup draft is missing fields",
+            raw_content=content,
+            error_type="quick_setup_fields_missing",
+        )
+
+    allowed_keys = {item["key"] for item in requested_fields}
+    fields = {
+        str(key): str(value or "").strip()
+        for key, value in raw_fields.items()
+        if str(key) in allowed_keys
+    }
+    return fields, usage

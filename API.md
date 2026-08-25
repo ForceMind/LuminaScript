@@ -33,11 +33,20 @@
 - `GET /projects/{project_id}`
 - 返回完整项目信息，包含 `scenes`
 
-### 提交设定交互
-- `POST /projects/{project_id}/interact`
-
 ### 分析并推进提问流程
 - `POST /projects/{project_id}/analyze`
+- 新项目首先返回 `setup_mode`，可选 `ai_fast`（AI 快速完成）或 `guided`（自己掌控）
+- `ai_fast` 会返回 `quick_review` 完整草案；草案在确认前只缓存，不写入项目正式设定
+
+### 提交单项设定或切换设定方式
+- `POST /projects/{project_id}/interact`
+- 切换方式时使用 `context_key=setup_mode`，`answer=ai_fast|guided`
+
+### 确认 AI 快速设定草案
+- `POST /projects/{project_id}/setup/quick-review`
+- `action=confirm`：校验并原子写入整份草案
+- `action=guided`：丢弃未确认草案并切换到逐步掌控
+- 请求必须携带草案返回的 `context_revision`；项目已被其他标签页修改时返回 `409`
 
 ### 生成分场大纲
 - `POST /projects/{project_id}/generate_scenes`

@@ -2,10 +2,11 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -145,6 +146,21 @@ SETUP_FLOW_STEPS = [
     {"key": "final_confirm", "question": "以上是剧本的完整设定，请确认是否可以开始生成分场大纲？", "is_confirmation": True}
 ]
 
+SETUP_MODE_KEY = "_setup_mode"
+SETUP_MODE_FIELD = "setup_mode"
+SETUP_MODE_AI_FAST = "ai_fast"
+SETUP_MODE_GUIDED = "guided"
+QUICK_REVIEW_FIELD = "quick_review"
+QUICK_EDITED_FIELDS_KEY = "_quick_setup_user_edited_fields"
+QUICK_CONTROL_FIELDS = {
+    "project_type",
+    "movie_duration",
+    "scene_count_target",
+    "episode_count",
+    "episode_duration",
+    "video_duration_seconds",
+}
+
 FINAL_CONFIRM_EDIT_TARGETS = [
     ("story_expansion", "返回修改剧情大纲"),
     ("character_details", "返回修改人物设定"),
@@ -171,10 +187,11 @@ AUTO_PREFILL_FIELDS = [
 
 MAX_INTERACTION_ATTEMPTS = 2
 MAX_INTERACTION_ANSWER_LENGTH = 20000
+MAX_QUICK_SETUP_TOTAL_LENGTH = 60000
 ALLOWED_PROJECT_TYPES = {"movie", "tv", "short", "short_video"}
 ALLOWED_INTERACTION_CONTEXT_KEYS = {
     step["key"] for step in SETUP_FLOW_STEPS
-}
+} | {SETUP_MODE_FIELD}
 NUMERIC_INTERACTION_LIMITS = {
     "movie_duration": (30, 300),
     "scene_count_target": (1, 200),
@@ -200,6 +217,121 @@ def get_relevant_setup_steps(project_type: str) -> List[Dict[str, Any]]:
             continue
         relevant_steps.append(step)
     return relevant_steps
+
+
+def get_setup_value(
+    project: models.Project,
+    context: Dict[str, Any],
+    key: str,
+) -> Any:
+    if key == "project_type":
+        if project.project_type and project.project_type != "pending":
+            return project.project_type
+        return context.get(key)
+    if key == "title":
+        return context.get(key) or ""
+    return context.get(key)
+
+
+def has_existing_setup_progress(project: models.Project) -> bool:
+    if project.project_type and project.project_type != "pending":
+        return True
+    context = build_normalized_context(project)
+    return any(
+        str(value or "").strip()
+        for key, value in context.items()
+        if key in {step["key"] for step in SETUP_FLOW_STEPS}
+    )
+
+
+def build_setup_context_revision(project: models.Project) -> str:
+    internal_context = get_internal_project_context(project)
+    payload = {
+        "project_type": project.project_type or "pending",
+        "logline": project.logline or "",
+        "setup_mode": internal_context.get(SETUP_MODE_KEY, ""),
+        "context": build_normalized_context(project),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def quick_setup_field_specs() -> List[Dict[str, str]]:
+    return [
+        {"key": step["key"], "question": step["question"]}
+        for step in SETUP_FLOW_STEPS
+        if step["key"] != "final_confirm"
+    ]
+
+
+def normalize_quick_setup_values(
+    project: models.Project,
+    raw_values: Dict[str, Any],
+    *,
+    preserve_existing: bool = True,
+) -> Dict[str, str]:
+    current_context = build_normalized_context(project)
+    merged_values = dict(raw_values or {})
+    if preserve_existing:
+        for step in SETUP_FLOW_STEPS:
+            key = step["key"]
+            existing_value = get_setup_value(project, current_context, key)
+            if str(existing_value or "").strip():
+                merged_values[key] = existing_value
+
+    raw_project_type = merged_values.get("project_type")
+    try:
+        project_type = validate_interaction_answer("project_type", raw_project_type)
+    except HTTPException as exc:
+        raise ValueError("AI 未能确定有效的剧本类型") from exc
+    merged_values["project_type"] = project_type
+
+    normalized: Dict[str, str] = {}
+    for step in get_relevant_setup_steps(project_type):
+        key = step["key"]
+        if key == "final_confirm":
+            continue
+        raw_value = merged_values.get(key)
+        if key in QUICK_CONTROL_FIELDS:
+            try:
+                value = validate_interaction_answer(key, raw_value)
+            except HTTPException as exc:
+                raise ValueError(f"{SUMMARY_LABELS.get(key, key)}缺少有效值") from exc
+        else:
+            value = normalize_extracted_setup_value(key, raw_value)
+            if not value:
+                raise ValueError(f"{SUMMARY_LABELS.get(key, key)}缺少有效值")
+        normalized[key] = value
+    return normalized
+
+
+def build_quick_review_sections(
+    project: models.Project,
+    values: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    existing_context = build_normalized_context(project)
+    sections: List[Dict[str, Any]] = []
+    for step in get_relevant_setup_steps(values["project_type"]):
+        key = step["key"]
+        if key == "final_confirm":
+            continue
+        existing_value = get_setup_value(project, existing_context, key)
+        sections.append(
+            {
+                "key": key,
+                "label": SUMMARY_LABELS.get(key, key),
+                "question": step["question"],
+                "value": values[key],
+                "editable": key not in QUICK_CONTROL_FIELDS,
+                "source": "confirmed" if str(existing_value or "").strip() else "ai",
+            }
+        )
+    return sections
 
 TITLE_PATTERNS = [
     re.compile(r"《\s*([^《》\n]{1,60}?)\s*》"),
@@ -871,6 +1003,36 @@ class InteractionRequest(BaseModel):
             raise ValueError("不支持的交互字段")
         return normalized
 
+
+class QuickSetupReviewRequest(BaseModel):
+    action: Literal["confirm", "guided"] = "confirm"
+    values: Dict[str, str] = Field(default_factory=dict)
+    edited_fields: List[str] = Field(default_factory=list, max_length=20)
+    context_revision: str = Field(min_length=8, max_length=128)
+
+    @field_validator("values")
+    @classmethod
+    def validate_quick_setup_values(cls, value: Dict[str, str]) -> Dict[str, str]:
+        allowed = {step["key"] for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm"}
+        normalized: Dict[str, str] = {}
+        for key, raw_value in value.items():
+            normalized_key = str(key or "").strip()
+            if normalized_key not in allowed:
+                raise ValueError(f"不支持的快速设定字段: {normalized_key}")
+            text = str(raw_value or "").strip()
+            if len(text) > MAX_INTERACTION_ANSWER_LENGTH:
+                raise ValueError(f"字段 {normalized_key} 内容过长")
+            normalized[normalized_key] = text
+        if sum(len(item) for item in normalized.values()) > MAX_QUICK_SETUP_TOTAL_LENGTH:
+            raise ValueError("快速设定草案总内容过长")
+        return normalized
+
+    @field_validator("edited_fields")
+    @classmethod
+    def validate_edited_fields(cls, value: List[str]) -> List[str]:
+        allowed = {step["key"] for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm"}
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip() in allowed))
+
 class ContentReviewRequest(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
 
@@ -926,6 +1088,21 @@ async def submit_interaction(
         interaction.context_key,
         interaction.answer,
     )
+    if interaction.context_key == SETUP_MODE_FIELD:
+        if answer_text not in {SETUP_MODE_AI_FAST, SETUP_MODE_GUIDED}:
+            raise HTTPException(status_code=422, detail="不支持的设定方式")
+        current_context[SETUP_MODE_KEY] = answer_text
+        project.global_context = current_context
+        project.next_step_cache = None
+        await db.commit()
+        return {
+            "status": "setup_mode_updated",
+            "setup_mode": answer_text,
+            "context": project.global_context,
+            "title": project.title or previous_title or "",
+            "total_tokens": int(project.total_tokens or 0),
+        }
+
     if interaction.context_key == 'final_confirm' and answer_text == 'reset':
         logger.info(f"项目 {project_id} 收到重置请求，清空上下文重新开始设定流程")
         project.global_context = {}
@@ -980,6 +1157,80 @@ async def submit_interaction(
     }
 
 
+@app.post("/projects/{project_id}/setup/quick-review")
+async def submit_quick_setup_review(
+    project_id: int,
+    payload: QuickSetupReviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    project, _ = await require_project_access(
+        db,
+        project_id,
+        current_user.id,
+        minimum_role="editor",
+    )
+    current_revision = build_setup_context_revision(project)
+    if payload.context_revision != current_revision:
+        raise HTTPException(
+            status_code=409,
+            detail="项目设定已在其他位置更新，请刷新快速草案后重试。",
+        )
+
+    current_context = get_internal_project_context(project)
+    if payload.action == "guided":
+        current_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
+        current_context.pop(QUICK_EDITED_FIELDS_KEY, None)
+        project.global_context = current_context
+        project.next_step_cache = None
+        await db.commit()
+        return {
+            "status": "guided",
+            "setup_mode": SETUP_MODE_GUIDED,
+            "context": project.global_context,
+            "title": project.title or "",
+            "total_tokens": int(project.total_tokens or 0),
+        }
+
+    try:
+        normalized_values = normalize_quick_setup_values(
+            project,
+            payload.values,
+            preserve_existing=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    for derived_key in (
+        "synopsis_brief",
+        "synopsis_detailed",
+        "brief_synopsis",
+        "detailed_synopsis",
+        "story_brief",
+        "story_detailed",
+    ):
+        current_context.pop(derived_key, None)
+
+    project.project_type = normalized_values["project_type"]
+    for key, value in normalized_values.items():
+        current_context[key] = value
+    project.title = normalized_values["title"]
+    current_context[SETUP_MODE_KEY] = SETUP_MODE_AI_FAST
+    current_context[QUICK_EDITED_FIELDS_KEY] = payload.edited_fields
+    current_context["final_confirm"] = "confirmed"
+    project.global_context = current_context
+    project.next_step_cache = None
+    await db.commit()
+
+    return {
+        "status": "confirmed",
+        "setup_mode": SETUP_MODE_AI_FAST,
+        "context": project.global_context,
+        "title": project.title,
+        "total_tokens": int(project.total_tokens or 0),
+    }
+
+
 @app.post("/projects/{project_id}/analyze")
 async def analyze_logline(
     project_id: int, 
@@ -1002,6 +1253,9 @@ async def analyze_logline(
     def with_runtime_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(payload or {})
         result["total_tokens"] = int(project.total_tokens or 0)
+        result["setup_mode"] = str(
+            get_internal_project_context(project).get(SETUP_MODE_KEY, "") or ""
+        )
         return result
 
     normalized = False
@@ -1013,6 +1267,36 @@ async def analyze_logline(
         await db.commit()
 
     normalized_context = build_normalized_context(project)
+    internal_context = get_internal_project_context(project)
+    setup_mode = str(internal_context.get(SETUP_MODE_KEY, "") or "").strip()
+    if setup_mode not in {SETUP_MODE_AI_FAST, SETUP_MODE_GUIDED}:
+        if has_existing_setup_progress(project):
+            internal_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
+            project.global_context = internal_context
+            setup_mode = SETUP_MODE_GUIDED
+            await db.commit()
+        else:
+            return with_runtime_meta(
+                {
+                    "type": "interaction_required",
+                    "payload": {
+                        "field": SETUP_MODE_FIELD,
+                        "question": "你希望如何完善故事设定？",
+                        "options": [
+                            {
+                                "label": "✨ AI 快速完成",
+                                "value": SETUP_MODE_AI_FAST,
+                                "description": "AI 生成一份完整且连贯的设定草案，你只需检查和修改有疑问的内容。",
+                            },
+                            {
+                                "label": "🎛️ 自己掌控",
+                                "value": SETUP_MODE_GUIDED,
+                                "description": "逐项决定剧情、人物、主题和视觉方向，完整控制每一个创作决定。",
+                            },
+                        ],
+                    },
+                }
+            )
 
     if should_auto_prefill_from_logline(project, normalized_context):
         filled_fields: List[str] = []
@@ -1059,7 +1343,105 @@ async def analyze_logline(
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
-    context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
+    if setup_mode == SETUP_MODE_AI_FAST and "final_confirm" not in normalized_context:
+        field_specs = quick_setup_field_specs()
+        interaction_template = await get_prompt_addendum(
+            db,
+            stage="interaction",
+            project_type=(
+                project.project_type
+                if project.project_type and project.project_type != "pending"
+                else "all"
+            ),
+        )
+        draft_values: Optional[Dict[str, str]] = None
+        draft_usage = 0
+        last_error: Optional[Exception] = None
+        for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
+            try:
+                generated_values, draft_usage = await llm.generate_quick_setup_draft(
+                    logline=project.logline or "",
+                    current_context=normalized_context,
+                    field_specs=field_specs,
+                    template_instructions=interaction_template,
+                )
+                draft_values = normalize_quick_setup_values(project, generated_values)
+                background_tasks.add_task(
+                    log_ai_action,
+                    user_id=current_user.id,
+                    project_id=project_id,
+                    action="generate_quick_setup_draft",
+                    prompt=project.logline or "",
+                    response=json.dumps(draft_values, ensure_ascii=False),
+                    tokens=draft_usage,
+                    status="success",
+                    step_key=QUICK_REVIEW_FIELD,
+                    attempt=attempt,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                await log_ai_action(
+                    user_id=current_user.id,
+                    project_id=project_id,
+                    action="generate_quick_setup_draft",
+                    prompt=project.logline or "",
+                    response="",
+                    tokens=0,
+                    status="failed",
+                    step_key=QUICK_REVIEW_FIELD,
+                    error_type=type(exc).__name__,
+                    error_message=f"快速设定生成失败（{type(exc).__name__}）",
+                    attempt=attempt,
+                )
+                logger.warning(
+                    "项目 %s 快速设定草案第 %s 次生成失败: %s",
+                    project_id,
+                    attempt,
+                    type(exc).__name__,
+                )
+
+        if draft_values is None:
+            return with_runtime_meta(
+                {
+                    "type": "interaction_required",
+                    "payload": {
+                        "field": SETUP_MODE_FIELD,
+                        "question": (
+                            "AI 快速设定暂时生成失败，你可以重试或切换到自己掌控。"
+                            if last_error is not None
+                            else "AI 未返回有效草案，请选择下一步。"
+                        ),
+                        "options": [
+                            {
+                                "label": "✨ 重试 AI 快速完成",
+                                "value": SETUP_MODE_AI_FAST,
+                                "description": "重新联合生成一份完整故事设定草案。",
+                            },
+                            {
+                                "label": "🎛️ 切换到自己掌控",
+                                "value": SETUP_MODE_GUIDED,
+                                "description": "保留已经确认的内容，从下一项缺失设定继续。",
+                            },
+                        ],
+                    },
+                }
+            )
+
+        if draft_usage:
+            await increment_project_tokens(db, project, draft_usage)
+        response_payload = {
+            "type": "interaction_required",
+            "payload": {
+                "field": QUICK_REVIEW_FIELD,
+                "question": "AI 已完成整套故事设定，请展开有疑问的内容进行修改。",
+                "context_revision": build_setup_context_revision(project),
+                "sections": build_quick_review_sections(project, draft_values),
+            },
+        }
+        project.next_step_cache = response_payload
+        await db.commit()
+        return with_runtime_meta(response_payload)
 
     # 1. Check which steps are missing
     # Important: 'project_type' is stored in column, others in global_context

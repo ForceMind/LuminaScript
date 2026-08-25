@@ -81,6 +81,9 @@ const currentProject = ref<any>(null)
 const interaction = ref<any>(null)
 const selectedOption = ref('')
 const customInput = ref('')
+const quickReviewValues = ref<Record<string, string>>({})
+const quickReviewExpanded = ref<string[]>([])
+const quickReviewEditedFields = ref<string[]>([])
 const loading = ref(false)
 const loadingText = ref('AI 正在思考中...')
 const switchingProject = ref(false)
@@ -429,8 +432,16 @@ const characterDetailsText = computed(() => {
 })
 
 const isControlInteractionField = (field: string) => {
-    return ['final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration'].includes(field)
+    return ['setup_mode', 'quick_review', 'final_confirm', 'project_type', 'movie_duration', 'scene_count_target', 'episode_count', 'episode_duration'].includes(field)
 }
+
+const interactionField = computed(() => toTextValue(interaction.value?.field || '').trim())
+
+const canOfferFastCompletion = computed(() => {
+    const field = interactionField.value
+    if (!field || ['setup_mode', 'quick_review', 'final_confirm'].includes(field)) return false
+    return toTextValue(currentProject.value?.global_context?._setup_mode) === 'guided'
+})
 
 const canUseCustomInput = computed(() => {
     const field = toTextValue(interaction.value?.field || '').trim()
@@ -451,7 +462,7 @@ const shouldShowOptionValue = (opt: any) => {
     const label = toTextValue(opt?.label).trim()
     const value = toTextValue(opt?.value).trim()
     if (!value || value === label) return false
-    if (value.length <= 24 && /^(movie|tv|short|short_video|\d+|confirmed|reset|edit:)/.test(value)) return false
+    if (value.length <= 24 && /^(movie|tv|short|short_video|ai_fast|guided|\d+|confirmed|reset|edit:)/.test(value)) return false
     return true
 }
 
@@ -873,6 +884,98 @@ const createProject = async () => {
   }
 }
 
+
+const initializeQuickReview = (payload: any) => {
+    const values: Record<string, string> = {}
+    for (const section of Array.isArray(payload?.sections) ? payload.sections : []) {
+        const key = toTextValue(section?.key).trim()
+        if (key) values[key] = toTextValue(section?.value)
+    }
+    quickReviewValues.value = values
+    quickReviewExpanded.value = []
+    quickReviewEditedFields.value = []
+}
+
+const markQuickReviewFieldEdited = (key: string) => {
+    if (!quickReviewEditedFields.value.includes(key)) {
+        quickReviewEditedFields.value = [...quickReviewEditedFields.value, key]
+    }
+}
+
+const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
+    if (!currentProject.value?.id) return
+    loading.value = true
+    loadingText.value = mode === 'ai_fast'
+        ? 'AI 正在联合生成完整故事设定...'
+        : '正在进入逐步掌控模式...'
+    try {
+        const response = await api.post(`/projects/${currentProject.value.id}/interact`, {
+            answer: mode,
+            context_key: 'setup_mode',
+        })
+        if (response.data?.context) currentProject.value.global_context = response.data.context
+        syncProjectTokensFromResponse(response.data)
+        interaction.value = null
+        await analyzeLogline(currentProject.value.id)
+    } catch (e: any) {
+        console.error(e)
+        ElMessage.error(e.response?.data?.detail || '切换设定方式失败，请稍后重试')
+    } finally {
+        loading.value = false
+    }
+}
+
+const submitQuickReview = async (action: 'confirm' | 'guided') => {
+    if (!currentProject.value?.id || interactionField.value !== 'quick_review') return
+    const values = { ...quickReviewValues.value }
+    if (action === 'confirm') {
+        for (const section of interaction.value?.sections || []) {
+            const key = toTextValue(section?.key).trim()
+            if (!key || !toTextValue(values[key]).trim()) {
+                ElMessage.warning(`请完善“${toTextValue(section?.label) || key}”后再确认`)
+                return
+            }
+        }
+    }
+
+    loading.value = true
+    loadingText.value = action === 'confirm'
+        ? '正在保存完整设定...'
+        : '正在切换到逐步掌控...'
+    try {
+        if (action === 'confirm') {
+            for (const key of quickReviewEditedFields.value) {
+                values[key] = await reviewAndMaybeRewriteInput(
+                    values[key],
+                    getContextFieldLabel(key),
+                )
+            }
+        }
+        const response = await api.post(
+            `/projects/${currentProject.value.id}/setup/quick-review`,
+            {
+                action,
+                values,
+                edited_fields: quickReviewEditedFields.value,
+                context_revision: interaction.value?.context_revision,
+            },
+        )
+        if (response.data?.context) currentProject.value.global_context = response.data.context
+        if (response.data?.title) currentProject.value.title = response.data.title
+        syncProjectTokensFromResponse(response.data)
+        interaction.value = null
+        quickReviewValues.value = {}
+        quickReviewExpanded.value = []
+        quickReviewEditedFields.value = []
+        await analyzeLogline(currentProject.value.id)
+    } catch (e: any) {
+        console.error(e)
+        ElMessage.error(e.response?.data?.detail || '快速设定提交失败，请稍后重试')
+    } finally {
+        loading.value = false
+    }
+}
+
 const analyzeLogline = async (id: number) => {
   if (!id) {
     console.error("Analysis invoked without ID")
@@ -885,9 +988,18 @@ const analyzeLogline = async (id: number) => {
     
     const res = await api.post(`/projects/${id}/analyze`)
     syncProjectTokensFromResponse(res.data)
+    if (res.data?.setup_mode && currentProject.value) {
+        currentProject.value.global_context = {
+            ...(currentProject.value.global_context || {}),
+            _setup_mode: res.data.setup_mode,
+        }
+    }
     
     if (res.data.type === 'interaction_required') {
       interaction.value = res.data.payload
+      if (interaction.value?.field === 'quick_review') {
+          initializeQuickReview(interaction.value)
+      }
       // Reset inputs
       selectedOption.value = ''
       customInput.value = '' 
@@ -999,6 +1111,9 @@ const startNewProject = () => {
     currentProject.value = null
     projectJobs.value = []
     interaction.value = null
+    quickReviewValues.value = {}
+    quickReviewExpanded.value = []
+    quickReviewEditedFields.value = []
     loading.value = false
     switchingProject.value = false
     scenePromptMap.value = {}
@@ -1033,6 +1148,9 @@ const loadProject = async (p: any) => {
         projectJobs.value = []
         drawerOpen.value = false
         interaction.value = null
+        quickReviewValues.value = {}
+        quickReviewExpanded.value = []
+        quickReviewEditedFields.value = []
 
         const detailedProject = await fetchProjectDetail(p.id)
         if (detailedProject) {
@@ -1601,10 +1719,14 @@ const copyText = (value: unknown) => {
                 </div>
 
                 <!-- Stage 2: Interaction -->
-                <div v-if="currentProject && interaction" class="w-full max-w-2xl mt-8 animate-fade-in-up flex gap-6">
+                <div
+                    v-if="currentProject && interaction"
+                    class="w-full mt-8 animate-fade-in-up flex gap-6"
+                    :class="interactionField === 'quick_review' ? 'max-w-5xl' : 'max-w-2xl'"
+                >
                      
                      <!-- Project Context Sidebar -->
-                     <div class="hidden md:block w-64 shrink-0 space-y-4">
+                     <div v-if="!['setup_mode', 'quick_review'].includes(interactionField)" class="hidden md:block w-64 shrink-0 space-y-4">
                         <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
                              <div class="text-xs font-bold text-gray-400 uppercase mb-2">当前设定</div>
                              <div class="space-y-3 text-sm">
@@ -1649,40 +1771,110 @@ const copyText = (value: unknown) => {
                                 <!-- Spinner is in header, this disables clicks -->
                             </div>
 
-                            <div class="space-y-3 mb-6">
-                                <button 
-                                    v-for="opt in interaction.options" 
+                            <div v-if="interactionField === 'setup_mode'" class="grid gap-4 md:grid-cols-2">
+                                <button
+                                    v-for="opt in interaction.options"
                                     :key="opt.value"
-                                    @click="handleOptionSelect(opt)"
-                                    class="w-full text-left p-4 rounded-xl border-2 transition-all duration-200 flex items-center justify-between group hover:shadow-sm"
-                                    :class="selectedOption === opt.value ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-100 hover:border-blue-200 hover:bg-gray-50'"
+                                    class="text-left rounded-2xl border-2 border-gray-100 p-6 transition hover:border-blue-400 hover:bg-blue-50 hover:shadow-md"
+                                    @click="chooseSetupMode(opt.value)"
                                 >
-                                    <div>
-                                        <div class="font-medium text-base">{{ opt.label }}</div>
-                                        <div v-if="shouldShowOptionValue(opt)" class="text-sm text-gray-500 mt-1 font-light">{{ opt.value }}</div>
-                                    </div>
-                                    <div v-if="selectedOption === opt.value" class="w-5 h-5 bg-blue-500 rounded-full flex items-center justify-center shrink-0">
-                                        <div class="w-2 h-2 bg-white rounded-full"></div>
-                                    </div>
+                                    <div class="text-xl font-medium text-slate-800 mb-3">{{ opt.label }}</div>
+                                    <div class="text-sm leading-6 text-gray-500">{{ opt.description }}</div>
                                 </button>
                             </div>
-                            
-                            <!-- Custom Input -->
-                             <div v-if="canUseCustomInput" class="relative">
-                                <div class="absolute -top-3 left-2 px-1 bg-white text-xs font-bold text-gray-400">或者自行输入</div>
-                                <el-input 
-                                    v-model="customInput"
-                                    :placeholder="customInputPlaceholder"
-                                    size="large"
-                                    @input="selectedOption = ''"
-                                />
-                             </div>
 
-                            <div class="mt-8">
-                                <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput" :loading="loading">
-                                    下一步
-                                </el-button>
+                            <div v-else-if="interactionField === 'quick_review'">
+                                <div class="mb-5 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-blue-800">
+                                    AI 已把所有答案作为一套完整方案联合生成。默认可直接采用；只需展开你有疑问的部分修改。
+                                    类型与规模属于结构条件，如需调整请切换到“自己掌控”。
+                                </div>
+                                <el-collapse v-model="quickReviewExpanded" class="quick-setup-review">
+                                    <el-collapse-item
+                                        v-for="section in interaction.sections"
+                                        :key="section.key"
+                                        :name="section.key"
+                                    >
+                                        <template #title>
+                                            <div class="flex min-w-0 flex-1 items-center gap-3 pr-4">
+                                                <span class="shrink-0 font-medium text-slate-700">{{ section.label }}</span>
+                                                <el-tag size="small" :type="section.source === 'confirmed' ? 'success' : 'info'">
+                                                    {{ section.source === 'confirmed' ? '已确认' : 'AI 推荐' }}
+                                                </el-tag>
+                                                <span class="min-w-0 flex-1 truncate text-right text-sm text-gray-400">
+                                                    {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
+                                                </span>
+                                            </div>
+                                        </template>
+                                        <div class="px-2 pb-3">
+                                            <div class="mb-2 text-xs leading-5 text-gray-400">{{ section.question }}</div>
+                                            <el-input
+                                                v-if="section.editable"
+                                                v-model="quickReviewValues[section.key]"
+                                                type="textarea"
+                                                :autosize="{ minRows: section.key === 'title' ? 1 : 3, maxRows: 12 }"
+                                                @input="markQuickReviewFieldEdited(section.key)"
+                                            />
+                                            <div v-else class="rounded-lg bg-gray-50 p-3 text-sm text-gray-700">
+                                                {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
+                                            </div>
+                                        </div>
+                                    </el-collapse-item>
+                                </el-collapse>
+                                <div class="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-between">
+                                    <div class="flex gap-2">
+                                        <el-button @click="chooseSetupMode('ai_fast')" :loading="loading">重新生成整份</el-button>
+                                        <el-button @click="submitQuickReview('guided')" :loading="loading">切换到自己掌控</el-button>
+                                    </div>
+                                    <el-button type="primary" @click="submitQuickReview('confirm')" :loading="loading">
+                                        采用草案并继续
+                                    </el-button>
+                                </div>
                             </div>
+
+                            <template v-else>
+                                <div class="space-y-3 mb-6">
+                                    <button
+                                        v-for="opt in interaction.options"
+                                        :key="opt.value"
+                                        @click="handleOptionSelect(opt)"
+                                        class="w-full text-left p-4 rounded-xl border-2 transition-all duration-200 flex items-center justify-between group hover:shadow-sm"
+                                        :class="selectedOption === opt.value ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-100 hover:border-blue-200 hover:bg-gray-50'"
+                                    >
+                                        <div>
+                                            <div class="font-medium text-base">{{ opt.label }}</div>
+                                            <div v-if="shouldShowOptionValue(opt)" class="text-sm text-gray-500 mt-1 font-light">{{ opt.value }}</div>
+                                        </div>
+                                        <div v-if="selectedOption === opt.value" class="w-5 h-5 bg-blue-500 rounded-full flex items-center justify-center shrink-0">
+                                            <div class="w-2 h-2 bg-white rounded-full"></div>
+                                        </div>
+                                    </button>
+                                </div>
+
+                                <div v-if="canUseCustomInput" class="relative">
+                                    <div class="absolute -top-3 left-2 px-1 bg-white text-xs font-bold text-gray-400">或者自行输入</div>
+                                    <el-input
+                                        v-model="customInput"
+                                        :placeholder="customInputPlaceholder"
+                                        size="large"
+                                        @input="selectedOption = ''"
+                                    />
+                                </div>
+
+                                <div class="mt-8 flex flex-col gap-3">
+                                    <el-button
+                                        v-if="canOfferFastCompletion"
+                                        plain
+                                        class="w-full !rounded-xl !h-11"
+                                        @click="chooseSetupMode('ai_fast')"
+                                        :loading="loading"
+                                    >
+                                        ✨ 剩余内容交给 AI
+                                    </el-button>
+                                    <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput" :loading="loading">
+                                        下一步
+                                    </el-button>
+                                </div>
+                            </template>
                         </div>
                      </div>
                 </div>
