@@ -6,6 +6,62 @@ import models
 from services import llm
 
 
+def test_ai_revision_request_rejects_unknown_and_strips_optional_fields():
+    with pytest.raises(ValueError):
+        main.QuickSetupAIReviseRequest(
+            operation="review_edits", values={"unknown": "x"},
+            context_revision="12345678", edited_fields=["tone"]
+        )
+    request = main.QuickSetupAIReviseRequest(
+        operation="review_edits", values={"tone": "x"},
+        context_revision="12345678", edited_fields=["tone"],
+        instruction="  improve  ", target_field=" tone "
+    )
+    assert request.instruction == "improve"
+    assert request.target_field == "tone"
+
+    with pytest.raises(ValueError):
+        main.QuickSetupAIReviseRequest(
+            operation="review_edits",
+            values={"movie_duration": "120"},
+            context_revision="12345678",
+            edited_fields=["movie_duration"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_revision_llm_rejects_out_of_scope_json(monkeypatch):
+    async def fake_raw(*args, **kwargs):
+        return '{"fields":{"tone":"新","title":"越界"},"summary":"x"}', 3
+
+    monkeypatch.setattr(llm, "raw_generation", fake_raw)
+    with pytest.raises(llm.InteractionGenerationError) as error:
+        await llm.revise_quick_setup_fields(
+            logline="创意", values={"tone": "旧"}, allowed_fields=["tone"]
+        )
+    assert error.value.error_type == "revision_scope_violation"
+
+
+@pytest.mark.asyncio
+async def test_revision_llm_parses_scoped_candidate(monkeypatch):
+    async def fake_raw(messages, **kwargs):
+        assert "记者追查真相" in messages[1]["content"]
+        assert "单项重新生成" in messages[1]["content"]
+        return '{"fields":{"tone":"更紧张的都市悬疑"},"summary":"已改变基调"}', 9
+
+    monkeypatch.setattr(llm, "raw_generation", fake_raw)
+    fields, summary, usage = await llm.revise_quick_setup_fields(
+        logline="记者追查真相",
+        values={"tone": "克制悬疑"},
+        allowed_fields=["tone"],
+        operation="regenerate_field",
+    )
+
+    assert fields == {"tone": "更紧张的都市悬疑"}
+    assert summary == "已改变基调"
+    assert usage == 9
+
+
 async def seed_project(
     session,
     *,
@@ -53,6 +109,267 @@ def complete_movie_draft() -> dict[str, str]:
         "visual_style": "低饱和霓虹、潮湿街道与不断重复的城市构图",
         "user_notes": "保持推理线索公平，不使用梦境作为最终解释",
     }
+
+
+async def no_op_async(*_args, **_kwargs):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_regenerates_one_field_without_applying(monkeypatch):
+    from database import SessionLocal
+
+    audits = []
+
+    async def fake_revise(**kwargs):
+        assert kwargs["allowed_fields"] == ["tone"]
+        assert kwargs["operation"] == "regenerate_field"
+        return {"tone": "高密度的都市悬疑与黑色幽默"}, "只重新生成了基调", 11
+
+    async def capture_audit(**kwargs):
+        audits.append(kwargs)
+
+    monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
+    monkeypatch.setattr(main, "log_ai_action", capture_audit)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+
+    async with SessionLocal() as session:
+        user, project = await seed_project(
+            session,
+            context={main.SETUP_MODE_KEY: main.SETUP_MODE_AI_FAST},
+        )
+        original_context = dict(project.global_context)
+        response = await main.revise_quick_setup_with_ai(
+            1,
+            main.QuickSetupAIReviseRequest(
+                operation="regenerate_field",
+                values=complete_movie_draft(),
+                target_field="tone",
+                context_revision=main.build_setup_context_revision(project),
+            ),
+            db=session,
+            current_user=user,
+        )
+        await session.refresh(project)
+
+    assert response["changed_fields"] == ["tone"]
+    assert response["changes"][0]["before"] == complete_movie_draft()["tone"]
+    assert response["tokens_used"] == 11
+    assert response["total_tokens"] == 11
+    assert project.project_type == "pending"
+    assert project.title == "创意草稿"
+    assert project.global_context == original_context
+    assert audits[0]["action"] == "regenerate_quick_setup_field"
+    assert audits[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_edited_only_rejects_model_scope_violation(monkeypatch):
+    from database import SessionLocal
+
+    audits = []
+
+    async def fake_revise(**kwargs):
+        assert kwargs["allowed_fields"] == ["theme"]
+        return {
+            "theme": "记忆如何塑造真实",
+            "plot_details": "不应被允许的越界修改",
+        }, "越界", 4
+
+    async def capture_audit(**kwargs):
+        audits.append(kwargs)
+
+    monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
+    monkeypatch.setattr(main, "log_ai_action", capture_audit)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+
+    async with SessionLocal() as session:
+        user, project = await seed_project(
+            session,
+            context={main.SETUP_MODE_KEY: main.SETUP_MODE_AI_FAST},
+        )
+        with pytest.raises(HTTPException) as error:
+            await main.revise_quick_setup_with_ai(
+                1,
+                main.QuickSetupAIReviseRequest(
+                    operation="review_edits",
+                    scope="edited_only",
+                    values=complete_movie_draft(),
+                    edited_fields=["theme"],
+                    context_revision=main.build_setup_context_revision(project),
+                ),
+                db=session,
+                current_user=user,
+            )
+        await session.refresh(project)
+
+    assert error.value.status_code == 503
+    assert project.global_context == {main.SETUP_MODE_KEY: main.SETUP_MODE_AI_FAST}
+    assert project.total_tokens == 4
+    assert audits[0]["status"] == "failed"
+    assert audits[0]["error_type"] == "invalid_ai_candidate"
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_related_scope_locks_control_fields(monkeypatch):
+    from database import SessionLocal
+
+    async def fake_revise(**kwargs):
+        allowed = set(kwargs["allowed_fields"])
+        assert allowed
+        assert not allowed.intersection(main.QUICK_CONTROL_FIELDS)
+        assert {"theme", "plot_details"}.issubset(allowed)
+        return {
+            "theme": "真实与稳定之间的道德代价",
+            "plot_details": "医生曾主动参与实验；高潮中她公开自己的责任。",
+        }, "联动校准了主题与关键转折", 7
+
+    monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
+    monkeypatch.setattr(main, "log_ai_action", no_op_async)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+
+    async with SessionLocal() as session:
+        user, project = await seed_project(
+            session,
+            context={main.SETUP_MODE_KEY: main.SETUP_MODE_AI_FAST},
+        )
+        response = await main.revise_quick_setup_with_ai(
+            1,
+            main.QuickSetupAIReviseRequest(
+                operation="review_edits",
+                scope="related",
+                values=complete_movie_draft(),
+                edited_fields=["theme"],
+                context_revision=main.build_setup_context_revision(project),
+            ),
+            db=session,
+            current_user=user,
+        )
+
+    assert set(response["changed_fields"]) == {"theme", "plot_details"}
+    assert not set(response["changed_fields"]).intersection(main.QUICK_CONTROL_FIELDS)
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_rejects_stale_context_before_calling_ai(monkeypatch):
+    from database import SessionLocal
+
+    called = False
+
+    async def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("stale requests must stop before quota or AI calls")
+
+    monkeypatch.setattr(main, "enforce_user_quota", fail_if_called)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fail_if_called)
+
+    async with SessionLocal() as session:
+        user, _project = await seed_project(session)
+        with pytest.raises(HTTPException) as error:
+            await main.revise_quick_setup_with_ai(
+                1,
+                main.QuickSetupAIReviseRequest(
+                    operation="regenerate_field",
+                    values=complete_movie_draft(),
+                    target_field="tone",
+                    context_revision="stale-revision",
+                ),
+                db=session,
+                current_user=user,
+            )
+
+    assert error.value.status_code == 409
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_discards_candidate_if_context_changes_during_call(monkeypatch):
+    from database import SessionLocal
+
+    audits = []
+
+    async def fake_revise(**_kwargs):
+        return {"tone": "过期的新基调"}, "这份候选已过期", 5
+
+    async def capture_audit(**kwargs):
+        audits.append(kwargs)
+
+    monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
+    monkeypatch.setattr(main, "log_ai_action", capture_audit)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+
+    async with SessionLocal() as session:
+        user, project = await seed_project(session)
+        initial_revision = main.build_setup_context_revision(project)
+        revision_calls = 0
+
+        def changing_revision(_project):
+            nonlocal revision_calls
+            revision_calls += 1
+            return initial_revision if revision_calls == 1 else "changed-during-ai-call"
+
+        monkeypatch.setattr(main, "build_setup_context_revision", changing_revision)
+        with pytest.raises(HTTPException) as error:
+            await main.revise_quick_setup_with_ai(
+                1,
+                main.QuickSetupAIReviseRequest(
+                    operation="regenerate_field",
+                    values=complete_movie_draft(),
+                    target_field="tone",
+                    context_revision=initial_revision,
+                ),
+                db=session,
+                current_user=user,
+            )
+        await session.refresh(project)
+
+    assert error.value.status_code == 409
+    assert project.total_tokens == 5
+    assert project.project_type == "pending"
+    assert project.global_context == {}
+    assert audits[0]["status"] == "stale"
+    assert audits[0]["error_type"] == "stale_context"
+
+
+@pytest.mark.asyncio
+async def test_ai_revision_rejects_invalid_numeric_candidate_and_charges_usage(monkeypatch):
+    from database import SessionLocal
+
+    audits = []
+
+    async def fake_revise(**kwargs):
+        assert kwargs["allowed_fields"] == ["movie_duration"]
+        return {"movie_duration": "9999"}, "不合法时长", 6
+
+    async def capture_audit(**kwargs):
+        audits.append(kwargs)
+
+    monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
+    monkeypatch.setattr(main, "log_ai_action", capture_audit)
+    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+
+    async with SessionLocal() as session:
+        user, project = await seed_project(session)
+        with pytest.raises(HTTPException) as error:
+            await main.revise_quick_setup_with_ai(
+                1,
+                main.QuickSetupAIReviseRequest(
+                    operation="regenerate_field",
+                    values=complete_movie_draft(),
+                    target_field="movie_duration",
+                    context_revision=main.build_setup_context_revision(project),
+                ),
+                db=session,
+                current_user=user,
+            )
+        await session.refresh(project)
+
+    assert error.value.status_code == 503
+    assert project.project_type == "pending"
+    assert project.global_context == {}
+    assert project.total_tokens == 6
+    assert audits[0]["status"] == "failed"
 
 
 @pytest.mark.asyncio

@@ -1033,8 +1033,106 @@ class QuickSetupReviewRequest(BaseModel):
         allowed = {step["key"] for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm"}
         return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip() in allowed))
 
+
+class QuickSetupAIReviseRequest(BaseModel):
+    operation: Literal["regenerate_field", "review_edits"]
+    scope: Literal["edited_only", "related"] = "edited_only"
+    values: Dict[str, str] = Field(default_factory=dict)
+    target_field: Optional[str] = None
+    edited_fields: List[str] = Field(default_factory=list, max_length=20)
+    context_revision: str = Field(min_length=8, max_length=128)
+    instruction: Optional[str] = Field(default=None, max_length=MAX_INTERACTION_ANSWER_LENGTH)
+
+    @field_validator("values")
+    @classmethod
+    def validate_values(cls, value: Dict[str, str]) -> Dict[str, str]:
+        allowed = {
+            step["key"]
+            for step in SETUP_FLOW_STEPS
+            if step["key"] != "final_confirm"
+        }
+        normalized: Dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip()
+            if key not in allowed:
+                raise ValueError(f"不支持的快速设定字段: {key}")
+            text = str(raw_value or "").strip()
+            if len(text) > MAX_INTERACTION_ANSWER_LENGTH:
+                raise ValueError(f"字段 {key} 内容过长")
+            normalized[key] = text
+        if sum(len(item) for item in normalized.values()) > MAX_QUICK_SETUP_TOTAL_LENGTH:
+            raise ValueError("快速设定草案总内容过长")
+        return normalized
+
+    @field_validator("target_field", "instruction")
+    @classmethod
+    def strip_optional(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("edited_fields")
+    @classmethod
+    def validate_revision_fields(cls, value: List[str]) -> List[str]:
+        allowed = {
+            step["key"]
+            for step in SETUP_FLOW_STEPS
+            if step["key"] != "final_confirm"
+        }
+        result = list(
+            dict.fromkeys(str(key).strip() for key in value if str(key).strip())
+        )
+        invalid = [k for k in result if k not in allowed or k in QUICK_CONTROL_FIELDS]
+        if invalid:
+            raise ValueError(f"不可编辑字段: {', '.join(invalid)}")
+        return result
+
+
+async def record_quick_setup_ai_revision(
+    *,
+    db: AsyncSession,
+    project: models.Project,
+    current_user: models.User,
+    operation: str,
+    prompt: str,
+    response: str,
+    tokens: int,
+    status: str,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Charge known usage and write an audit entry without exposing provider errors."""
+    token_count = max(0, int(tokens or 0))
+    if token_count:
+        await increment_project_tokens(db, project, token_count)
+        await db.commit()
+
+    action = (
+        "regenerate_quick_setup_field"
+        if operation == "regenerate_field"
+        else "review_quick_setup_edits"
+    )
+    try:
+        await log_ai_action(
+            user_id=current_user.id,
+            project_id=project.id,
+            action=action,
+            prompt=prompt,
+            response=response,
+            tokens=token_count,
+            status=status,
+            step_key=QUICK_REVIEW_FIELD,
+            error_type=error_type,
+            error_message=error_message,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Unable to write quick setup AI audit log: %s",
+            type(exc).__name__,
+        )
+
+
 class ContentReviewRequest(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
+
 
 @app.post("/content/review")
 async def review_content(
@@ -1154,6 +1252,227 @@ async def submit_interaction(
         "context": project.global_context,
         "title": project.title or previous_title or "",
         "total_tokens": int(project.total_tokens or 0),
+    }
+
+
+@app.post("/projects/{project_id}/setup/quick-review/ai-revise")
+async def revise_quick_setup_with_ai(
+    project_id: int,
+    payload: QuickSetupAIReviseRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    project, _ = await require_project_access(
+        db,
+        project_id,
+        current_user.id,
+        minimum_role="editor",
+    )
+    if payload.context_revision != build_setup_context_revision(project):
+        raise HTTPException(
+            status_code=409,
+            detail="项目设定已更新，请刷新后重试。",
+        )
+
+    try:
+        values = normalize_quick_setup_values(
+            project,
+            payload.values,
+            preserve_existing=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    all_fields = list(values.keys())
+    editable_fields = [
+        field for field in all_fields if field not in QUICK_CONTROL_FIELDS
+    ]
+    if payload.operation == "regenerate_field":
+        if (
+            not payload.target_field
+            or payload.target_field not in all_fields
+            or payload.target_field == "project_type"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="单项重生必须指定有效 target_field",
+            )
+        allowed = [payload.target_field]
+    else:
+        allowed = [
+            field
+            for field in payload.edited_fields
+            if field in editable_fields
+        ]
+        if not allowed:
+            raise HTTPException(
+                status_code=422,
+                detail="review_edits 必须提供 edited_fields",
+            )
+        if payload.scope == "related":
+            allowed = [
+                field
+                for field in all_fields
+                if field not in QUICK_CONTROL_FIELDS
+            ]
+
+    await enforce_user_quota(db, project.owner_id)
+    audit_prompt = json.dumps(
+        {
+            "operation": payload.operation,
+            "scope": payload.scope,
+            "target_field": payload.target_field,
+            "edited_fields": payload.edited_fields,
+            "allowed_fields": allowed,
+            "instruction": payload.instruction or "",
+            "values": values,
+        },
+        ensure_ascii=False,
+    )
+    usage = 0
+    try:
+        template_instructions = await get_prompt_addendum(
+            db,
+            stage="interaction",
+            project_type=values.get("project_type", "all"),
+        )
+        revised, summary, usage = await llm.revise_quick_setup_fields(
+            logline=project.logline or "",
+            values=values,
+            allowed_fields=allowed,
+            instruction=payload.instruction or "",
+            operation=payload.operation,
+            scope=payload.scope,
+            template_instructions=template_instructions,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Quick setup AI revision failed: %s",
+            type(exc).__name__,
+        )
+        await record_quick_setup_ai_revision(
+            db=db,
+            project=project,
+            current_user=current_user,
+            operation=payload.operation,
+            prompt=audit_prompt,
+            response="",
+            tokens=0,
+            status="failed",
+            error_type=type(exc).__name__,
+            error_message="AI 修订服务调用失败",
+        )
+        raise HTTPException(status_code=503, detail="AI 修订服务暂不可用") from exc
+
+    await db.refresh(
+        project,
+        attribute_names=["project_type", "logline", "global_context"],
+    )
+    if payload.context_revision != build_setup_context_revision(project):
+        await record_quick_setup_ai_revision(
+            db=db,
+            project=project,
+            current_user=current_user,
+            operation=payload.operation,
+            prompt=audit_prompt,
+            response=json.dumps(
+                {"fields": revised, "summary": str(summary or "")},
+                ensure_ascii=False,
+            ),
+            tokens=usage,
+            status="stale",
+            error_type="stale_context",
+            error_message="AI 返回前项目设定已更新",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="AI 分析期间项目设定已更新，请刷新后重试。",
+        )
+
+    candidate_error: Optional[str] = None
+    if not isinstance(revised, dict):
+        candidate_error = "AI 未返回有效的字段集合"
+        revised = {}
+    unexpected_fields = set(revised) - set(allowed)
+    if unexpected_fields:
+        candidate_error = "AI 返回了超出允许范围的字段"
+
+    candidate_values = dict(values)
+    candidate_values.update(revised)
+    try:
+        normalized_candidate_values = normalize_quick_setup_values(
+            project,
+            candidate_values,
+            preserve_existing=False,
+        )
+    except ValueError:
+        candidate_error = "AI 返回的候选设定不合法"
+    else:
+        candidate_values = normalized_candidate_values
+
+    normalized_revised = {
+        field: candidate_values[field]
+        for field in allowed
+        if field in candidate_values and field in revised
+    }
+    if payload.operation == "regenerate_field" and (
+        payload.target_field not in normalized_revised
+        or normalized_revised[payload.target_field]
+        == values.get(payload.target_field, "")
+    ):
+        candidate_error = "AI 未返回有效的新候选"
+
+    if candidate_error:
+        await record_quick_setup_ai_revision(
+            db=db,
+            project=project,
+            current_user=current_user,
+            operation=payload.operation,
+            prompt=audit_prompt,
+            response=json.dumps(
+                {"fields": revised, "summary": str(summary or "")},
+                ensure_ascii=False,
+            ),
+            tokens=usage,
+            status="failed",
+            error_type="invalid_ai_candidate",
+            error_message=candidate_error,
+        )
+        raise HTTPException(status_code=503, detail=candidate_error)
+
+    changes = [
+        {
+            "field": field,
+            "before": values.get(field, ""),
+            "after": value,
+        }
+        for field, value in normalized_revised.items()
+        if value != values.get(field, "")
+    ]
+    response_text = json.dumps(
+        {"fields": normalized_revised, "summary": str(summary or "")},
+        ensure_ascii=False,
+    )
+    await record_quick_setup_ai_revision(
+        db=db,
+        project=project,
+        current_user=current_user,
+        operation=payload.operation,
+        prompt=audit_prompt,
+        response=response_text,
+        tokens=usage,
+        status="success",
+    )
+    return {
+        "status": "candidate",
+        "operation": payload.operation,
+        "scope": payload.scope,
+        "changes": changes,
+        "changed_fields": [change["field"] for change in changes],
+        "summary": str(summary or "").strip(),
+        "tokens_used": max(0, int(usage or 0)),
+        "total_tokens": int(project.total_tokens or 0),
+        "context_revision": payload.context_revision,
     }
 
 

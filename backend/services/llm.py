@@ -1113,3 +1113,107 @@ async def generate_quick_setup_draft(
         if str(key) in allowed_keys
     }
     return fields, usage
+
+
+async def revise_quick_setup_fields(
+    *,
+    logline: str,
+    values: dict,
+    allowed_fields: list[str],
+    instruction: str = "",
+    operation: str = "review_edits",
+    scope: str = "edited_only",
+    template_instructions: str = "",
+) -> tuple[dict[str, str], str, int]:
+    """Return a strictly scoped candidate revision; never mutate project state."""
+    allowed = list(
+        dict.fromkeys(str(key).strip() for key in allowed_fields if str(key).strip())
+    )
+    if not allowed:
+        raise InteractionGenerationError(
+            "Quick setup revision has no allowed fields",
+            error_type="revision_fields_missing",
+        )
+
+    if operation == "regenerate_field":
+        mode_rules = (
+            "这是单项重新生成。fields 必须且只能包含唯一的允许字段，"
+            "新值必须与旧值有实质差异，同时与其他锁定设定保持一致。"
+        )
+    elif scope == "related":
+        mode_rules = (
+            "这是联动整改。用户改动代表新的创作方向；只返回为恢复整体"
+            "一致性而确有必要调整的允许字段，不要为了改写而改写。"
+        )
+    else:
+        mode_rules = (
+            "这是仅整改用户已改项。允许字段之外的内容全部锁定；请仅优化"
+            "允许字段，使它们与锁定内容一致。如无需调整，fields 返回空对象。"
+        )
+
+    prompt = f"""
+    请审阅以下剧本设定，并返回严格 JSON。
+
+    作用域规则（最高优先级）：
+    - 仅可修改“允许字段”中的字段；其他字段可用于分析，但不得返回或改写。
+    - {mode_rules}
+    - 只返回 fields 和 summary，不要 Markdown 或额外解释。
+    - fields 只放实际建议变更的字段；summary 简述分析结果和影响范围。
+
+    用户创意：
+    {logline}
+
+    允许字段：
+    {json.dumps(allowed, ensure_ascii=False)}
+
+    当前完整设定：
+    {json.dumps(values, ensure_ascii=False)}
+
+    用户补充要求：
+    {instruction or '无；以内部一致、具体、有戏剧张力为目标'}
+
+    项目专属要求：
+    {template_instructions or '无'}
+
+    返回格式：
+    {{"fields": {{"字段名": "新值"}}, "summary": "简短说明"}}
+    """
+    content, usage = await raw_generation(
+        [
+            {
+                "role": "system",
+                "content": "你是严格遵守字段作用域的专业剧本设定编辑。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        json_response=True,
+        task_type="interaction",
+    )
+    parsed = _load_json_payload(content or "")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("fields"), dict):
+        raise InteractionGenerationError(
+            "Invalid revision JSON",
+            raw_content=content or "",
+            error_type="revision_json_parse_failed",
+        )
+    unexpected_top_level = set(parsed) - {"fields", "summary"}
+    if unexpected_top_level:
+        raise InteractionGenerationError(
+            "Revision returned unexpected top-level keys",
+            raw_content=content or "",
+            error_type="revision_json_shape_invalid",
+        )
+    unknown = set(parsed["fields"]) - set(allowed)
+    if unknown:
+        raise InteractionGenerationError(
+            "Revision returned disallowed fields",
+            raw_content=content or "",
+            error_type="revision_scope_violation",
+        )
+    fields = {
+        str(key): str(value or "").strip()
+        for key, value in parsed["fields"].items()
+        if str(value or "").strip()
+    }
+    return fields, str(parsed.get("summary") or "").strip(), int(usage or 0)

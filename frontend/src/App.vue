@@ -84,6 +84,15 @@ const customInput = ref('')
 const quickReviewValues = ref<Record<string, string>>({})
 const quickReviewExpanded = ref<string[]>([])
 const quickReviewEditedFields = ref<string[]>([])
+const quickReviewAiAdjustedFields = ref<string[]>([])
+const quickReviewAiLoading = ref<Record<string, boolean>>({})
+const quickReviewAiErrors = ref<Record<string, string>>({})
+const quickReviewCandidateVisible = ref(false)
+const quickReviewCandidate = ref<any>(null)
+const quickReviewCandidateBaseValues = ref<Record<string, string>>({})
+const quickReviewCandidateTokens = ref(0)
+const quickReviewAiCandidateBusy = ref(false)
+const quickReviewAiRequestSequence = ref(0)
 const loading = ref(false)
 const loadingText = ref('AI 正在思考中...')
 const switchingProject = ref(false)
@@ -885,18 +894,33 @@ const createProject = async () => {
 }
 
 
+const resetQuickReviewState = () => {
+    quickReviewAiRequestSequence.value += 1
+    quickReviewValues.value = {}
+    quickReviewExpanded.value = []
+    quickReviewEditedFields.value = []
+    quickReviewAiAdjustedFields.value = []
+    quickReviewAiLoading.value = {}
+    quickReviewAiErrors.value = {}
+    quickReviewCandidateVisible.value = false
+    quickReviewCandidate.value = null
+    quickReviewCandidateBaseValues.value = {}
+    quickReviewCandidateTokens.value = 0
+    quickReviewAiCandidateBusy.value = false
+}
+
 const initializeQuickReview = (payload: any) => {
+    resetQuickReviewState()
     const values: Record<string, string> = {}
     for (const section of Array.isArray(payload?.sections) ? payload.sections : []) {
         const key = toTextValue(section?.key).trim()
         if (key) values[key] = toTextValue(section?.value)
     }
     quickReviewValues.value = values
-    quickReviewExpanded.value = []
-    quickReviewEditedFields.value = []
 }
 
 const markQuickReviewFieldEdited = (key: string) => {
+    quickReviewAiAdjustedFields.value = quickReviewAiAdjustedFields.value.filter((field) => field !== key)
     if (!quickReviewEditedFields.value.includes(key)) {
         quickReviewEditedFields.value = [...quickReviewEditedFields.value, key]
     }
@@ -904,6 +928,11 @@ const markQuickReviewFieldEdited = (key: string) => {
 
 const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
     if (!currentProject.value?.id) return
+    if (mode === 'ai_fast' && (quickReviewEditedFields.value.length || quickReviewAiAdjustedFields.value.length)) {
+        try {
+            await ElMessageBox.confirm('已有本地修改，重新生成整份会覆盖这些修改，是否继续？', '确认重新生成', { type: 'warning' })
+        } catch { return }
+    }
     loading.value = true
     loadingText.value = mode === 'ai_fast'
         ? 'AI 正在联合生成完整故事设定...'
@@ -923,6 +952,159 @@ const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
     } finally {
         loading.value = false
     }
+}
+
+const closeQuickReviewCandidate = () => {
+    quickReviewCandidateVisible.value = false
+    quickReviewCandidate.value = null
+    quickReviewCandidateBaseValues.value = {}
+    quickReviewCandidateTokens.value = 0
+}
+
+const showQuickReviewCandidate = (data: any, baseValues: Record<string, string>) => {
+    quickReviewCandidate.value = data
+    quickReviewCandidateBaseValues.value = { ...baseValues }
+    quickReviewCandidateTokens.value = Number(data?.tokens_used || 0)
+    if (!(data?.changes || []).length) {
+        closeQuickReviewCandidate()
+        ElMessage.info(data?.summary || 'AI 检查后认为无需调整')
+        return
+    }
+    quickReviewCandidateVisible.value = true
+}
+
+const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'related' = 'edited_only') => {
+    if (!currentProject.value?.id || !interaction.value?.context_revision) return
+    const projectId = currentProject.value.id
+    const contextRevision = interaction.value.context_revision
+    const operation = field ? 'regenerate_field' : 'review_edits'
+    const key = field || `review_${scope}`
+    if (!field && !quickReviewEditedFields.value.length) return
+    if (quickReviewAiCandidateBusy.value) return
+    const requestSequence = quickReviewAiRequestSequence.value + 1
+    quickReviewAiRequestSequence.value = requestSequence
+    quickReviewAiCandidateBusy.value = true
+    quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: true }
+    quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: '' }
+    const requestValues = { ...quickReviewValues.value }
+    try {
+        const response = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
+            operation, scope, values: requestValues, target_field: field || null,
+            edited_fields: quickReviewEditedFields.value,
+            context_revision: contextRevision, instruction: ''
+        })
+        if (
+            quickReviewAiRequestSequence.value !== requestSequence
+            || currentProject.value?.id !== projectId
+            || interaction.value?.context_revision !== contextRevision
+        ) return
+        syncProjectTokensFromResponse(response.data)
+        showQuickReviewCandidate(response.data, requestValues)
+    } catch (e: any) {
+        if (
+            quickReviewAiRequestSequence.value !== requestSequence
+            || currentProject.value?.id !== projectId
+            || interaction.value?.context_revision !== contextRevision
+        ) return
+        const status = e.response?.status
+        const message = status === 409
+            ? '设定已在其他地方更新，请刷新后再试。'
+            : (e.response?.data?.detail || 'AI 整改失败，请稍后重试')
+        quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: message }
+        ElMessage.error(message)
+    } finally {
+        if (quickReviewAiRequestSequence.value === requestSequence) {
+            quickReviewAiCandidateBusy.value = false
+            quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: false }
+        }
+    }
+}
+
+const regenerateQuickReviewField = async (field: string) => {
+    if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value) return
+    const projectId = currentProject.value.id
+    const contextRevision = interaction.value.context_revision
+    let instruction = ''
+    try {
+        const promptResult: any = await ElMessageBox.prompt('可选：告诉 AI 这项需要怎样调整', '重新生成此项', { inputPlaceholder: '例如：更悬疑、更简洁' })
+        instruction = promptResult.value || ''
+    } catch { return }
+    if (
+        quickReviewAiCandidateBusy.value
+        || currentProject.value?.id !== projectId
+        || interaction.value?.context_revision !== contextRevision
+    ) return
+    const requestSequence = quickReviewAiRequestSequence.value + 1
+    quickReviewAiRequestSequence.value = requestSequence
+    quickReviewAiCandidateBusy.value = true
+    const key = field
+    quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: true }
+    quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: '' }
+    const requestValues = { ...quickReviewValues.value }
+    try {
+        const { data } = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
+            operation: 'regenerate_field', scope: 'edited_only', values: requestValues, target_field: field,
+            edited_fields: quickReviewEditedFields.value, context_revision: contextRevision, instruction
+        })
+        if (
+            quickReviewAiRequestSequence.value !== requestSequence
+            || currentProject.value?.id !== projectId
+            || interaction.value?.context_revision !== contextRevision
+        ) return
+        syncProjectTokensFromResponse(data)
+        showQuickReviewCandidate(data, requestValues)
+    } catch (e: any) {
+        if (
+            quickReviewAiRequestSequence.value !== requestSequence
+            || currentProject.value?.id !== projectId
+            || interaction.value?.context_revision !== contextRevision
+        ) return
+        const message = e.response?.status === 409 ? '设定已在其他地方更新，请刷新后再试。' : (e.response?.data?.detail || '重新生成失败，请稍后重试')
+        quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: message }; ElMessage.error(message)
+    } finally {
+        if (quickReviewAiRequestSequence.value === requestSequence) {
+            quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: false }
+            quickReviewAiCandidateBusy.value = false
+        }
+    }
+}
+
+const applyQuickReviewCandidate = () => {
+    const changes = Array.isArray(quickReviewCandidate.value?.changes)
+        ? quickReviewCandidate.value.changes
+        : []
+    if (!changes.length) {
+        closeQuickReviewCandidate()
+        return
+    }
+
+    const candidateFieldsAreValid = changes.every((change: any) => {
+        const field = toTextValue(change?.field).trim()
+        return Boolean(field) && Object.prototype.hasOwnProperty.call(
+            quickReviewCandidateBaseValues.value,
+            field,
+        )
+    })
+    const hasLocalConflict = Object.entries(quickReviewCandidateBaseValues.value).some(
+        ([field, value]) => quickReviewValues.value[field] !== value,
+    )
+    if (!candidateFieldsAreValid || hasLocalConflict) {
+        ElMessage.warning('候选生成期间内容已被修改，请重新复核后再应用')
+        return
+    }
+
+    for (const change of changes) {
+        const field = toTextValue(change?.field).trim()
+        if (field) quickReviewValues.value[field] = toTextValue(change.after)
+        if (field && !quickReviewAiAdjustedFields.value.includes(field)) {
+            quickReviewAiAdjustedFields.value = [...quickReviewAiAdjustedFields.value, field]
+        }
+        if (field) {
+            quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [field]: '' }
+        }
+    }
+    closeQuickReviewCandidate()
+    ElMessage.success('AI 候选已应用，可继续修改后再提交')
 }
 
 const submitQuickReview = async (action: 'confirm' | 'guided') => {
@@ -964,9 +1146,7 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
         if (response.data?.title) currentProject.value.title = response.data.title
         syncProjectTokensFromResponse(response.data)
         interaction.value = null
-        quickReviewValues.value = {}
-        quickReviewExpanded.value = []
-        quickReviewEditedFields.value = []
+        resetQuickReviewState()
         await analyzeLogline(currentProject.value.id)
     } catch (e: any) {
         console.error(e)
@@ -1111,9 +1291,7 @@ const startNewProject = () => {
     currentProject.value = null
     projectJobs.value = []
     interaction.value = null
-    quickReviewValues.value = {}
-    quickReviewExpanded.value = []
-    quickReviewEditedFields.value = []
+    resetQuickReviewState()
     loading.value = false
     switchingProject.value = false
     scenePromptMap.value = {}
@@ -1148,9 +1326,7 @@ const loadProject = async (p: any) => {
         projectJobs.value = []
         drawerOpen.value = false
         interaction.value = null
-        quickReviewValues.value = {}
-        quickReviewExpanded.value = []
-        quickReviewEditedFields.value = []
+        resetQuickReviewState()
 
         const detailedProject = await fetchProjectDetail(p.id)
         if (detailedProject) {
@@ -1800,6 +1976,8 @@ const copyText = (value: unknown) => {
                                                 <el-tag size="small" :type="section.source === 'confirmed' ? 'success' : 'info'">
                                                     {{ section.source === 'confirmed' ? '已确认' : 'AI 推荐' }}
                                                 </el-tag>
+                                                <el-tag v-if="quickReviewEditedFields.includes(section.key)" size="small" type="warning">已修改</el-tag>
+                                                <el-tag v-if="quickReviewAiAdjustedFields.includes(section.key)" size="small" type="success">AI 已调整</el-tag>
                                                 <span class="min-w-0 flex-1 truncate text-right text-sm text-gray-400">
                                                     {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
                                                 </span>
@@ -1817,15 +1995,30 @@ const copyText = (value: unknown) => {
                                             <div v-else class="rounded-lg bg-gray-50 p-3 text-sm text-gray-700">
                                                 {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
                                             </div>
+                                            <div class="mt-3 flex flex-wrap items-center gap-2">
+                                                <el-button
+                                                    v-if="section.key !== 'project_type'"
+                                                    size="small"
+                                                    :loading="quickReviewAiLoading[section.key]"
+                                                    :disabled="quickReviewAiCandidateBusy"
+                                                    @click="regenerateQuickReviewField(section.key)"
+                                                >
+                                                    重新生成
+                                                </el-button>
+                                                <el-tag v-if="quickReviewAiLoading[section.key]" size="small" type="info">AI处理中</el-tag>
+                                                <span v-if="quickReviewAiErrors[section.key]" class="text-xs text-red-500">{{ quickReviewAiErrors[section.key] }}</span>
+                                            </div>
                                         </div>
                                     </el-collapse-item>
                                 </el-collapse>
                                 <div class="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-between">
-                                    <div class="flex gap-2">
-                                        <el-button @click="chooseSetupMode('ai_fast')" :loading="loading">重新生成整份</el-button>
-                                        <el-button @click="submitQuickReview('guided')" :loading="loading">切换到自己掌控</el-button>
+                                    <div class="flex flex-wrap gap-2">
+                                        <el-button @click="chooseSetupMode('ai_fast')" :loading="loading" :disabled="quickReviewAiCandidateBusy">重新生成整份</el-button>
+                                        <el-button @click="submitQuickReview('guided')" :loading="loading" :disabled="quickReviewAiCandidateBusy">切换到自己掌控</el-button>
+                                        <el-button :disabled="!quickReviewEditedFields.length || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_edited_only" @click="quickReviewAiRequest(undefined, 'edited_only')">AI 仅整改已改项</el-button>
+                                        <el-button :disabled="!quickReviewEditedFields.length || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_related" @click="quickReviewAiRequest(undefined, 'related')">AI 联动整改</el-button>
                                     </div>
-                                    <el-button type="primary" @click="submitQuickReview('confirm')" :loading="loading">
+                                    <el-button type="primary" @click="submitQuickReview('confirm')" :loading="loading" :disabled="quickReviewAiCandidateBusy">
                                         采用草案并继续
                                     </el-button>
                                 </div>
@@ -1875,6 +2068,20 @@ const copyText = (value: unknown) => {
                                     </el-button>
                                 </div>
                             </template>
+                            <el-dialog v-model="quickReviewCandidateVisible" title="AI 整改候选预览" width="min(720px, 94vw)" append-to-body @closed="closeQuickReviewCandidate">
+                                <div v-if="quickReviewCandidate" class="space-y-4">
+                                    <p class="text-sm leading-6 text-slate-600">{{ quickReviewCandidate.summary || 'AI 已生成候选修改，请确认后应用。' }}</p>
+                                    <div v-for="change in quickReviewCandidate.changes || []" :key="change.field" class="rounded-xl border border-gray-200 p-4">
+                                        <div class="mb-2 font-medium text-slate-700">{{ getContextFieldLabel(change.field) }} <el-tag size="small" type="warning">AI 已调整</el-tag></div>
+                                        <div class="grid gap-3 md:grid-cols-2">
+                                            <div><div class="mb-1 text-xs text-gray-400">修改前</div><pre class="whitespace-pre-wrap rounded bg-gray-50 p-3 text-xs">{{ change.before }}</pre></div>
+                                            <div><div class="mb-1 text-xs text-blue-500">修改后</div><pre class="whitespace-pre-wrap rounded bg-blue-50 p-3 text-xs">{{ change.after }}</pre></div>
+                                        </div>
+                                    </div>
+                                    <div v-if="quickReviewCandidateTokens > 0" class="text-xs text-gray-400">本次消耗 {{ quickReviewCandidateTokens }} tokens</div>
+                                </div>
+                                <template #footer><el-button @click="closeQuickReviewCandidate">取消</el-button><el-button type="primary" @click="applyQuickReviewCandidate">应用候选</el-button></template>
+                            </el-dialog>
                         </div>
                      </div>
                 </div>
