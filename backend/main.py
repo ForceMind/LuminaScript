@@ -1330,21 +1330,51 @@ async def revise_quick_setup_with_ai(
         ensure_ascii=False,
     )
     usage = 0
+    ai_response: Dict[str, Any] = {}
+    revised: Dict[str, str] = {}
+    summary = ""
     try:
         template_instructions = await get_prompt_addendum(
             db,
             stage="interaction",
             project_type=values.get("project_type", "all"),
         )
-        revised, summary, usage = await llm.revise_quick_setup_fields(
-            logline=project.logline or "",
-            values=values,
-            allowed_fields=allowed,
-            instruction=payload.instruction or "",
-            operation=payload.operation,
-            scope=payload.scope,
-            template_instructions=template_instructions,
-        )
+        if payload.operation == "regenerate_field":
+            target_step = next(
+                step
+                for step in SETUP_FLOW_STEPS
+                if step["key"] == payload.target_field
+            )
+            option_context = json.dumps(
+                {
+                    "logline": project.logline or "",
+                    "current_draft": values,
+                    "current_target_value": values[payload.target_field],
+                    "user_instruction": payload.instruction or "",
+                    "generation_rule": (
+                        "只为目标字段提供 3 个互不相同的新选项；"
+                        "其他设定全部作为锁定上下文。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            ai_response, usage = await llm.generate_interaction_options(
+                payload.target_field,
+                target_step["question"],
+                option_context,
+                template_instructions=template_instructions,
+            )
+        else:
+            revised, summary, usage = await llm.revise_quick_setup_fields(
+                logline=project.logline or "",
+                values=values,
+                allowed_fields=allowed,
+                instruction=payload.instruction or "",
+                operation=payload.operation,
+                scope=payload.scope,
+                template_instructions=template_instructions,
+            )
+            ai_response = {"fields": revised, "summary": summary}
     except Exception as exc:
         logger.warning(
             "Quick setup AI revision failed: %s",
@@ -1375,10 +1405,7 @@ async def revise_quick_setup_with_ai(
             current_user=current_user,
             operation=payload.operation,
             prompt=audit_prompt,
-            response=json.dumps(
-                {"fields": revised, "summary": str(summary or "")},
-                ensure_ascii=False,
-            ),
+            response=json.dumps(ai_response, ensure_ascii=False),
             tokens=usage,
             status="stale",
             error_type="stale_context",
@@ -1388,6 +1415,82 @@ async def revise_quick_setup_with_ai(
             status_code=409,
             detail="AI 分析期间项目设定已更新，请刷新后重试。",
         )
+
+    if payload.operation == "regenerate_field":
+        target_field = payload.target_field
+        validated_options: List[Dict[str, str]] = []
+        seen_values: set[str] = set()
+        for raw_option in ai_response.get("options", []):
+            if not isinstance(raw_option, dict):
+                continue
+            label = str(raw_option.get("label", "") or "").strip()
+            raw_value = str(raw_option.get("value", "") or "").strip()
+            if not label or not raw_value:
+                continue
+            option_values = dict(values)
+            option_values[target_field] = raw_value
+            try:
+                normalized_option_values = normalize_quick_setup_values(
+                    project,
+                    option_values,
+                    preserve_existing=False,
+                )
+            except ValueError:
+                continue
+            normalized_value = normalized_option_values.get(target_field, "")
+            if (
+                not normalized_value
+                or normalized_value == values.get(target_field, "")
+                or normalized_value in seen_values
+            ):
+                continue
+            seen_values.add(normalized_value)
+            validated_options.append(
+                {"label": label, "value": normalized_value}
+            )
+            if len(validated_options) == 3:
+                break
+
+        if len(validated_options) != 3:
+            error_message = "AI 未返回 3 个有效且不同的选项"
+            await record_quick_setup_ai_revision(
+                db=db,
+                project=project,
+                current_user=current_user,
+                operation=payload.operation,
+                prompt=audit_prompt,
+                response=json.dumps(ai_response, ensure_ascii=False),
+                tokens=usage,
+                status="failed",
+                error_type="invalid_ai_options",
+                error_message=error_message,
+            )
+            raise HTTPException(status_code=503, detail=error_message)
+
+        option_response = {
+            "question": str(ai_response.get("question", "") or "").strip(),
+            "options": validated_options,
+        }
+        await record_quick_setup_ai_revision(
+            db=db,
+            project=project,
+            current_user=current_user,
+            operation=payload.operation,
+            prompt=audit_prompt,
+            response=json.dumps(option_response, ensure_ascii=False),
+            tokens=usage,
+            status="success",
+        )
+        return {
+            "status": "options",
+            "operation": payload.operation,
+            "target_field": target_field,
+            "question": option_response["question"],
+            "options": validated_options,
+            "tokens_used": max(0, int(usage or 0)),
+            "total_tokens": int(project.total_tokens or 0),
+            "context_revision": payload.context_revision,
+        }
 
     candidate_error: Optional[str] = None
     if not isinstance(revised, dict):

@@ -121,17 +121,32 @@ async def test_ai_revision_regenerates_one_field_without_applying(monkeypatch):
 
     audits = []
 
-    async def fake_revise(**kwargs):
-        assert kwargs["allowed_fields"] == ["tone"]
-        assert kwargs["operation"] == "regenerate_field"
-        return {"tone": "高密度的都市悬疑与黑色幽默"}, "只重新生成了基调", 11
+    async def fake_options(
+        step_key,
+        base_question,
+        context_str,
+        template_instructions="",
+    ):
+        assert step_key == "tone"
+        assert "基调" in base_question
+        assert "current_draft" in context_str
+        assert template_instructions == ""
+        return {
+            "question": "请选择一种新基调",
+            "options": [
+                {"label": "方案一", "value": "高密度都市悬疑"},
+                {"label": "方案二", "value": "黑色幽默科幻"},
+                {"label": "方案三", "value": "克制冷峻惊悚"},
+                {"label": "方案四", "value": "温暖的社会寓言"},
+            ],
+        }, 11
 
     async def capture_audit(**kwargs):
         audits.append(kwargs)
 
     monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
     monkeypatch.setattr(main, "log_ai_action", capture_audit)
-    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+    monkeypatch.setattr(main.llm, "generate_interaction_options", fake_options)
 
     async with SessionLocal() as session:
         user, project = await seed_project(
@@ -152,8 +167,14 @@ async def test_ai_revision_regenerates_one_field_without_applying(monkeypatch):
         )
         await session.refresh(project)
 
-    assert response["changed_fields"] == ["tone"]
-    assert response["changes"][0]["before"] == complete_movie_draft()["tone"]
+    assert response["status"] == "options"
+    assert response["target_field"] == "tone"
+    assert len(response["options"]) == 3
+    assert [item["label"] for item in response["options"]] == [
+        "方案一",
+        "方案二",
+        "方案三",
+    ]
     assert response["tokens_used"] == 11
     assert response["total_tokens"] == 11
     assert project.project_type == "pending"
@@ -263,6 +284,7 @@ async def test_ai_revision_rejects_stale_context_before_calling_ai(monkeypatch):
 
     monkeypatch.setattr(main, "enforce_user_quota", fail_if_called)
     monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fail_if_called)
+    monkeypatch.setattr(main.llm, "generate_interaction_options", fail_if_called)
 
     async with SessionLocal() as session:
         user, _project = await seed_project(session)
@@ -289,15 +311,22 @@ async def test_ai_revision_discards_candidate_if_context_changes_during_call(mon
 
     audits = []
 
-    async def fake_revise(**_kwargs):
-        return {"tone": "过期的新基调"}, "这份候选已过期", 5
+    async def fake_options(*_args, **_kwargs):
+        return {
+            "question": "过期的选项",
+            "options": [
+                {"label": "一", "value": "过期基调一"},
+                {"label": "二", "value": "过期基调二"},
+                {"label": "三", "value": "过期基调三"},
+            ],
+        }, 5
 
     async def capture_audit(**kwargs):
         audits.append(kwargs)
 
     monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
     monkeypatch.setattr(main, "log_ai_action", capture_audit)
-    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+    monkeypatch.setattr(main.llm, "generate_interaction_options", fake_options)
 
     async with SessionLocal() as session:
         user, project = await seed_project(session)
@@ -338,16 +367,23 @@ async def test_ai_revision_rejects_invalid_numeric_candidate_and_charges_usage(m
 
     audits = []
 
-    async def fake_revise(**kwargs):
-        assert kwargs["allowed_fields"] == ["movie_duration"]
-        return {"movie_duration": "9999"}, "不合法时长", 6
+    async def fake_options(step_key, *_args, **_kwargs):
+        assert step_key == "movie_duration"
+        return {
+            "question": "选择时长",
+            "options": [
+                {"label": "过长一", "value": "9999"},
+                {"label": "过长二", "value": "8888"},
+                {"label": "过长三", "value": "7777"},
+            ],
+        }, 6
 
     async def capture_audit(**kwargs):
         audits.append(kwargs)
 
     monkeypatch.setattr(main, "enforce_user_quota", no_op_async)
     monkeypatch.setattr(main, "log_ai_action", capture_audit)
-    monkeypatch.setattr(main.llm, "revise_quick_setup_fields", fake_revise)
+    monkeypatch.setattr(main.llm, "generate_interaction_options", fake_options)
 
     async with SessionLocal() as session:
         user, project = await seed_project(session)

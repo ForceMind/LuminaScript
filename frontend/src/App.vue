@@ -91,6 +91,13 @@ const quickReviewCandidateVisible = ref(false)
 const quickReviewCandidate = ref<any>(null)
 const quickReviewCandidateBaseValues = ref<Record<string, string>>({})
 const quickReviewCandidateTokens = ref(0)
+const quickReviewFieldOptionsVisible = ref(false)
+const quickReviewFieldOptionTarget = ref('')
+const quickReviewFieldOptionQuestion = ref('')
+const quickReviewFieldOptions = ref<any[]>([])
+const quickReviewSelectedFieldOption = ref('')
+const quickReviewFieldOptionBaseValues = ref<Record<string, string>>({})
+const quickReviewFieldOptionTokens = ref(0)
 const quickReviewAiCandidateBusy = ref(false)
 const quickReviewAiRequestSequence = ref(0)
 const loading = ref(false)
@@ -906,6 +913,13 @@ const resetQuickReviewState = () => {
     quickReviewCandidate.value = null
     quickReviewCandidateBaseValues.value = {}
     quickReviewCandidateTokens.value = 0
+    quickReviewFieldOptionsVisible.value = false
+    quickReviewFieldOptionTarget.value = ''
+    quickReviewFieldOptionQuestion.value = ''
+    quickReviewFieldOptions.value = []
+    quickReviewSelectedFieldOption.value = ''
+    quickReviewFieldOptionBaseValues.value = {}
+    quickReviewFieldOptionTokens.value = 0
     quickReviewAiCandidateBusy.value = false
 }
 
@@ -1020,20 +1034,63 @@ const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'rela
     }
 }
 
+const closeQuickReviewFieldOptions = () => {
+    quickReviewFieldOptionsVisible.value = false
+    quickReviewFieldOptionTarget.value = ''
+    quickReviewFieldOptionQuestion.value = ''
+    quickReviewFieldOptions.value = []
+    quickReviewSelectedFieldOption.value = ''
+    quickReviewFieldOptionBaseValues.value = {}
+    quickReviewFieldOptionTokens.value = 0
+}
+
+const showQuickReviewFieldOptions = (
+    data: any,
+    field: string,
+    baseValues: Record<string, string>,
+) => {
+    const options = Array.isArray(data?.options) ? data.options.slice(0, 3) : []
+    if (options.length !== 3) {
+        ElMessage.error('AI 未返回 3 个有效选项，请重试')
+        return
+    }
+    quickReviewFieldOptionTarget.value = field
+    quickReviewFieldOptionQuestion.value = toTextValue(data?.question)
+    quickReviewFieldOptions.value = options
+    quickReviewSelectedFieldOption.value = ''
+    quickReviewFieldOptionBaseValues.value = { ...baseValues }
+    quickReviewFieldOptionTokens.value = Number(data?.tokens_used || 0)
+    quickReviewFieldOptionsVisible.value = true
+}
+
+const applyQuickReviewFieldOption = () => {
+    const field = quickReviewFieldOptionTarget.value
+    const selectedOption = quickReviewFieldOptions.value.find(
+        (option: any) => toTextValue(option?.value) === quickReviewSelectedFieldOption.value,
+    )
+    if (!field || !selectedOption) {
+        ElMessage.warning('请先选择一个方案')
+        return
+    }
+    const hasLocalConflict = Object.entries(quickReviewFieldOptionBaseValues.value).some(
+        ([key, value]) => quickReviewValues.value[key] !== value,
+    )
+    if (hasLocalConflict) {
+        ElMessage.warning('选项生成期间草案已被修改，请重新生成后再选择')
+        return
+    }
+    quickReviewValues.value[field] = toTextValue(selectedOption.value)
+    if (!quickReviewAiAdjustedFields.value.includes(field)) {
+        quickReviewAiAdjustedFields.value = [...quickReviewAiAdjustedFields.value, field]
+    }
+    closeQuickReviewFieldOptions()
+    ElMessage.success(`已应用“${getContextFieldLabel(field)}”的 AI 方案`)
+}
+
 const regenerateQuickReviewField = async (field: string) => {
     if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
-    let instruction = ''
-    try {
-        const promptResult: any = await ElMessageBox.prompt('可选：告诉 AI 这项需要怎样调整', '重新生成此项', { inputPlaceholder: '例如：更悬疑、更简洁' })
-        instruction = promptResult.value || ''
-    } catch { return }
-    if (
-        quickReviewAiCandidateBusy.value
-        || currentProject.value?.id !== projectId
-        || interaction.value?.context_revision !== contextRevision
-    ) return
     const requestSequence = quickReviewAiRequestSequence.value + 1
     quickReviewAiRequestSequence.value = requestSequence
     quickReviewAiCandidateBusy.value = true
@@ -1044,7 +1101,7 @@ const regenerateQuickReviewField = async (field: string) => {
     try {
         const { data } = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
             operation: 'regenerate_field', scope: 'edited_only', values: requestValues, target_field: field,
-            edited_fields: quickReviewEditedFields.value, context_revision: contextRevision, instruction
+            edited_fields: quickReviewEditedFields.value, context_revision: contextRevision, instruction: ''
         })
         if (
             quickReviewAiRequestSequence.value !== requestSequence
@@ -1052,7 +1109,7 @@ const regenerateQuickReviewField = async (field: string) => {
             || interaction.value?.context_revision !== contextRevision
         ) return
         syncProjectTokensFromResponse(data)
-        showQuickReviewCandidate(data, requestValues)
+        showQuickReviewFieldOptions(data, field, requestValues)
     } catch (e: any) {
         if (
             quickReviewAiRequestSequence.value !== requestSequence
@@ -1961,8 +2018,8 @@ const copyText = (value: unknown) => {
 
                             <div v-else-if="interactionField === 'quick_review'">
                                 <div class="mb-5 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-blue-800">
-                                    AI 已把所有答案作为一套完整方案联合生成。默认可直接采用；只需展开你有疑问的部分修改。
-                                    类型与规模属于结构条件，如需调整请切换到“自己掌控”。
+                                    AI 已把所有答案作为一套完整方案联合生成。每一项都可以点击“AI 单独生成”，
+                                    再从 3 个方案中选择一个；其他项不会被改动。剧本类型会改变整套字段结构，需在“自己掌控”中调整。
                                 </div>
                                 <el-collapse v-model="quickReviewExpanded" class="quick-setup-review">
                                     <el-collapse-item
@@ -1981,6 +2038,18 @@ const copyText = (value: unknown) => {
                                                 <span class="min-w-0 flex-1 truncate text-right text-sm text-gray-400">
                                                     {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
                                                 </span>
+                                                <el-button
+                                                    v-if="section.key !== 'project_type'"
+                                                    class="shrink-0"
+                                                    size="small"
+                                                    type="primary"
+                                                    plain
+                                                    :loading="quickReviewAiLoading[section.key]"
+                                                    :disabled="quickReviewAiCandidateBusy"
+                                                    @click.stop="regenerateQuickReviewField(section.key)"
+                                                >
+                                                    AI 单独生成
+                                                </el-button>
                                             </div>
                                         </template>
                                         <div class="px-2 pb-3">
@@ -1995,17 +2064,7 @@ const copyText = (value: unknown) => {
                                             <div v-else class="rounded-lg bg-gray-50 p-3 text-sm text-gray-700">
                                                 {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
                                             </div>
-                                            <div class="mt-3 flex flex-wrap items-center gap-2">
-                                                <el-button
-                                                    v-if="section.key !== 'project_type'"
-                                                    size="small"
-                                                    :loading="quickReviewAiLoading[section.key]"
-                                                    :disabled="quickReviewAiCandidateBusy"
-                                                    @click="regenerateQuickReviewField(section.key)"
-                                                >
-                                                    重新生成
-                                                </el-button>
-                                                <el-tag v-if="quickReviewAiLoading[section.key]" size="small" type="info">AI处理中</el-tag>
+                                            <div v-if="quickReviewAiErrors[section.key]" class="mt-3 flex flex-wrap items-center gap-2">
                                                 <span v-if="quickReviewAiErrors[section.key]" class="text-xs text-red-500">{{ quickReviewAiErrors[section.key] }}</span>
                                             </div>
                                         </div>
@@ -2081,6 +2140,41 @@ const copyText = (value: unknown) => {
                                     <div v-if="quickReviewCandidateTokens > 0" class="text-xs text-gray-400">本次消耗 {{ quickReviewCandidateTokens }} tokens</div>
                                 </div>
                                 <template #footer><el-button @click="closeQuickReviewCandidate">取消</el-button><el-button type="primary" @click="applyQuickReviewCandidate">应用候选</el-button></template>
+                            </el-dialog>
+                            <el-dialog
+                                v-model="quickReviewFieldOptionsVisible"
+                                :title="`为“${getContextFieldLabel(quickReviewFieldOptionTarget)}”选择一个方案`"
+                                width="min(760px, 94vw)"
+                                append-to-body
+                                :show-close="!quickReviewAiCandidateBusy"
+                                :close-on-click-modal="!quickReviewAiCandidateBusy"
+                                :close-on-press-escape="!quickReviewAiCandidateBusy"
+                                @closed="closeQuickReviewFieldOptions"
+                            >
+                                <p v-if="quickReviewFieldOptionQuestion" class="mb-4 text-sm leading-6 text-slate-600">{{ quickReviewFieldOptionQuestion }}</p>
+                                <div class="space-y-3">
+                                    <button
+                                        v-for="(option, optionIndex) in quickReviewFieldOptions"
+                                        :key="`${optionIndex}-${option.value}`"
+                                        class="w-full rounded-xl border-2 p-4 text-left transition hover:border-blue-300 hover:bg-blue-50/50"
+                                        :class="quickReviewSelectedFieldOption === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-100'"
+                                        @click="quickReviewSelectedFieldOption = option.value"
+                                    >
+                                        <div class="flex items-start gap-3">
+                                            <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-blue-100 text-xs font-bold text-blue-700">{{ optionIndex + 1 }}</span>
+                                            <div class="min-w-0 flex-1">
+                                                <div class="font-medium text-slate-800">{{ option.label }}</div>
+                                                <div v-if="option.value !== option.label" class="mt-2 whitespace-pre-wrap text-sm leading-6 text-gray-500">{{ option.value }}</div>
+                                            </div>
+                                        </div>
+                                    </button>
+                                </div>
+                                <div v-if="quickReviewFieldOptionTokens > 0" class="mt-4 text-xs text-gray-400">本次消耗 {{ quickReviewFieldOptionTokens }} tokens</div>
+                                <template #footer>
+                                    <el-button :disabled="quickReviewAiCandidateBusy" @click="closeQuickReviewFieldOptions">取消</el-button>
+                                    <el-button :loading="quickReviewAiLoading[quickReviewFieldOptionTarget]" :disabled="quickReviewAiCandidateBusy" @click="regenerateQuickReviewField(quickReviewFieldOptionTarget)">换一批</el-button>
+                                    <el-button type="primary" :disabled="!quickReviewSelectedFieldOption || quickReviewAiCandidateBusy" @click="applyQuickReviewFieldOption">使用此选项</el-button>
+                                </template>
                             </el-dialog>
                         </div>
                      </div>
