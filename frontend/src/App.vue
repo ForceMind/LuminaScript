@@ -37,6 +37,7 @@ import {
     formatSetupFieldValue,
     normalizeTitleDisplay,
 } from './setupFieldPresentation'
+import { draftValuesDiffer, hydrateQuickReviewDraft, quickReviewAiEligibility, savedDraftResult } from './quickReviewDraft'
 
 marked.setOptions({ gfm: true, breaks: true })
 const AdminDashboard = defineAsyncComponent(
@@ -97,6 +98,10 @@ const projectRequestGuard = new ProjectRequestGuard()
 const selectedOption = ref('')
 const customInput = ref('')
 const quickReviewValues = ref<Record<string, string>>({})
+const quickReviewBaselineValues = ref<Record<string, string>>({})
+const quickReviewSavedValues = ref<Record<string, string>>({})
+const quickReviewSavedAt = ref('')
+const quickReviewDraftStale = ref(false)
 const quickReviewExpanded = ref<string[]>([])
 const quickReviewEditedFields = ref<string[]>([])
 const quickReviewAiAdjustedFields = ref<string[]>([])
@@ -137,6 +142,18 @@ const versionDiffText = ref('')
 const memberForm = ref({ username: '', role: 'viewer' })
 const canEditCurrentProject = computed(() => ['owner', 'editor'].includes(currentProject.value?.access_role || 'owner'))
 const ownsCurrentProject = computed(() => (currentProject.value?.access_role || 'owner') === 'owner')
+const quickReviewHasUnsavedChanges = computed(() => draftValuesDiffer(
+    quickReviewValues.value,
+    quickReviewSavedValues.value,
+))
+const quickReviewCanSave = computed(() => !quickReviewDraftStale.value && (
+    !quickReviewSavedAt.value || quickReviewHasUnsavedChanges.value
+))
+const quickReviewSavedTimeLabel = computed(() => {
+    if (!quickReviewSavedAt.value) return '未保存'
+    const date = new Date(quickReviewSavedAt.value)
+    return Number.isNaN(date.getTime()) ? '已保存' : `已保存 ${date.toLocaleString()}`
+})
 
 const currentProjectRevision = () => toTextValue(currentProject.value?.context_revision).trim()
 const beginProjectRequest = (
@@ -786,6 +803,12 @@ const handleVisibilityChange = () => {
     stopPolling()
 }
 
+const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+    if (!quickReviewHasUnsavedChanges.value) return
+    event.preventDefault()
+    event.returnValue = ''
+}
+
 const logout = () => {
     try { stopPolling() } catch(e) { console.error(e) }
     invalidateProjectRequests()
@@ -871,7 +894,7 @@ const handleAccountCommand = (command: string) => {
         void changePassword()
         return
     }
-    if (command === 'logout') logout()
+    if (command === 'logout') void requestLogout()
 }
 
 // Start polling if token exists on load
@@ -883,6 +906,7 @@ if (token.value) {
 onMounted(() => {
     if (typeof document !== 'undefined') {
         document.addEventListener('visibilitychange', handleVisibilityChange)
+        window.addEventListener('beforeunload', handleBeforeUnload)
     }
 })
 
@@ -890,6 +914,7 @@ onUnmounted(() => {
     stopPolling()
     if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityChange)
+        window.removeEventListener('beforeunload', handleBeforeUnload)
     }
 })
 
@@ -933,6 +958,10 @@ const createProject = async () => {
 const resetQuickReviewState = () => {
     quickReviewAiRequestSequence.value += 1
     quickReviewValues.value = {}
+    quickReviewBaselineValues.value = {}
+    quickReviewSavedValues.value = {}
+    quickReviewSavedAt.value = ''
+    quickReviewDraftStale.value = false
     quickReviewExpanded.value = []
     quickReviewEditedFields.value = []
     quickReviewAiAdjustedFields.value = []
@@ -954,23 +983,214 @@ const resetQuickReviewState = () => {
 
 const initializeQuickReview = (payload: any) => {
     resetQuickReviewState()
-    const values: Record<string, string> = {}
-    for (const section of Array.isArray(payload?.sections) ? payload.sections : []) {
-        const key = toTextValue(section?.key).trim()
-        if (key) values[key] = toTextValue(section?.value)
-    }
-    quickReviewValues.value = values
+    const draft = hydrateQuickReviewDraft(payload)
+    quickReviewValues.value = draft.values
+    quickReviewBaselineValues.value = draft.baselineValues
+    quickReviewSavedValues.value = draft.savedValues
+    quickReviewEditedFields.value = draft.editedFields
+    quickReviewAiAdjustedFields.value = draft.aiAdjustedFields
+    quickReviewSavedAt.value = draft.savedAt
+    quickReviewDraftStale.value = draft.stale
 }
 
+const applyQuickReviewDraftResponse = (payload: any) => {
+    const draft = hydrateQuickReviewDraft(payload)
+    quickReviewValues.value = draft.values
+    quickReviewBaselineValues.value = draft.baselineValues
+    quickReviewSavedValues.value = draft.savedValues
+    quickReviewEditedFields.value = draft.editedFields
+    quickReviewAiAdjustedFields.value = draft.aiAdjustedFields
+    quickReviewSavedAt.value = draft.savedAt
+    quickReviewDraftStale.value = draft.stale
+}
+
+const quickReviewAiEligibilityState = computed(() => {
+    const editable = new Set<string>((interaction.value?.sections || [])
+        .filter((section: any) => section?.editable)
+        .map((section: any) => toTextValue(section?.key).trim()) as string[])
+    return quickReviewAiEligibility(quickReviewValues.value, quickReviewBaselineValues.value, editable)
+})
+const quickReviewCanRelated = computed(() => quickReviewAiEligibilityState.value.canRelated)
+const quickReviewCanEditedOnly = computed(() => quickReviewAiEligibilityState.value.canEditedOnly)
+
 const markQuickReviewFieldEdited = (key: string) => {
+    if (quickReviewDraftStale.value) return
     quickReviewAiAdjustedFields.value = quickReviewAiAdjustedFields.value.filter((field) => field !== key)
     if (!quickReviewEditedFields.value.includes(key)) {
         quickReviewEditedFields.value = [...quickReviewEditedFields.value, key]
     }
 }
 
+type QuickReviewDraftAction = 'save' | 'save_guided' | 'discard' | 'regenerate' | 'guided'
+
+const runQuickReviewDraftAction = async (action: QuickReviewDraftAction) => {
+    if (!currentProject.value?.id || interactionField.value !== 'quick_review') return false
+    if (quickReviewDraftStale.value && !['discard', 'regenerate'].includes(action)) return false
+    const projectId = currentProject.value.id
+    const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
+    if (!contextRevision) return false
+    const request = beginProjectRequest(projectId, contextRevision, 'quick-draft')
+    const valuesSnapshot = { ...quickReviewValues.value }
+    const baselineSnapshot = { ...quickReviewBaselineValues.value }
+    const editedFieldsSnapshot = [...quickReviewEditedFields.value]
+    const aiAdjustedFieldsSnapshot = [...quickReviewAiAdjustedFields.value]
+    const actionText: Record<QuickReviewDraftAction, string> = {
+        save: '正在保存工作草案...',
+        save_guided: '正在保存草案并切换...',
+        discard: '正在放弃工作草案...',
+        regenerate: '正在重新生成整份设定...',
+        guided: '正在切换到自己掌控...',
+    }
+    startProjectLoading(request, actionText[action])
+    try {
+        const response = await api.post(`/projects/${projectId}/setup/quick-review`, {
+            action,
+            values: valuesSnapshot,
+            baseline_values: baselineSnapshot,
+            edited_fields: editedFieldsSnapshot,
+            ai_adjusted_fields: aiAdjustedFieldsSnapshot,
+            context_revision: contextRevision,
+        })
+        if (!isProjectRequestCurrent(request)) return false
+        syncProjectTokensFromResponse(response.data, true)
+        if (action === 'save') {
+            const savedResult = savedDraftResult(quickReviewValues.value, valuesSnapshot)
+            const changedDuringSave = savedResult.changedDuringSave
+            if (!changedDuringSave) {
+                applyQuickReviewDraftResponse(response.data?.quick_setup_draft || response.data)
+            }
+            quickReviewSavedValues.value = savedResult.savedValues
+            quickReviewSavedAt.value = toTextValue(response.data?.quick_setup_draft?.saved_at || response.data?.saved_at || quickReviewSavedAt.value)
+            ElMessage.success(changedDuringSave
+                ? '已保存先前版本；当前继续编辑尚未保存'
+                : '工作草案已保存，尚未确认到正式设定')
+            return true
+        }
+        if (draftValuesDiffer(quickReviewValues.value, valuesSnapshot)) {
+            quickReviewSavedValues.value = valuesSnapshot
+            quickReviewDraftStale.value = true
+            ElMessage.warning('切换期间检测到新的编辑，内容已保留为只读草案，请复制后重新生成。')
+            return false
+        }
+        interaction.value = null
+        resetQuickReviewState()
+        await analyzeLogline(projectId)
+        return true
+    } catch (error: any) {
+        const message = error.response?.status === 409
+            ? '草案已过期，请重新生成或明确放弃。'
+            : formatApiErrorDetail(error.response?.data?.detail, '草案操作失败，请稍后重试')
+        ElMessage.error(message)
+        return false
+    } finally {
+        finishProjectLoading(request)
+    }
+}
+
+const switchQuickReviewToGuided = async () => {
+    try {
+        await ElMessageBox.confirm(
+            '可保存当前工作稿后进入自己掌控；放弃会删除该工作稿。',
+            '切换到自己掌控',
+            {
+                confirmButtonText: '保存草案并切换',
+                cancelButtonText: '放弃草案并切换',
+                distinguishCancelAndClose: true,
+                type: 'warning',
+            },
+        )
+        await runQuickReviewDraftAction('save_guided')
+    } catch (reason) {
+        if (reason === 'cancel') {
+            await runQuickReviewDraftAction('guided')
+        }
+    }
+}
+
+const copyQuickReviewDraft = () => {
+    const text = Object.entries(quickReviewValues.value)
+        .map(([field, value]) => `${getContextFieldLabel(field)}：${value}`)
+        .join('\n\n')
+    copyText(text)
+}
+
+const confirmQuickReviewLeave = async () => {
+    if (!quickReviewHasUnsavedChanges.value) return true
+    if (quickReviewDraftStale.value) {
+        try {
+            await ElMessageBox.confirm(
+                '这份本地冲突内容无法保存或合并。请先复制需要保留的文本，再确认离开。',
+                '未保存的冲突内容',
+                { confirmButtonText: '仍然离开', cancelButtonText: '取消', type: 'warning' },
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+    try {
+        await ElMessageBox.confirm(
+            '当前快速设定有未保存修改。',
+            '保存工作稿？',
+            {
+                confirmButtonText: '保存后继续',
+                cancelButtonText: '放弃未保存修改',
+                distinguishCancelAndClose: true,
+                type: 'warning',
+            },
+        )
+        const saved = await runQuickReviewDraftAction('save')
+        if (saved && quickReviewHasUnsavedChanges.value) {
+            ElMessage.warning('保存期间仍有新的编辑，请再次保存或取消离开。')
+            return false
+        }
+        return saved
+    } catch (reason) {
+        // Leaving discards only the local, unsaved delta; the last server-saved
+        // work draft remains available when this project is opened again.
+        if (reason === 'cancel') return true
+        return false
+    }
+}
+
+const discardQuickReviewDraft = async () => {
+    try {
+        await ElMessageBox.confirm(
+            '这会删除服务器中已保存的工作稿，且无法恢复。',
+            '放弃工作稿',
+            { type: 'warning', confirmButtonText: '放弃工作稿', cancelButtonText: '取消' },
+        )
+        await runQuickReviewDraftAction('discard')
+    } catch { /* cancel keeps the saved draft */ }
+}
+
+const requestStartNewProject = async () => {
+    if (!await confirmQuickReviewLeave()) return
+    startNewProject()
+}
+
+const requestLogout = async () => {
+    if (!await confirmQuickReviewLeave()) return
+    logout()
+}
+
 const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
     if (!currentProject.value?.id) return
+    if (interactionField.value === 'quick_review') {
+        if (mode === 'guided') {
+            await switchQuickReviewToGuided()
+            return
+        }
+        try {
+            await ElMessageBox.confirm(
+                '重新生成整份会清除当前工作稿，是否继续？',
+                '确认重新生成',
+                { type: 'warning' },
+            )
+        } catch { return }
+        await runQuickReviewDraftAction('regenerate')
+        return
+    }
     const projectId = currentProject.value.id
     const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
     if (!contextRevision) {
@@ -1025,13 +1245,13 @@ const showQuickReviewCandidate = (data: any, baseValues: Record<string, string>)
 }
 
 const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'related' = 'edited_only') => {
-    if (!currentProject.value?.id || !interaction.value?.context_revision) return
+    if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewDraftStale.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
     const projectRequest = beginProjectRequest(projectId, contextRevision, 'quick-ai')
     const operation = field ? 'regenerate_field' : 'review_edits'
     const key = field || `review_${scope}`
-    if (!field && !quickReviewEditedFields.value.length) return
+    if (!field && !(scope === 'related' ? quickReviewCanRelated.value : quickReviewCanEditedOnly.value)) return
     if (quickReviewAiCandidateBusy.value) return
     const requestSequence = quickReviewAiRequestSequence.value + 1
     quickReviewAiRequestSequence.value = requestSequence
@@ -1043,7 +1263,9 @@ const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'rela
     try {
         const response = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
             operation, scope, values: requestValues, target_field: field || null,
+            baseline_values: { ...quickReviewBaselineValues.value },
             edited_fields: editedFields,
+            ai_adjusted_fields: [...quickReviewAiAdjustedFields.value],
             context_revision: contextRevision, instruction: ''
         })
         if (
@@ -1125,7 +1347,7 @@ const applyQuickReviewFieldOption = () => {
 }
 
 const regenerateQuickReviewField = async (field: string) => {
-    if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value) return
+    if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value || quickReviewDraftStale.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
     const projectRequest = beginProjectRequest(projectId, contextRevision, 'quick-ai')
@@ -1140,7 +1362,8 @@ const regenerateQuickReviewField = async (field: string) => {
     try {
         const { data } = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
             operation: 'regenerate_field', scope: 'edited_only', values: requestValues, target_field: field,
-            edited_fields: editedFields, context_revision: contextRevision, instruction: ''
+            baseline_values: { ...quickReviewBaselineValues.value }, edited_fields: editedFields,
+            ai_adjusted_fields: [...quickReviewAiAdjustedFields.value], context_revision: contextRevision, instruction: ''
         })
         if (
             quickReviewAiRequestSequence.value !== requestSequence
@@ -1204,6 +1427,10 @@ const applyQuickReviewCandidate = () => {
 
 const submitQuickReview = async (action: 'confirm' | 'guided') => {
     if (!currentProject.value?.id || interactionField.value !== 'quick_review') return
+    if (quickReviewDraftStale.value) {
+        ElMessage.warning('该工作稿已过期，只能复制、重新生成或放弃。')
+        return
+    }
     const projectId = currentProject.value.id
     const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
     if (!contextRevision) {
@@ -1231,6 +1458,8 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
                 isCurrent: () => isProjectRequestCurrent(request),
                 values,
                 editedFields,
+                baselineValues: { ...quickReviewBaselineValues.value },
+                aiAdjustedFields: [...quickReviewAiAdjustedFields.value],
                 reviewInput: reviewAndMaybeRewriteInput,
                 getLabel: getContextFieldLabel,
                 post: (url, payload) => api.post(url, payload),
@@ -1289,7 +1518,11 @@ const analyzeLogline = async (id: number) => {
     }
     
     if (res.data.type === 'interaction_required') {
-      interaction.value = res.data.payload
+      interaction.value = {
+          ...res.data.payload,
+          saved_draft_available: Boolean(res.data.saved_draft_available ?? res.data.payload?.saved_draft_available),
+          draft_stale: Boolean(res.data.draft_stale ?? res.data.payload?.draft_stale),
+      }
       if (interaction.value?.field === 'quick_review') {
           initializeQuickReview(interaction.value)
       }
@@ -1442,6 +1675,7 @@ const loadProject = async (p: any) => {
             return
         }
     }
+    if (!await confirmQuickReviewLeave()) return
     
     switchingProject.value = true
     let loadRequest: ProjectRequestSnapshot | null = null
@@ -1924,7 +2158,7 @@ const copyText = (value: unknown) => {
                         </el-dropdown-menu>
                     </template>
                  </el-dropdown>
-                 <el-button type="primary" round :icon="Plus" @click="startNewProject">开始新创意</el-button>
+                 <el-button type="primary" round :icon="Plus" @click="requestStartNewProject">开始新创意</el-button>
             </div>
         </header>
 
@@ -1995,7 +2229,7 @@ const copyText = (value: unknown) => {
                     <div class="flex-1 overflow-y-auto">
                         <ul class="space-y-2 p-1">
                             <div class="p-2">
-                                <el-button class="w-full" :icon="Plus" @click="startNewProject(); drawerOpen=false">新创意</el-button>
+                                <el-button class="w-full" :icon="Plus" @click="requestStartNewProject(); drawerOpen=false">新创意</el-button>
                             </div>
                             <li v-for="p in sortedProjectList" :key="p.id" 
                                 @click="loadProject(p)"
@@ -2129,9 +2363,18 @@ const copyText = (value: unknown) => {
                             </div>
 
                             <div v-else-if="interactionField === 'quick_review'">
-                                <div class="mb-5 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-blue-800">
+                                <div v-if="!quickReviewDraftStale" class="mb-5 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-blue-800">
                                     AI 已把所有答案作为一套完整方案联合生成。每一项都可以点击“AI 单独生成”，
                                     再从 3 个方案中选择一个；其他项不会被改动。剧本类型会改变整套字段结构，需在“自己掌控”中调整。
+                                </div>
+                                <div class="mb-4 flex flex-wrap items-center justify-between gap-2 text-xs">
+                                    <span :class="quickReviewDraftStale ? 'text-amber-700' : quickReviewHasUnsavedChanges ? 'text-amber-600' : 'text-gray-400'">
+                                        {{ quickReviewDraftStale ? '工作稿已过期：正式设定已变化' : quickReviewHasUnsavedChanges ? '有未保存修改' : quickReviewSavedTimeLabel }}
+                                    </span>
+                                    <el-button v-if="quickReviewDraftStale" size="small" text @click="copyQuickReviewDraft">复制工作稿</el-button>
+                                </div>
+                                <div v-if="quickReviewDraftStale" class="mb-5 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-800">
+                                    此工作稿无法与新的正式设定自动合并。你可以复制内容后重新生成，或明确放弃该稿。
                                 </div>
                                 <el-collapse v-model="quickReviewExpanded" class="quick-setup-review">
                                     <el-collapse-item
@@ -2159,7 +2402,7 @@ const copyText = (value: unknown) => {
                                                     type="primary"
                                                     plain
                                                     :loading="quickReviewAiLoading[section.key]"
-                                                    :disabled="quickReviewAiCandidateBusy"
+                                                    :disabled="quickReviewAiCandidateBusy || quickReviewDraftStale"
                                                     @click.stop="regenerateQuickReviewField(section.key)"
                                                 >
                                                     AI 单独生成
@@ -2173,6 +2416,7 @@ const copyText = (value: unknown) => {
                                                 v-model="quickReviewValues[section.key]"
                                                 type="textarea"
                                                 :autosize="{ minRows: section.key === 'title' ? 1 : 3, maxRows: 12 }"
+                                                :disabled="loading || quickReviewDraftStale"
                                                 @input="markQuickReviewFieldEdited(section.key)"
                                             />
                                             <div v-else class="rounded-lg bg-gray-50 p-3 text-sm text-gray-700">
@@ -2186,18 +2430,27 @@ const copyText = (value: unknown) => {
                                 </el-collapse>
                                 <div class="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-between">
                                     <div class="flex flex-wrap gap-2">
+                                        <el-button v-if="!quickReviewDraftStale" @click="runQuickReviewDraftAction('save')" :loading="loading" :disabled="!quickReviewCanSave || quickReviewAiCandidateBusy">保存工作稿</el-button>
+                                        <el-button v-if="!quickReviewDraftStale && quickReviewSavedAt" type="warning" plain @click="discardQuickReviewDraft" :loading="loading" :disabled="quickReviewAiCandidateBusy">放弃工作稿</el-button>
                                         <el-button @click="chooseSetupMode('ai_fast')" :loading="loading" :disabled="quickReviewAiCandidateBusy">重新生成整份</el-button>
-                                        <el-button @click="submitQuickReview('guided')" :loading="loading" :disabled="quickReviewAiCandidateBusy">切换到自己掌控</el-button>
-                                        <el-button :disabled="!quickReviewEditedFields.length || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_edited_only" @click="quickReviewAiRequest(undefined, 'edited_only')">AI 仅整改已改项</el-button>
-                                        <el-button :disabled="!quickReviewEditedFields.length || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_related" @click="quickReviewAiRequest(undefined, 'related')">AI 联动整改</el-button>
+                                        <el-button v-if="!quickReviewDraftStale" @click="switchQuickReviewToGuided" :loading="loading" :disabled="quickReviewAiCandidateBusy">切换到自己掌控</el-button>
+                                        <el-button v-else type="warning" plain @click="discardQuickReviewDraft" :loading="loading">放弃工作稿</el-button>
+                                        <el-button v-if="!quickReviewDraftStale" :disabled="!quickReviewCanEditedOnly || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_edited_only" @click="quickReviewAiRequest(undefined, 'edited_only')">AI 仅整改已改项</el-button>
+                                        <el-button v-if="!quickReviewDraftStale" :disabled="!quickReviewCanRelated || quickReviewAiCandidateBusy" :loading="quickReviewAiLoading.review_related" @click="quickReviewAiRequest(undefined, 'related')">AI 联动整改</el-button>
                                     </div>
-                                    <el-button type="primary" @click="submitQuickReview('confirm')" :loading="loading" :disabled="quickReviewAiCandidateBusy">
+                                    <el-button v-if="!quickReviewDraftStale" type="primary" @click="submitQuickReview('confirm')" :loading="loading" :disabled="quickReviewAiCandidateBusy">
                                         采用草案并继续
                                     </el-button>
                                 </div>
                             </div>
 
                             <template v-else>
+                                <div v-if="interaction?.saved_draft_available" class="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm text-blue-800">
+                                    <span>{{ interaction.draft_stale ? '有一份已过期的快速工作稿，可重新生成或放弃。' : '有一份已保存的快速工作稿，可返回继续审查。' }}</span>
+                                    <el-button size="small" type="primary" plain @click="chooseSetupMode('ai_fast')">
+                                        返回快速审查
+                                    </el-button>
+                                </div>
                                 <div class="space-y-3 mb-6">
                                     <button
                                         v-for="opt in interaction.options"
@@ -2301,7 +2554,7 @@ const copyText = (value: unknown) => {
                             <h2 class="text-2xl font-light text-slate-800 truncate min-w-0" :title="currentProjectTitle">
                                 {{ currentProjectTitle }}
                             </h2>
-                            <el-button class="shrink-0" size="small" circle :icon="Plus" @click="startNewProject" title="开启新创意"></el-button>
+                            <el-button class="shrink-0" size="small" circle :icon="Plus" @click="requestStartNewProject" title="开启新创意"></el-button>
                             <el-button class="shrink-0" size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
                         </div>
                         <div class="flex items-center gap-3 shrink-0 max-w-full">

@@ -71,8 +71,10 @@ from services.setup_state import (
     write_scene_prompt_cache,
     write_setup,
     write_setup_cache,
+    write_working_draft,
 )
 from services import setup_fields
+from services import setup_drafts
 
 # Configure Logging
 logging.basicConfig(
@@ -302,6 +304,39 @@ def build_quick_review_sections(
             }
         )
     return sections
+
+
+def working_draft_payload(project: models.Project, draft: dict, *, stale: bool) -> Dict[str, Any]:
+    values = draft.get("values") if isinstance(draft.get("values"), dict) else {}
+    project_type = values.get("project_type")
+    if project_type not in ALLOWED_PROJECT_TYPES:
+        project_type = project.project_type if project.project_type in ALLOWED_PROJECT_TYPES else "movie"
+    relevant = {step["key"] for step in get_relevant_setup_steps(project_type)} | set(values)
+    sections = [{
+        "key": step["key"], "label": SUMMARY_LABELS.get(step["key"], step["key"]),
+        "question": step["question"], "value": str(values.get(step["key"], "")),
+        "editable": not stale and step["key"] not in QUICK_CONTROL_FIELDS, "source": "ai",
+    } for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm" and step["key"] in relevant]
+    return {
+        "type": "interaction_required", "payload": {
+            "field": QUICK_REVIEW_FIELD,
+            "question": "保存的工作稿已过期，请只读查看、复制或明确丢弃。" if stale else "已恢复保存的快速工作稿，尚未写入正式设定。",
+            "sections": sections, "values": values,
+            "baseline_values": draft.get("baseline_values", {}),
+            "edited_fields": draft.get("edited_fields", []),
+            "ai_adjusted_fields": draft.get("ai_adjusted_fields", []),
+            "draft_status": "stale" if stale else "saved", "draft_stale": stale,
+            "read_only": stale, "base_setup_revision": draft.get("base_setup_revision"),
+            "saved_at": draft.get("saved_at"),
+        },
+    }
+
+
+def draft_response_state(project: models.Project) -> Dict[str, Any]:
+    draft, stale = setup_drafts.inspect_draft(project)
+    return {"quick_setup_draft": draft, "has_quick_setup_draft": draft is not None,
+            "quick_setup_draft_stale": stale, "saved_draft_available": draft is not None,
+            "draft_stale": stale}
 
 
 
@@ -896,17 +931,19 @@ class InteractionRequest(BaseModel):
 
 
 class QuickSetupReviewRequest(BaseModel):
-    action: Literal["confirm", "guided"] = "confirm"
+    action: Literal["confirm", "guided", "save", "save_guided", "discard", "regenerate"] = "confirm"
     values: Dict[str, str] = Field(default_factory=dict)
+    baseline_values: Dict[str, str] = Field(default_factory=dict)
     edited_fields: List[str] = Field(default_factory=list, max_length=20)
+    ai_adjusted_fields: List[str] = Field(default_factory=list, max_length=20)
     context_revision: Optional[str] = Field(default=None, max_length=128)
 
-    @field_validator("values")
+    @field_validator("values", "baseline_values")
     @classmethod
     def validate_quick_setup_values(cls, value: Dict[str, str]) -> Dict[str, str]:
         return setup_fields.validate_safety(value)
 
-    @field_validator("edited_fields")
+    @field_validator("edited_fields", "ai_adjusted_fields")
     @classmethod
     def validate_edited_fields(cls, value: List[str]) -> List[str]:
         allowed = {step["key"] for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm"}
@@ -917,12 +954,14 @@ class QuickSetupAIReviseRequest(BaseModel):
     operation: Literal["regenerate_field", "review_edits"]
     scope: Literal["edited_only", "related"] = "edited_only"
     values: Dict[str, str] = Field(default_factory=dict)
+    baseline_values: Dict[str, str] = Field(default_factory=dict)
     target_field: Optional[str] = None
     edited_fields: List[str] = Field(default_factory=list, max_length=20)
+    ai_adjusted_fields: List[str] = Field(default_factory=list, max_length=20)
     context_revision: Optional[str] = Field(default=None, max_length=128)
     instruction: Optional[str] = Field(default=None, max_length=MAX_INTERACTION_ANSWER_LENGTH)
 
-    @field_validator("values")
+    @field_validator("values", "baseline_values")
     @classmethod
     def validate_values(cls, value: Dict[str, str]) -> Dict[str, str]:
         return setup_fields.validate_safety(value)
@@ -932,7 +971,7 @@ class QuickSetupAIReviseRequest(BaseModel):
     def strip_optional(cls, value: Optional[str]) -> Optional[str]:
         return value.strip() if isinstance(value, str) else value
 
-    @field_validator("edited_fields")
+    @field_validator("edited_fields", "ai_adjusted_fields")
     @classmethod
     def validate_revision_fields(cls, value: List[str]) -> List[str]:
         allowed = {
@@ -943,7 +982,7 @@ class QuickSetupAIReviseRequest(BaseModel):
         result = list(
             dict.fromkeys(str(key).strip() for key in value if str(key).strip())
         )
-        invalid = [k for k in result if k not in allowed or k in QUICK_CONTROL_FIELDS]
+        invalid = [k for k in result if k not in allowed]
         if invalid:
             raise ValueError(f"不可编辑字段: {', '.join(invalid)}")
         return result
@@ -1052,7 +1091,10 @@ async def submit_interaction(
         if answer_text not in {SETUP_MODE_AI_FAST, SETUP_MODE_GUIDED}:
             raise HTTPException(status_code=422, detail="不支持的设定方式")
         current_context[SETUP_MODE_KEY] = answer_text
-        await write_setup(db, project, interaction.context_revision, {"global_context": current_context})
+        await write_setup(db, project, interaction.context_revision, {
+            "global_context": current_context,
+            "quick_setup_draft": setup_drafts.draft_after_mode_change(project),
+        })
         await db.commit()
         return {
             "status": "setup_mode_updated",
@@ -1061,6 +1103,7 @@ async def submit_interaction(
             "title": project.title or previous_title or "",
             "total_tokens": int(project.total_tokens or 0),
             **revision_meta(project),
+            **draft_response_state(project),
         }
 
     if interaction.context_key == 'final_confirm' and answer_text == 'reset':
@@ -1264,6 +1307,7 @@ async def revise_quick_setup_with_ai(
 ):
     project, _ = await require_project_access(db, project_id, current_user.id, minimum_role="editor")
     await assert_setup_writable(db, project, payload.context_revision)
+    setup_drafts.require_current_draft(project)
     if payload.context_revision != build_setup_context_revision(project):
         raise HTTPException(status_code=409, detail="项目设定已更新，请刷新后重试。")
     # Only safety/shape is global here. Invalid repair targets must reach AI;
@@ -1273,21 +1317,46 @@ async def revise_quick_setup_with_ai(
         all_fields = setup_fields.relevant_fields(values.get("project_type", project.project_type or ""))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    baseline, baseline_source = setup_drafts.baseline_for(project, payload.baseline_values)
+    actual_changes = setup_drafts.value_changes(values, baseline)
+    saved_metadata, _ = setup_drafts.inspect_draft(project)
+    ai_sources = payload.ai_adjusted_fields if "ai_adjusted_fields" in payload.model_fields_set else (saved_metadata or {}).get("ai_adjusted_fields", [])
+    manual_sources = payload.edited_fields if "edited_fields" in payload.model_fields_set else (saved_metadata or {}).get("edited_fields", [])
+    changed_fields = {key: {**change, "source": "ai" if key in ai_sources and key not in manual_sources else "manual"}
+                      for key, change in actual_changes.items()}
+    locked_fields: List[str] = []
+    invalid_changed_fields: Dict[str, str] = {}
     if payload.operation == "regenerate_field":
         if not payload.target_field or payload.target_field not in all_fields or payload.target_field == "project_type":
             raise HTTPException(status_code=422, detail="单项重生必须指定有效 target_field")
         allowed = [payload.target_field]
     else:
-        allowed = [field for field in payload.edited_fields if field in all_fields and field not in QUICK_CONTROL_FIELDS]
-        if not allowed:
-            raise HTTPException(status_code=422, detail="review_edits 必须提供 edited_fields")
+        allowed = [field for field in all_fields if field in actual_changes and field not in QUICK_CONTROL_FIELDS]
         if payload.scope == "related":
-            allowed = [field for field in all_fields if field not in QUICK_CONTROL_FIELDS]
+            locked_fields = sorted(set(actual_changes) | QUICK_CONTROL_FIELDS)
+            allowed = [field for field in all_fields if field not in locked_fields]
+            for field, change in actual_changes.items():
+                try:
+                    setup_fields.normalize_field(field, change["after"])
+                except ValueError as exc:
+                    invalid_changed_fields[field] = str(exc)
+        else:
+            locked_fields = sorted(set(all_fields) - set(allowed))
+        if not actual_changes or not allowed:
+            note = "当前值与基线一致，无需额外 AI 分析。" if not actual_changes else "当前改后值已锁定，没有可调整的关联内容项。"
+            if invalid_changed_fields:
+                note += " 锁定改后字段仍需人工修正：" + "、".join(invalid_changed_fields)
+            return {"status": "candidate", "operation": payload.operation, "scope": payload.scope,
+                    "changes": [], "changed_fields": [], "summary": note, "tokens_used": 0,
+                    "total_tokens": int(project.total_tokens or 0), "context_revision": payload.context_revision}
     await enforce_user_quota(db, project.owner_id)
     template_instructions = await get_prompt_addendum(db, stage="interaction", project_type=values.get("project_type", "all"))
     audit_prompt = json.dumps({
         "operation": payload.operation, "scope": payload.scope,
         "target_field": payload.target_field, "edited_fields": payload.edited_fields,
+        "ai_adjusted_fields": payload.ai_adjusted_fields, "baseline_values": baseline,
+        "baseline_source": baseline_source, "changed_fields": changed_fields,
+        "locked_fields": locked_fields, "invalid_changed_fields": invalid_changed_fields,
         "allowed_fields": allowed, "instruction": payload.instruction or "", "values": values,
     }, ensure_ascii=False)
     if payload.operation == "regenerate_field":
@@ -1311,6 +1380,8 @@ async def revise_quick_setup_with_ai(
             logline=project.logline or "", values=values, allowed_fields=allowed,
             instruction=payload.instruction or "", operation=payload.operation,
             scope=payload.scope, template_instructions=template_instructions,
+            baseline_values=baseline, changed_fields=changed_fields,
+            locked_fields=locked_fields, invalid_changed_fields=invalid_changed_fields,
         )
         raw_content = getattr(revised, "raw_content", json.dumps({"fields": revised, "summary": summary}, ensure_ascii=False))
         setup_fields.validate_safety(revised, allowed=set(allowed))
@@ -1345,6 +1416,9 @@ async def revise_quick_setup_with_ai(
     )
     if stale:
         raise HTTPException(status_code=409, detail="AI 分析期间项目设定已更新，请刷新后重试。")
+    if invalid_changed_fields:
+        note = "锁定改后字段仍需人工修正，未自动改写：" + "、".join(invalid_changed_fields)
+        summary = summary[:MAX_INTERACTION_ANSWER_LENGTH - len(note) - 1] + "\n" + note
     changes = [{"field": field, "before": values.get(field, ""), "after": value}
                for field, value in normalized_revised.items() if value != values.get(field, "")]
     return {"status": "candidate", "operation": payload.operation, "scope": payload.scope,
@@ -1355,78 +1429,67 @@ async def revise_quick_setup_with_ai(
 
 @app.post("/projects/{project_id}/setup/quick-review")
 async def submit_quick_setup_review(
-    project_id: int,
-    payload: QuickSetupReviewRequest,
+    project_id: int, payload: QuickSetupReviewRequest,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    project, _ = await require_project_access(
-        db,
-        project_id,
-        current_user.id,
-        minimum_role="editor",
-    )
+    project, _ = await require_project_access(db, project_id, current_user.id, minimum_role="editor")
     await assert_setup_writable(db, project, payload.context_revision)
-    current_revision = build_setup_context_revision(project)
-    if payload.context_revision != current_revision:
-        raise HTTPException(
-            status_code=409,
-            detail="项目设定已在其他位置更新，请刷新快速草案后重试。",
-        )
-
     current_context = get_internal_project_context(project)
-    if payload.action == "guided":
-        current_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
-        current_context.pop(QUICK_EDITED_FIELDS_KEY, None)
-        await write_setup(db, project, payload.context_revision, {"global_context": current_context})
-        await db.commit()
-        return {
-            "status": "guided",
-            "setup_mode": SETUP_MODE_GUIDED,
-            "context": project.global_context,
-            "title": project.title or "",
-            "total_tokens": int(project.total_tokens or 0),
-            **revision_meta(project),
-        }
-
-    try:
-        normalized_values = normalize_quick_setup_values(
-            project,
-            payload.values,
-            preserve_existing=False,
+    status = payload.action
+    if payload.action in {"save", "save_guided", "confirm"}:
+        setup_drafts.require_current_draft(project)
+    if payload.action in {"save", "save_guided"}:
+        if "values" not in payload.model_fields_set:
+            raise HTTPException(status_code=422, detail="保存工作稿需要明确提交 values；未提交时不会替换现有工作稿。")
+        baseline, _ = setup_drafts.baseline_for(project, payload.baseline_values)
+        previous, _ = setup_drafts.inspect_draft(project)
+        ai_fields = payload.ai_adjusted_fields if "ai_adjusted_fields" in payload.model_fields_set else (previous or {}).get("ai_adjusted_fields", [])
+        draft = setup_drafts.build_working_draft(
+            project, payload.values, baseline, payload.edited_fields, ai_fields,
+            mode_change=payload.action == "save_guided",
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    for derived_key in (
-        "synopsis_brief",
-        "synopsis_detailed",
-        "brief_synopsis",
-        "detailed_synopsis",
-        "story_brief",
-        "story_detailed",
-    ):
-        current_context.pop(derived_key, None)
-
-    for key, value in normalized_values.items():
-        current_context[key] = value
-    current_context[SETUP_MODE_KEY] = SETUP_MODE_AI_FAST
-    current_context[QUICK_EDITED_FIELDS_KEY] = payload.edited_fields
-    current_context["final_confirm"] = "confirmed"
-    await write_setup(db, project, payload.context_revision, {
-        "global_context": current_context,
-        "project_type": normalized_values["project_type"],
-        "title": normalized_values["title"],
-    })
+        if payload.action == "save_guided":
+            current_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
+            await write_setup(db, project, payload.context_revision, {"global_context": current_context, "quick_setup_draft": draft})
+            status = "saved_guided"
+        else:
+            await write_working_draft(db, project, payload.context_revision, draft)
+            status = "saved"
+    elif payload.action == "discard":
+        await write_working_draft(db, project, payload.context_revision, None)
+        status = "discarded"
+    elif payload.action in {"guided", "regenerate"}:
+        current_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED if payload.action == "guided" else SETUP_MODE_AI_FAST
+        if payload.action == "regenerate":
+            current_context[setup_drafts.REGENERATE_KEY] = True
+        else:
+            current_context.pop(QUICK_EDITED_FIELDS_KEY, None)
+            current_context.pop(setup_drafts.REGENERATE_KEY, None)
+        await write_setup(db, project, payload.context_revision, {"global_context": current_context, "quick_setup_draft": None})
+    else:
+        try:
+            normalized_values = normalize_quick_setup_values(project, payload.values, preserve_existing=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        for key in ("synopsis_brief", "synopsis_detailed", "brief_synopsis", "detailed_synopsis", "story_brief", "story_detailed", setup_drafts.REGENERATE_KEY):
+            current_context.pop(key, None)
+        baseline, _ = setup_drafts.baseline_for(project, payload.baseline_values)
+        actual_changes = setup_drafts.value_changes(payload.values, baseline)
+        current_context.update(normalized_values)
+        current_context[SETUP_MODE_KEY] = SETUP_MODE_AI_FAST
+        current_context[QUICK_EDITED_FIELDS_KEY] = [key for key in payload.edited_fields if key in actual_changes]
+        current_context["final_confirm"] = "confirmed"
+        await write_setup(db, project, payload.context_revision, {
+            "global_context": current_context, "project_type": normalized_values["project_type"],
+            "title": normalized_values["title"], "quick_setup_draft": None,
+        })
+        status = "confirmed"
     await db.commit()
-
     return {
-        "status": "confirmed",
-        "setup_mode": SETUP_MODE_AI_FAST,
-        "context": project.global_context,
-        "title": project.title,
-        "total_tokens": int(project.total_tokens or 0),
-        **revision_meta(project),
+        "status": status, "setup_mode": get_internal_project_context(project).get(SETUP_MODE_KEY, ""),
+        "context": project.global_context, "title": project.title or "",
+        "total_tokens": int(project.total_tokens or 0), **revision_meta(project), **draft_response_state(project),
     }
 
 
@@ -1447,7 +1510,7 @@ async def analyze_logline(
         current_user.id,
         minimum_role="editor",
     )
-    await enforce_user_quota(db, project.owner_id)
+    await db.refresh(project)
 
     def with_runtime_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(payload or {})
@@ -1455,19 +1518,39 @@ async def analyze_logline(
         result.update(revision_meta(project))
         if isinstance(result.get("payload"), dict):
             result["payload"] = {**result["payload"], "context_revision": build_setup_context_revision(project)}
+            if result["payload"].get("field") == QUICK_REVIEW_FIELD:
+                data = result["payload"]
+                values = data.setdefault("values", {item["key"]: item["value"] for item in data.get("sections", [])})
+                data.setdefault("baseline_values", dict(values))
+                data.setdefault("edited_fields", [])
+                data.setdefault("ai_adjusted_fields", [])
+                data.setdefault("draft_status", "generated")
+                data.setdefault("draft_stale", False)
+                data.setdefault("read_only", False)
+                data.setdefault("base_setup_revision", int(project.setup_revision or 0))
+                data.setdefault("saved_at", None)
         result["total_tokens"] = int(project.total_tokens or 0)
         result["setup_mode"] = str(
             get_internal_project_context(project).get(SETUP_MODE_KEY, "") or ""
         )
+        saved, stale = setup_drafts.inspect_draft(project)
+        result["saved_draft_available"] = saved is not None
+        result["draft_stale"] = stale
         return result
 
+    saved_draft, saved_stale = setup_drafts.inspect_draft(project)
+    saved_mode = get_internal_project_context(project).get(SETUP_MODE_KEY, "")
+    if saved_draft is not None and saved_mode != SETUP_MODE_GUIDED:
+        return with_runtime_meta(working_draft_payload(project, saved_draft, stale=saved_stale))
+
+    await enforce_user_quota(db, project.owner_id)
     await assert_setup_writable(db, project, build_setup_context_revision(project))
     normalization_revision = build_setup_context_revision(project)
     normalized_draft = detached_setup(project)
     normalized = False
-    if normalize_project_title(normalized_draft):
+    if saved_draft is None and normalize_project_title(normalized_draft):
         normalized = True
-    if normalize_project_context(normalized_draft):
+    if saved_draft is None and normalize_project_context(normalized_draft):
         normalized = True
     if normalized:
         await write_setup(db, project, normalization_revision, {
@@ -1507,7 +1590,7 @@ async def analyze_logline(
                 }
             )
 
-    if should_auto_prefill_from_logline(project, normalized_context):
+    if saved_draft is None and should_auto_prefill_from_logline(project, normalized_context):
         prefill_revision = build_setup_context_revision(project)
         prefill_draft = detached_setup(project)
         filled_fields: List[str] = []
@@ -1559,7 +1642,8 @@ async def analyze_logline(
         normalized_context = build_normalized_context(project)
 
     # A legacy/mismatched cache is ignored, never relabelled as current.
-    stage = QUICK_REVIEW_FIELD if setup_mode == SETUP_MODE_AI_FAST and "final_confirm" not in normalized_context else next(
+    quick_review_needed = setup_mode == SETUP_MODE_AI_FAST and ("final_confirm" not in normalized_context or bool(get_internal_project_context(project).get(setup_drafts.REGENERATE_KEY)))
+    stage = QUICK_REVIEW_FIELD if quick_review_needed else next(
         (step["key"] for step in get_relevant_setup_steps(normalized_context.get("project_type", "movie"))
          if step["key"] not in normalized_context), "completed"
     )
@@ -1570,7 +1654,7 @@ async def analyze_logline(
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
-    if setup_mode == SETUP_MODE_AI_FAST and "final_confirm" not in normalized_context:
+    if quick_review_needed:
         field_specs = quick_setup_field_specs()
         interaction_template = await get_prompt_addendum(
             db,
@@ -1662,6 +1746,10 @@ async def analyze_logline(
                 "question": "AI 已完成整套故事设定，请展开有疑问的内容进行修改。",
                 "context_revision": build_setup_context_revision(project),
                 "sections": build_quick_review_sections(project, draft_values),
+                "values": dict(draft_values), "baseline_values": dict(draft_values),
+                "edited_fields": [], "ai_adjusted_fields": [],
+                "draft_status": "generated", "draft_stale": False, "read_only": False,
+                "base_setup_revision": int(project.setup_revision or 0), "saved_at": None,
             },
         }
         response_payload = await write_setup_cache(

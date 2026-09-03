@@ -47,12 +47,15 @@ class ProjectListResponse(ProjectBase):
     setup_revision: int = 0
     setup_cache_revision: int = 0
     context_revision: str
+    has_quick_setup_draft: bool = False
+    quick_setup_draft_stale: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class ProjectResponse(ProjectListResponse):
     scenes: List[SceneResponse] = Field(default_factory=list)
+    quick_setup_draft: Optional[Dict[str, Any]] = None
 
 # --- Auth Schemas ---
 class UserCreate(BaseModel):

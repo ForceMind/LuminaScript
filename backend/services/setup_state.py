@@ -20,11 +20,11 @@ CACHE_SCHEMA = 2
 SETUP_ATTRIBUTES = (
     "title", "logline", "project_type", "genre", "global_context",
     "global_summary", "next_step_cache", "setup_revision",
-    "setup_cache_revision", "status", "total_tokens",
+    "setup_cache_revision", "status", "total_tokens", "quick_setup_draft",
 )
 SETUP_WRITE_FIELDS = {
     "title", "logline", "project_type", "genre", "global_context",
-    "global_summary", "status",
+    "global_summary", "status", "quick_setup_draft",
 }
 
 
@@ -172,6 +172,15 @@ async def write_setup_cache(
         "setup_cache_revision": models.Project.setup_cache_revision + 1,
     })
     return cached
+
+
+async def write_working_draft(db: AsyncSession, project: models.Project, token: str, draft: dict | None) -> None:
+    """Saving/discarding a draft changes only working state, never formal setup."""
+    await _conditional_update(db, project, token, {
+        "quick_setup_draft": deepcopy(draft),
+        "next_step_cache": None,
+        "setup_cache_revision": models.Project.setup_cache_revision + 1,
+    })
 
 
 def valid_setup_cache(project: models.Project, *, mode: str, stage: str) -> bool:

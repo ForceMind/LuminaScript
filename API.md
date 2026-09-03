@@ -29,10 +29,12 @@
 - 返回轻量列表，不包含分场内容
 - 包含 `access_role`：`owner`、`editor` 或 `viewer`
 - 项目响应包含 `setup_revision`、`setup_cache_revision` 和 `context_revision`。
+- `has_quick_setup_draft`、`quick_setup_draft_stale` 表示是否有已保存稿及其是否过期；列表不携带完整工作稿。
 
 ### 获取单个项目详情
 - `GET /projects/{project_id}`
 - 返回完整项目信息，包含 `scenes`
+- 详情包含 `quick_setup_draft`（可空），用于恢复工作稿；它独立于正式 `global_context`。
 
 ### 分析并推进提问流程
 - `POST /projects/{project_id}/analyze`
@@ -62,11 +64,24 @@
 - `action=guided`：丢弃未确认草案并切换到逐步掌控
 - 请求必须携带草案返回的 `context_revision`；项目已被其他标签页修改时返回 `409`
 
+### 保存、恢复与丢弃工作稿
+- 同一 quick-review 接口新增 `save`、`save_guided`、`discard`、`regenerate` 动作。
+- 请求包含 `values`、`baseline_values`、`edited_fields`、`ai_adjusted_fields`、`context_revision`。
+- `save` 返回 `status=saved`：只保存工作稿并推进缓存版本，不写正式标题/类型/确认标志。
+- `save_guided` 返回 `status=saved_guided`：同一次原子操作保存稿并切换逐步掌控；保存稿仅供恢复，不自动成为逐项已确认答案。
+- `discard` 返回 `status=discarded`：明确删除已保存工作稿；`regenerate` 返回 `status=regenerate`：清除工作稿和旧生成缓存，准备重新生成快速草案，保留正式已确认约束。
+- 工作稿结构为 `schema=1`、`values`、`baseline_values`、两组改动字段、`base_setup_revision` 和 `saved_at`。再次保存不得替换原生成基线。
+- 单纯切模式会保留有效稿的可恢复性；正式内容变化后旧稿过期，只可查看、复制和明确丢弃，不自动合并或覆盖。
+- `/analyze` 优先恢复保存稿。quick-review payload 的 `draft_status` 为 `generated|saved|stale`，并包含 `draft_stale`、`read_only`、工作稿值和来源元数据；顶层 `saved_draft_available` 提示逐步模式可以返回快速审查。
+- 过期稿不能保存、确认或调用单项/联动 AI。客户端应展示只读冲突状态，不给旧稿换上新 token 后继续写入。
+
 ### 单项重生与 AI 复核
 - `POST /projects/{project_id}/setup/quick-review/ai-revise`
-- 共同请求字段：`values`（完整当前草案）、`edited_fields`、`context_revision`、可选 `instruction`。
+- 共同请求字段：`values`（完整当前草案）、`baseline_values`、`edited_fields`、`ai_adjusted_fields`、`context_revision`、可选 `instruction`。
 - `operation=regenerate_field` 需 `target_field`；成功返回 `status=options` 和三个 `label/value` 选项，只供客户端选择，不写正式设定。
 - `operation=review_edits` 使用 `scope=edited_only|related`；成功返回 `status=candidate`、`changes` 和摘要，应用前须由用户确认。
+- 改动以当前值相对基线的真实差异计算；基线优先使用已保存稿或有效服务器缓存。`edited_only` 只优化已改内容项；`related` 锁定用户/AI 明确选择的改后值与类型/规模，只修改必要关联内容。
+- 仅选择 AI 方案后也可发起关联复核；尺度变化作为锁定约束参与分析，不由联动 AI 改回原值。没有可修改项时不额外调用模型。
 - 返回 `tokens_used`、`total_tokens` 和版本；过期请求不得覆盖更新后的设定或缓存。
 - 生成期间本地草案再次变化时，客户端应拒绝应用旧候选。
 

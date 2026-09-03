@@ -92,6 +92,8 @@ export const submitQuickReviewRequest = async ({
     isCurrent,
     values,
     editedFields,
+    baselineValues = {},
+    aiAdjustedFields = [],
     reviewInput,
     getLabel,
     post,
@@ -100,6 +102,8 @@ export const submitQuickReviewRequest = async ({
     isCurrent: () => boolean
     values: Record<string, string>
     editedFields: string[]
+    baselineValues?: Record<string, string>
+    aiAdjustedFields?: string[]
     reviewInput: (value: string, label: string) => Promise<string>
     getLabel: (field: string) => string
     post: (url: string, payload: Record<string, unknown>) => Promise<{ data: unknown }>
@@ -112,7 +116,9 @@ export const submitQuickReviewRequest = async ({
     const response = await post(`/projects/${request.projectId}/setup/quick-review`, {
         action: 'confirm',
         values: reviewedValues,
+        baseline_values: baselineValues,
         edited_fields: editedFields,
+        ai_adjusted_fields: aiAdjustedFields,
         context_revision: request.contextRevision,
     })
     return isCurrent()

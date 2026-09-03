@@ -42,6 +42,7 @@ function harness(get: (url: string) => Promise<any>) {
         ElMessage: { error() {}, warning() {}, success() {} },
         ElMessageBox: { confirm: async () => {} },
         api: { get },
+        confirmQuickReviewLeave: async () => true,
         upsertProjectListItem() {}, resetQuickReviewState() {}, startPolling() {},
         syncProjectTokensFromResponse() {}, initializeQuickReview() {},
         normalizeProjectStatus: (value: unknown) => String(value || '').toLowerCase(),
@@ -159,6 +160,23 @@ test('实际删除成功清理旧loading，即使分析已推进同项目的revi
     assert.equal(state.currentProject.value, null)
     assert.equal(state.loading.value, false)
     assert.equal(state.switchingProject.value, false)
+})
+
+test('实际 guided 分析将顶层保存稿标志传到返回快速审查入口', async () => {
+    const { state } = harness(async () => ({}))
+    state.currentProject.value = { id: 1, context_revision: 'setup-v2:1:2' }
+    state.api.post = async () => ({ data: {
+        type: 'interaction_required',
+        setup_mode: 'guided',
+        saved_draft_available: true,
+        draft_stale: true,
+        payload: { field: 'movie_duration', question: '电影时长', options: [] },
+    } })
+    const app = install(state, [['analyzeLogline', 'submitChoice']])
+    await app.analyzeLogline(1)
+    assert.equal(state.interaction.value.field, 'movie_duration')
+    assert.equal(state.interaction.value.saved_draft_available, true)
+    assert.equal(state.interaction.value.draft_stale, true)
 })
 
 test('实际 getProjectTitle 优先保留权威 project.title 的内部标点', () => {

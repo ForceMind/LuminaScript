@@ -1140,6 +1140,10 @@ async def revise_quick_setup_fields(
     operation: str = "review_edits",
     scope: str = "edited_only",
     template_instructions: str = "",
+    baseline_values: dict | None = None,
+    changed_fields: dict | None = None,
+    locked_fields: list[str] | None = None,
+    invalid_changed_fields: dict | None = None,
 ) -> tuple[dict[str, str], str, int]:
     """Return a strictly scoped candidate revision; never mutate project state."""
     allowed = list(
@@ -1158,8 +1162,9 @@ async def revise_quick_setup_fields(
         )
     elif scope == "related":
         mode_rules = (
-            "这是联动整改。用户改动代表新的创作方向；只返回为恢复整体"
-            "一致性而确有必要调整的允许字段，不要为了改写而改写。"
+            "这是联动整改。用户和已采纳AI选项的改后值代表新的创作方向，必须原文锁定，"
+            "不得反向改回基线，也不得借机修正锁定规模字段。只调整允许列表中为适应新方向"
+            "确有必要改变的其他关联内容。锁定改后值若仍不合法，仅在summary提醒用户，不得改写。"
         )
     else:
         mode_rules = (
@@ -1184,6 +1189,18 @@ async def revise_quick_setup_fields(
 
     当前完整设定：
     {json.dumps(values, ensure_ascii=False)}
+
+    权威比较基线：
+    {json.dumps(baseline_values or {}, ensure_ascii=False)}
+
+    按实际值计算的前后变化（after是必须尊重的新方向）：
+    {json.dumps(changed_fields or {}, ensure_ascii=False)}
+
+    锁定字段（禁止返回或改写）：
+    {json.dumps(locked_fields or [], ensure_ascii=False)}
+
+    锁定改后字段中的无效项（只在summary说明）：
+    {json.dumps(invalid_changed_fields or {}, ensure_ascii=False)}
 
     用户补充要求：
     {instruction or '无；以内部一致、具体、有戏剧张力为目标'}

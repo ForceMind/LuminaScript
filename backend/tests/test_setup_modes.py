@@ -20,13 +20,11 @@ def test_ai_revision_request_rejects_unknown_and_strips_optional_fields():
     assert request.instruction == "improve"
     assert request.target_field == "tone"
 
-    with pytest.raises(ValueError):
-        main.QuickSetupAIReviseRequest(
-            operation="review_edits",
-            values={"movie_duration": "120"},
-            context_revision="12345678",
-            edited_fields=["movie_duration"],
-        )
+    scale_request = main.QuickSetupAIReviseRequest(
+        operation="review_edits", values={"movie_duration": "120"},
+        context_revision="12345678", ai_adjusted_fields=["movie_duration"],
+    )
+    assert scale_request.ai_adjusted_fields == ["movie_duration"]
 
 
 @pytest.mark.asyncio
@@ -216,6 +214,7 @@ async def test_ai_revision_edited_only_rejects_model_scope_violation(monkeypatch
                     operation="review_edits",
                     scope="edited_only",
                     values=complete_movie_draft(),
+                    baseline_values={**complete_movie_draft(), "theme": "基线旧主题"},
                     edited_fields=["theme"],
                     context_revision=main.build_setup_context_revision(project),
                 ),
@@ -239,9 +238,10 @@ async def test_ai_revision_related_scope_locks_control_fields(monkeypatch):
         allowed = set(kwargs["allowed_fields"])
         assert allowed
         assert not allowed.intersection(main.QUICK_CONTROL_FIELDS)
-        assert {"theme", "plot_details"}.issubset(allowed)
+        assert "theme" not in allowed
+        assert "plot_details" in allowed
+        assert kwargs["values"]["theme"] == "用户明确改后的主题"
         return {
-            "theme": "真实与稳定之间的道德代价",
             "plot_details": "医生曾主动参与实验；高潮中她公开自己的责任。",
         }, "联动校准了主题与关键转折", 7
 
@@ -259,7 +259,8 @@ async def test_ai_revision_related_scope_locks_control_fields(monkeypatch):
             main.QuickSetupAIReviseRequest(
                 operation="review_edits",
                 scope="related",
-                values=complete_movie_draft(),
+                values={**complete_movie_draft(), "theme": "用户明确改后的主题"},
+                baseline_values=complete_movie_draft(),
                 edited_fields=["theme"],
                 context_revision=main.build_setup_context_revision(project),
             ),
@@ -267,7 +268,7 @@ async def test_ai_revision_related_scope_locks_control_fields(monkeypatch):
             current_user=user,
         )
 
-    assert set(response["changed_fields"]) == {"theme", "plot_details"}
+    assert set(response["changed_fields"]) == {"plot_details"}
     assert not set(response["changed_fields"]).intersection(main.QUICK_CONTROL_FIELDS)
 
 
@@ -499,6 +500,7 @@ async def test_quick_mode_generates_reviews_and_atomically_confirms(monkeypatch)
         )
         payload = draft_response["payload"]
         values = {item["key"]: item["value"] for item in payload["sections"]}
+        values["theme"] = "用户编辑后的真实、记忆与个人责任主题"
 
         confirm_response = await main.submit_quick_setup_review(
             1,

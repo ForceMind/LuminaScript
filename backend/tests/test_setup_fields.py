@@ -201,6 +201,7 @@ async def test_review_repairs_invalid_edited_field_without_normalizing_locked_fi
         user, project = await seed_project(session)
         result = await main.revise_quick_setup_with_ai(1, main.QuickSetupAIReviseRequest(
             operation="review_edits", values=values, edited_fields=["theme"], context_revision=project.context_revision,
+            baseline_values={**values, "theme": "修改前的有效主题"},
         ), db=session, current_user=user)
         assert result["changes"] == [{"field": "theme", "before": "", "after": "爱"}]
         assert values["tone"] == "  暖  "

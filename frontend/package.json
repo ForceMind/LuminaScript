@@ -1,12 +1,12 @@
 {
   "name": "lumina-script-frontend",
   "private": true,
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
-    "test:async": "node --experimental-strip-types --test tests/projectRequestGuard.test.ts tests/appRequestLifecycle.test.ts tests/setupFieldPresentation.test.ts",
+    "test:async": "node --experimental-strip-types --test tests/projectRequestGuard.test.ts tests/appRequestLifecycle.test.ts tests/setupFieldPresentation.test.ts tests/quickReviewDraft.test.ts tests/quickReviewDraftLifecycle.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

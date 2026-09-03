@@ -11,7 +11,8 @@ from core.config import settings
 BASE_DIR = Path(__file__).resolve().parent
 BASELINE_REVISION = "20260728_0001"
 OPERATIONS_REVISION = "20260804_0004"
-HEAD_REVISION = "20260903_0005"
+SETUP_REVISION = "20260903_0005"
+HEAD_REVISION = "20260903_0006"
 
 
 def alembic_config() -> Config:
@@ -69,7 +70,7 @@ def unversioned_sqlite_revision(path: Path) -> Optional[str]:
             and "cancel_requested" in job_columns
         ):
             if {"setup_revision", "setup_cache_revision"}.issubset(project_columns):
-                return HEAD_REVISION
+                return HEAD_REVISION if "quick_setup_draft" in project_columns else SETUP_REVISION
             return OPERATIONS_REVISION
         return "20260728_0003"
     return BASELINE_REVISION

@@ -90,6 +90,8 @@ class Project(Base):
     
     # Stores the next interaction step to cache specific questions
     next_step_cache = Column(JSON, nullable=True)
+    # Unconfirmed working draft, deliberately independent of interaction cache.
+    quick_setup_draft = Column(JSON(none_as_null=True), nullable=True)
     # Monotonic setup state and derived-question revisions; never restored from snapshots.
     setup_revision = Column(Integer, default=0, server_default="0", nullable=False)
     setup_cache_revision = Column(Integer, default=0, server_default="0", nullable=False)
@@ -97,6 +99,15 @@ class Project(Base):
     @property
     def context_revision(self) -> str:
         return f"setup-v2:{int(self.setup_revision or 0)}:{int(self.setup_cache_revision or 0)}"
+
+    @property
+    def has_quick_setup_draft(self) -> bool:
+        return self.quick_setup_draft is not None
+
+    @property
+    def quick_setup_draft_stale(self) -> bool:
+        from services.setup_drafts import inspect_draft
+        return inspect_draft(self)[1]
     
     # Stores the overall summary/hook
     global_summary = Column(Text, nullable=True)
