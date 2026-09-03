@@ -2,6 +2,7 @@ from openai import AsyncOpenAI
 import json
 import logging
 import re
+from services import setup_fields
 
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -199,40 +200,29 @@ def _load_json_payload(text: str):
 
 
 class InteractionGenerationError(Exception):
-    def __init__(self, message: str, *, raw_content: str = "", error_type: str = ""):
+    def __init__(self, message: str, *, raw_content: str = "", error_type: str = "", usage: int = 0):
         super().__init__(message)
-        self.raw_content = str(raw_content or "")
+        self.raw_content = str(getattr(raw_content, "raw_content", raw_content) or "")
         self.error_type = str(error_type or "interaction_generation_error")
+        self.usage = max(0, int(usage or 0))
 
 
-def _option_text(option: dict) -> str:
-    label = str(option.get("label", "") or "").strip()
-    value = str(option.get("value", "") or "").strip()
-    return f"{label}\n{value}".strip()
+class AIResultDict(dict):
+    """Dictionary payload retaining the exact provider text for audit only."""
+    def __init__(self, payload, raw_content=""):
+        super().__init__(payload)
+        self.raw_content = str(getattr(raw_content, "raw_content", raw_content) or "")
+        self.rejection_summary = list(getattr(payload, "rejection_summary", []))[:8]
 
 
-def _is_relevant_interaction_option(step_key: str, option: dict) -> bool:
-    text = _option_text(option)
-    if not text:
-        return False
-
-    if step_key == "character_details":
-        return (
-            len(text) >= 20
-            and any(keyword in text for keyword in ("主角", "角色", "配角", "反派", "人物", "身份", "关系", "秘密", "目标"))
-            and not any(keyword in text for keyword in ("叙事风格", "实验风格", "镜头语言"))
-        )
-
-    if step_key == "story_expansion":
-        return len(text) >= 40 and any(keyword in text for keyword in ("第一幕", "第二幕", "第三幕", "开端", "中段", "高潮"))
-
-    if step_key == "plot_details":
-        return len(text) >= 20 and any(keyword in text for keyword in ("关键", "转折", "冲突", "危机", "真相", "高潮", "结局"))
-
-    return True
+class AIText(str):
+    def __new__(cls, value, raw_content):
+        result = super().__new__(cls, value)
+        result.raw_content = str(raw_content)
+        return result
 
 
-def _normalize_interaction_payload(step_key: str, base_question: str, payload: dict, *, strict: bool = False):
+def _normalize_interaction_payload(step_key: str, base_question: str, payload: dict, *, strict: bool = False, allow_partial: bool = False):
     if not isinstance(payload, dict):
         if strict:
             raise InteractionGenerationError(
@@ -252,18 +242,37 @@ def _normalize_interaction_payload(step_key: str, base_question: str, payload: d
         return _build_interaction_fallback(step_key, question)
 
     options = []
+    rejected: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        reason = str(reason)[:160]
+        if reason in rejected or len(rejected) < 8:
+            rejected[reason] = rejected.get(reason, 0) + 1
+
     for option in raw_options:
         if not isinstance(option, dict):
+            reject("选项不是对象")
             continue
-        label = str(option.get("label", "") or "").strip()
-        value = str(option.get("value", "") or "").strip()
-        if not label or not value:
+        if not isinstance(option.get("label"), str) or not isinstance(option.get("value"), str):
+            reject("label与value必须为文本，不能是对象、列表或缺失值")
+            continue
+        if len(option["label"]) > setup_fields.MAX_FIELD_LENGTH or len(option["value"]) > setup_fields.MAX_FIELD_LENGTH:
+            reject(f"label或value超过{setup_fields.MAX_FIELD_LENGTH}字符")
+            continue
+        label = option["label"].strip()
+        value = option["value"]
+        if not label or (not value and step_key != "user_notes"):
+            reject("label或必填value为空")
             continue
         normalized_option = {"label": label, "value": value}
-        if _is_relevant_interaction_option(step_key, normalized_option):
-            options.append(normalized_option)
+        try:
+            setup_fields.normalize_field(step_key, value)
+        except ValueError as exc:
+            reject(str(exc))
+            continue
+        options.append(normalized_option)
 
-    if len(options) < 3:
+    if len(options) < 3 and not allow_partial:
         if strict:
             raise InteractionGenerationError(
                 f"Interaction payload for step '{step_key}' has insufficient valid options",
@@ -271,7 +280,9 @@ def _normalize_interaction_payload(step_key: str, base_question: str, payload: d
             )
         return _build_interaction_fallback(step_key, question)
 
-    return {"question": question, "options": options[:4]}
+    result = AIResultDict({"question": question, "options": options if allow_partial else options[:4]})
+    result.rejection_summary = [{"reason": reason, "count": count} for reason, count in rejected.items()]
+    return result
 
 
 def _estimate_token_usage(messages, content: str) -> int:
@@ -339,12 +350,13 @@ async def raw_generation(messages, temperature=0.7, json_response=False, task_ty
                 else:
                     logger.info(f"LLM调用: 成功完成 (消耗Token: {usage})")
 
+                raw_content = content
                 if json_response and content:
                     content = content.replace("```json", "").replace("```", "").strip()
                     json_match = re.search(r'\{.*\}', content, re.DOTALL)
                     if json_match:
                         content = json_match.group(0)
-                return content, usage
+                return AIText(content, raw_content), usage
         except Exception as e:
             last_error = e
             logger.warning(
@@ -596,15 +608,16 @@ async def extract_setup_from_long_input(long_input: str):
     )
 
     if not content:
-        raise ValueError("Empty extraction payload for long input")
+        raise InteractionGenerationError("Empty extraction payload for long input", raw_content=content, usage=usage, error_type="prefill_empty_payload")
 
     try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
+        parsed = _load_json_payload(content)
+        parsed = setup_fields.validate_safety(parsed)
+    except (ValueError, TypeError) as exc:
         logger.warning(f"extract_setup_from_long_input JSON parse failed: {content[:500]}")
-        raise ValueError("Invalid JSON extraction payload for long input") from exc
+        raise InteractionGenerationError("Invalid JSON extraction payload for long input", raw_content=content, usage=usage, error_type="prefill_invalid_payload") from exc
 
-    return parsed, usage
+    return AIResultDict(parsed, content), usage
 
 async def analyze_script_requirements(logline: str, project_type: str="movie"):
     """
@@ -924,7 +937,9 @@ async def generate_interaction_options(
     You are a professional Script Consultant and Story Architect. 
     Your goal is to guide the user in defining their story's "Bible" using the Snowflake Method (雪花写作法).
     
-    Current Task: Based on the current story context, generate 3-4 creative and distinct options for a specific aspect of the story.
+    Current Task: Generate creative and distinct options for a specific aspect of the story.
+    Use required_count from the context (default 3). For a refill, return only that many new options;
+    preserve accepted_options and never repeat excluded_values.
     
     CRITICAL INSTRUCTION - SNOWFLAKE METHOD:
     - If the user has already provided some details, DON'T ask basic questions. Instead, propose EXPANSIONS or CONFLICTS that build on what they have.
@@ -1004,7 +1019,7 @@ async def generate_interaction_options(
     if not content:
         raise InteractionGenerationError(
             f"Empty interaction payload for step: {step_key}",
-            error_type="empty_payload"
+            error_type="empty_payload", raw_content=content, usage=usage,
         )
 
     parsed = _load_json_payload(content)
@@ -1013,17 +1028,18 @@ async def generate_interaction_options(
         raise InteractionGenerationError(
             f"Invalid JSON interaction payload for step: {step_key}",
             raw_content=content,
-            error_type="json_parse_failed"
+            error_type="json_parse_failed", usage=usage,
         )
 
     try:
-        normalized_payload = _normalize_interaction_payload(step_key, base_question, parsed, strict=True)
+        normalized_payload = _normalize_interaction_payload(step_key, base_question, parsed, strict=True, allow_partial=True)
     except InteractionGenerationError as exc:
         if not exc.raw_content:
-            exc.raw_content = content
+            exc.raw_content = str(getattr(content, "raw_content", content))
+        exc.usage = int(usage or 0)
         raise
 
-    return normalized_payload, usage
+    return AIResultDict(normalized_payload, content), usage
 
 
 async def generate_quick_setup_draft(
@@ -1038,6 +1054,7 @@ async def generate_quick_setup_draft(
         {
             "key": str(item.get("key", "")).strip(),
             "question": str(item.get("question", "")).strip(),
+            "contract": setup_fields.field_contract(str(item.get("key", "")).strip()),
         }
         for item in field_specs
         if str(item.get("key", "")).strip()
@@ -1088,7 +1105,7 @@ async def generate_quick_setup_draft(
     if not content:
         raise InteractionGenerationError(
             "Empty quick setup draft",
-            error_type="empty_quick_setup_draft",
+            error_type="empty_quick_setup_draft", raw_content=content, usage=usage,
         )
 
     parsed = _load_json_payload(content)
@@ -1096,23 +1113,22 @@ async def generate_quick_setup_draft(
         raise InteractionGenerationError(
             "Invalid quick setup draft JSON",
             raw_content=content,
-            error_type="quick_setup_json_parse_failed",
+            error_type="quick_setup_json_parse_failed", usage=usage,
         )
     raw_fields = parsed.get("fields", parsed)
     if not isinstance(raw_fields, dict):
         raise InteractionGenerationError(
             "Quick setup draft is missing fields",
             raw_content=content,
-            error_type="quick_setup_fields_missing",
+            error_type="quick_setup_fields_missing", usage=usage,
         )
 
     allowed_keys = {item["key"] for item in requested_fields}
-    fields = {
-        str(key): str(value or "").strip()
-        for key, value in raw_fields.items()
-        if str(key) in allowed_keys
-    }
-    return fields, usage
+    try:
+        fields = setup_fields.validate_safety(raw_fields, allowed=allowed_keys)
+    except ValueError as exc:
+        raise InteractionGenerationError(str(exc), raw_content=content, usage=usage, error_type="quick_setup_fields_invalid") from exc
+    return AIResultDict(fields, content), usage
 
 
 async def revise_quick_setup_fields(
@@ -1195,25 +1211,27 @@ async def revise_quick_setup_fields(
         raise InteractionGenerationError(
             "Invalid revision JSON",
             raw_content=content or "",
-            error_type="revision_json_parse_failed",
+            error_type="revision_json_parse_failed", usage=usage,
         )
     unexpected_top_level = set(parsed) - {"fields", "summary"}
     if unexpected_top_level:
         raise InteractionGenerationError(
             "Revision returned unexpected top-level keys",
             raw_content=content or "",
-            error_type="revision_json_shape_invalid",
+            error_type="revision_json_shape_invalid", usage=usage,
         )
     unknown = set(parsed["fields"]) - set(allowed)
     if unknown:
         raise InteractionGenerationError(
             "Revision returned disallowed fields",
             raw_content=content or "",
-            error_type="revision_scope_violation",
+            error_type="revision_scope_violation", usage=usage,
         )
-    fields = {
-        str(key): str(value or "").strip()
-        for key, value in parsed["fields"].items()
-        if str(value or "").strip()
-    }
-    return fields, str(parsed.get("summary") or "").strip(), int(usage or 0)
+    try:
+        fields = setup_fields.validate_safety(parsed["fields"], allowed=set(allowed))
+        summary = parsed.get("summary") or ""
+        if not isinstance(summary, str) or len(summary) > setup_fields.MAX_FIELD_LENGTH:
+            raise ValueError("AI 修订摘要过长或不是文本")
+    except ValueError as exc:
+        raise InteractionGenerationError(str(exc), raw_content=content, usage=usage, error_type="revision_fields_invalid") from exc
+    return AIResultDict(fields, content), summary.strip(), int(usage or 0)

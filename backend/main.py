@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
 import asyncio
 import json
-import math
 import re
+from decimal import Decimal, ROUND_FLOOR
 
 from database import get_db, SessionLocal
 import models
@@ -72,6 +72,7 @@ from services.setup_state import (
     write_setup,
     write_setup_cache,
 )
+from services import setup_fields
 
 # Configure Logging
 logging.basicConfig(
@@ -195,19 +196,13 @@ AUTO_PREFILL_FIELDS = [
 ]
 
 MAX_INTERACTION_ATTEMPTS = 2
-MAX_INTERACTION_ANSWER_LENGTH = 20000
-MAX_QUICK_SETUP_TOTAL_LENGTH = 60000
-ALLOWED_PROJECT_TYPES = {"movie", "tv", "short", "short_video"}
+MAX_INTERACTION_ANSWER_LENGTH = setup_fields.MAX_FIELD_LENGTH
+MAX_QUICK_SETUP_TOTAL_LENGTH = setup_fields.MAX_TOTAL_LENGTH
+ALLOWED_PROJECT_TYPES = setup_fields.PROJECT_TYPES
 ALLOWED_INTERACTION_CONTEXT_KEYS = {
     step["key"] for step in SETUP_FLOW_STEPS
 } | {SETUP_MODE_FIELD}
-NUMERIC_INTERACTION_LIMITS = {
-    "movie_duration": (30, 300),
-    "scene_count_target": (1, 200),
-    "episode_count": (1, 100),
-    "episode_duration": (1, 180),
-    "video_duration_seconds": (15, 600),
-}
+NUMERIC_INTERACTION_LIMITS = setup_fields.NUMERIC_LIMITS
 GENERATION_TARGET_LIMITS = {
     "movie": 200,
     "tv": 100,
@@ -257,9 +252,9 @@ def build_setup_context_revision(project: models.Project) -> str:
     return setup_context_revision(project)
 
 
-def quick_setup_field_specs() -> List[Dict[str, str]]:
+def quick_setup_field_specs() -> List[Dict[str, Any]]:
     return [
-        {"key": step["key"], "question": step["question"]}
+        {"key": step["key"], "question": step["question"], "contract": setup_fields.field_contract(step["key"])}
         for step in SETUP_FLOW_STEPS
         if step["key"] != "final_confirm"
     ]
@@ -272,6 +267,7 @@ def normalize_quick_setup_values(
     preserve_existing: bool = True,
 ) -> Dict[str, str]:
     current_context = build_normalized_context(project)
+    setup_fields.validate_safety(raw_values)
     merged_values = dict(raw_values or {})
     if preserve_existing:
         for step in SETUP_FLOW_STEPS:
@@ -280,30 +276,8 @@ def normalize_quick_setup_values(
             if str(existing_value or "").strip():
                 merged_values[key] = existing_value
 
-    raw_project_type = merged_values.get("project_type")
-    try:
-        project_type = validate_interaction_answer("project_type", raw_project_type)
-    except HTTPException as exc:
-        raise ValueError("AI 未能确定有效的剧本类型") from exc
-    merged_values["project_type"] = project_type
-
-    normalized: Dict[str, str] = {}
-    for step in get_relevant_setup_steps(project_type):
-        key = step["key"]
-        if key == "final_confirm":
-            continue
-        raw_value = merged_values.get(key)
-        if key in QUICK_CONTROL_FIELDS:
-            try:
-                value = validate_interaction_answer(key, raw_value)
-            except HTTPException as exc:
-                raise ValueError(f"{SUMMARY_LABELS.get(key, key)}缺少有效值") from exc
-        else:
-            value = normalize_extracted_setup_value(key, raw_value)
-            if not value:
-                raise ValueError(f"{SUMMARY_LABELS.get(key, key)}缺少有效值")
-        normalized[key] = value
-    return normalized
+    merged_values.pop("final_confirm", None)
+    return setup_fields.normalize_complete(merged_values)
 
 
 def build_quick_review_sections(
@@ -329,30 +303,13 @@ def build_quick_review_sections(
         )
     return sections
 
-TITLE_PATTERNS = [
-    re.compile(r"《\s*([^《》\n]{1,60}?)\s*》"),
-    re.compile(r"〈\s*([^〈〉\n]{1,60}?)\s*〉"),
-    re.compile(r"「\s*([^「」\n]{1,60}?)\s*」"),
-    re.compile(r"『\s*([^『』\n]{1,60}?)\s*』"),
-]
-TITLE_BREAK_PATTERN = re.compile(r"[，。！？：；,.!?;:\n]|--+|——|—|-")
 
 
 def extract_story_title(raw_text: str) -> str:
-    text = (raw_text or "").strip()
-    if not text:
+    try:
+        return setup_fields.normalize_field("title", raw_text)
+    except ValueError:
         return ""
-
-    for pattern in TITLE_PATTERNS:
-        marked_title = pattern.search(text)
-        if marked_title:
-            return marked_title.group(1).strip()
-
-    short_title = TITLE_BREAK_PATTERN.split(text, maxsplit=1)[0].strip(" \t\r\n\"'“”‘’《》")
-    if short_title and len(short_title) <= 30:
-        return short_title
-
-    return ""
 
 
 def sanitize_title_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -365,9 +322,7 @@ def sanitize_title_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
         raw_value = str(option.get("value", "") or "").strip()
         raw_label = str(option.get("label", "") or "").strip()
-        clean_title = extract_story_title(raw_value) or extract_story_title(raw_label)
-        if not clean_title:
-            clean_title = raw_value if raw_value and len(raw_value) <= 30 else raw_label
+        clean_title = extract_story_title(raw_value)
 
         clean_title = clean_title.strip()
         if not clean_title or clean_title in seen_titles:
@@ -405,21 +360,10 @@ def normalize_project_title(project: models.Project) -> bool:
 
 
 def is_valid_character_details(value: Any) -> bool:
-    text = str(value or "").strip()
-    if not text:
+    try:
+        setup_fields.normalize_field("character_details", value)
+    except ValueError:
         return False
-
-    if text in {"经典叙事风格", "带有反转的剧情", "大胆的实验性风格"}:
-        return False
-
-    if any(keyword in text for keyword in ("叙事风格", "实验风格", "镜头语言")) and not any(
-        keyword in text for keyword in ("主角", "角色", "配角", "反派", "人物", "身份", "关系", "秘密")
-    ):
-        return False
-
-    if len(text) < 12 and not any(keyword in text for keyword in ("主角", "角色", "配角", "人物")):
-        return False
-
     return True
 
 
@@ -471,41 +415,18 @@ def has_setup_value(project: models.Project, context: Dict[str, Any], key: str) 
 
 
 def normalize_extracted_setup_value(key: str, value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
+    try:
+        return setup_fields.normalize_field(key, value)
+    except ValueError:
         return ""
-
-    if key == "project_type":
-        normalized = text.lower()
-        return normalized if normalized in {"movie", "tv", "short", "short_video"} else ""
-
-    if key == "title":
-        return extract_story_title(text)
-
-    if key in {"movie_duration", "scene_count_target", "episode_count", "video_duration_seconds"}:
-        match = re.search(r"\d+", text)
-        return match.group(0) if match else ""
-
-    if key == "episode_duration":
-        match = re.search(r"\d+", text)
-        return f"{match.group(0)}mins" if match else ""
-
-    if key == "character_details":
-        return text if is_valid_character_details(text) else ""
-
-    if key == "story_expansion":
-        return text if len(text) >= 24 else ""
-
-    if key == "plot_details":
-        return text if len(text) >= 12 else ""
-
-    if key in {"tone", "time_period", "theme", "visual_style", "user_notes"}:
-        return text if len(text) >= 2 else ""
-
-    return text
 
 
 def validate_interaction_answer(context_key: str, raw_answer: Any) -> str:
+    if context_key in setup_fields.SETUP_FIELDS:
+        try:
+            return setup_fields.normalize_field(context_key, raw_answer)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     answer = str(raw_answer or "").strip()
     if not answer:
         raise HTTPException(status_code=422, detail="回答不能为空")
@@ -515,24 +436,6 @@ def validate_interaction_answer(context_key: str, raw_answer: Any) -> str:
             detail=f"回答不能超过 {MAX_INTERACTION_ANSWER_LENGTH} 个字符",
         )
 
-    if context_key == "project_type":
-        normalized_type = answer.lower()
-        if normalized_type not in ALLOWED_PROJECT_TYPES:
-            raise HTTPException(status_code=422, detail="不支持的项目类型")
-        return normalized_type
-
-    if context_key in NUMERIC_INTERACTION_LIMITS:
-        number_match = re.search(r"\d+", answer)
-        if not number_match:
-            raise HTTPException(status_code=422, detail="请输入有效数字")
-        number = int(number_match.group(0))
-        minimum, maximum = NUMERIC_INTERACTION_LIMITS[context_key]
-        if number < minimum or number > maximum:
-            raise HTTPException(
-                status_code=422,
-                detail=f"数值必须在 {minimum} 到 {maximum} 之间",
-            )
-        return f"{number}mins" if context_key == "episode_duration" else str(number)
 
     return answer
 
@@ -551,6 +454,7 @@ def should_auto_prefill_from_logline(project: models.Project, context: Dict[str,
 def apply_auto_prefill(project: models.Project, extracted_payload: Dict[str, Any] | None) -> tuple[List[str], bool]:
     current_context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
     extracted_payload = extracted_payload if isinstance(extracted_payload, dict) else {}
+    setup_fields.validate_safety(extracted_payload)
     changed = False
     filled_fields: List[str] = []
 
@@ -569,6 +473,13 @@ def apply_auto_prefill(project: models.Project, extracted_payload: Dict[str, Any
 
         normalized_value = normalize_extracted_setup_value(key, raw_value)
         if not normalized_value:
+            continue
+        try:
+            setup_fields.validate_safety({
+                **{field: value for field, value in current_context.items() if field in setup_fields.SETUP_FIELDS},
+                key: normalized_value,
+            })
+        except ValueError:
             continue
 
         if key == "project_type":
@@ -631,38 +542,13 @@ def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[
     if not isinstance(options, list) or len(options) < 3:
         return True
 
-    generic_values = {"经典叙事风格", "带有反转的剧情", "大胆的实验性风格"}
-
-    if field == "character_details":
-        for option in options:
-            if not isinstance(option, dict):
-                return True
-            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
-            if any(value in option_text for value in generic_values):
-                return True
-            if not any(keyword in option_text for keyword in ("主角", "角色", "配角", "反派", "人物", "关系", "秘密")):
-                return True
-
-    if field == "story_expansion":
-        for option in options:
-            if not isinstance(option, dict):
-                return True
-            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
-            if any(value in option_text for value in generic_values):
-                return True
-            if not any(keyword in option_text for keyword in ("第一幕", "第二幕", "第三幕", "开端", "高潮")):
-                return True
-
-    if field == "plot_details":
-        for option in options:
-            if not isinstance(option, dict):
-                return True
-            option_text = f"{option.get('label', '')}\n{option.get('value', '')}"
-            if any(value in option_text for value in generic_values):
-                return True
-            if not any(keyword in option_text for keyword in ("关键", "转折", "冲突", "危机", "真相", "高潮")):
-                return True
-
+    for option in options:
+        if not isinstance(option, dict):
+            return True
+        try:
+            setup_fields.normalize_field(field, option.get("value"))
+        except ValueError:
+            return True
     return False
 
 
@@ -732,18 +618,16 @@ def format_summary_value(key: str, value: Any) -> str:
         return PROJECT_TYPE_LABELS.get(text, text)
 
     if key in {"movie_duration", "episode_duration"}:
-        if "分钟" in text:
+        try:
+            return f"{setup_fields.normalize_number(key, text).removesuffix('mins')} 分钟"
+        except ValueError:
             return text
-        duration_match = re.search(r"\d+", text)
-        if duration_match:
-            return f"{duration_match.group(0)} 分钟"
 
     if key == "video_duration_seconds":
-        if "秒" in text:
+        try:
+            return f"{setup_fields.normalize_number(key, text)} 秒"
+        except ValueError:
             return text
-        duration_match = re.search(r"\d+", text)
-        if duration_match:
-            return f"{duration_match.group(0)} 秒"
 
     if key == "scene_count_target" and re.fullmatch(r"\d+", text):
         return f"{text} 场"
@@ -998,7 +882,7 @@ async def update_project(
     return project
 
 class InteractionRequest(BaseModel):
-    answer: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
+    answer: str = Field(max_length=MAX_INTERACTION_ANSWER_LENGTH)
     context_key: str = Field(min_length=1, max_length=100)
     context_revision: Optional[str] = Field(default=None, max_length=128)
 
@@ -1020,19 +904,7 @@ class QuickSetupReviewRequest(BaseModel):
     @field_validator("values")
     @classmethod
     def validate_quick_setup_values(cls, value: Dict[str, str]) -> Dict[str, str]:
-        allowed = {step["key"] for step in SETUP_FLOW_STEPS if step["key"] != "final_confirm"}
-        normalized: Dict[str, str] = {}
-        for key, raw_value in value.items():
-            normalized_key = str(key or "").strip()
-            if normalized_key not in allowed:
-                raise ValueError(f"不支持的快速设定字段: {normalized_key}")
-            text = str(raw_value or "").strip()
-            if len(text) > MAX_INTERACTION_ANSWER_LENGTH:
-                raise ValueError(f"字段 {normalized_key} 内容过长")
-            normalized[normalized_key] = text
-        if sum(len(item) for item in normalized.values()) > MAX_QUICK_SETUP_TOTAL_LENGTH:
-            raise ValueError("快速设定草案总内容过长")
-        return normalized
+        return setup_fields.validate_safety(value)
 
     @field_validator("edited_fields")
     @classmethod
@@ -1053,23 +925,7 @@ class QuickSetupAIReviseRequest(BaseModel):
     @field_validator("values")
     @classmethod
     def validate_values(cls, value: Dict[str, str]) -> Dict[str, str]:
-        allowed = {
-            step["key"]
-            for step in SETUP_FLOW_STEPS
-            if step["key"] != "final_confirm"
-        }
-        normalized: Dict[str, str] = {}
-        for raw_key, raw_value in value.items():
-            key = str(raw_key or "").strip()
-            if key not in allowed:
-                raise ValueError(f"不支持的快速设定字段: {key}")
-            text = str(raw_value or "").strip()
-            if len(text) > MAX_INTERACTION_ANSWER_LENGTH:
-                raise ValueError(f"字段 {key} 内容过长")
-            normalized[key] = text
-        if sum(len(item) for item in normalized.values()) > MAX_QUICK_SETUP_TOTAL_LENGTH:
-            raise ValueError("快速设定草案总内容过长")
-        return normalized
+        return setup_fields.validate_safety(value)
 
     @field_validator("target_field", "instruction")
     @classmethod
@@ -1091,6 +947,18 @@ class QuickSetupAIReviseRequest(BaseModel):
         if invalid:
             raise ValueError(f"不可编辑字段: {', '.join(invalid)}")
         return result
+
+
+async def write_setup_ai_audit(**entry: Any) -> None:
+    """Fail closed before exposing/applying setup AI results if audit is down."""
+    try:
+        await log_ai_action(**entry)
+    except Exception as exc:
+        logger.error("Setup AI audit write failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="AI 审计写入失败，原始返回记录未能确认保存，本次 AI 结果未应用；已知用量已保留，请稍后重试。",
+        ) from exc
 
 
 async def record_quick_setup_ai_revision(
@@ -1117,24 +985,11 @@ async def record_quick_setup_ai_revision(
         if operation == "regenerate_field"
         else "review_quick_setup_edits"
     )
-    try:
-        await log_ai_action(
-            user_id=current_user.id,
-            project_id=project.id,
-            action=action,
-            prompt=prompt,
-            response=response,
-            tokens=token_count,
-            status=status,
-            step_key=QUICK_REVIEW_FIELD,
-            error_type=error_type,
-            error_message=error_message,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Unable to write quick setup AI audit log: %s",
-            type(exc).__name__,
-        )
+    await write_setup_ai_audit(
+        user_id=current_user.id, project_id=project.id, action=action,
+        prompt=prompt, response=response, tokens=token_count, status=status,
+        step_key=QUICK_REVIEW_FIELD, error_type=error_type, error_message=error_message,
+    )
 
 
 class ContentReviewRequest(BaseModel):
@@ -1253,6 +1108,20 @@ async def submit_interaction(
 
     if interaction.context_key != "final_confirm":
         current_context.pop("final_confirm", None)
+    if interaction.context_key == "final_confirm" and answer_text == "confirmed":
+        try:
+            normalized = setup_fields.normalize_complete({
+                **{key: value for key, value in current_context.items() if key in setup_fields.SETUP_FIELDS},
+                "project_type": draft.project_type,
+            })
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        current_context.update(normalized)
+        draft.title = normalized["title"]
+    try:
+        setup_fields.validate_safety({key: value for key, value in current_context.items() if key in setup_fields.SETUP_FIELDS})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await write_setup(db, project, interaction.context_revision, {
         "global_context": current_context,
         "project_type": draft.project_type,
@@ -1270,337 +1139,218 @@ async def submit_interaction(
     }
 
 
+async def generate_validated_setup_options(
+    *, db: AsyncSession, project: models.Project, current_user: models.User,
+    step_key: str, question: str, values: Dict[str, str], context: str,
+    revision: str, template_instructions: str, action: str,
+) -> tuple[Dict[str, Any], int]:
+    """Keep good options and fill only the deficit, with at most two AI calls."""
+    setup_fields.validate_safety(values)
+    accepted: List[Dict[str, str]] = []
+    previous_value = ""
+    if step_key in values and values[step_key].strip():
+        try:
+            previous_value = setup_fields.normalize_field(step_key, values[step_key])
+        except ValueError:
+            previous_value = values[step_key].strip()
+    excluded = {previous_value} if previous_value else set()
+    total_usage = 0
+    final_question = question
+    rejection_summary: List[Dict[str, Any]] = []
+    for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
+        rejected: Dict[str, int] = {}
+
+        def reject(reason: str, count: int = 1) -> None:
+            bounded = str(reason)[:160]
+            if bounded not in rejected and len(rejected) >= 8:
+                bounded = "其他格式或内容问题"
+                if bounded not in rejected:
+                    return
+            rejected[bounded] = rejected.get(bounded, 0) + max(1, int(count))
+
+        call_context = json.dumps({
+            "context": context, "current_draft": values,
+            "target_field": step_key, "required_count": 3 - len(accepted),
+            "excluded_values": sorted(excluded),
+            "accepted_options": accepted,
+            "field_contract": setup_fields.field_contract(step_key),
+            "available_value_characters": min(MAX_INTERACTION_ANSWER_LENGTH, MAX_QUICK_SETUP_TOTAL_LENGTH - sum(len(value) for key, value in values.items() if key != step_key)),
+            "rejection_summary": rejection_summary,
+            "rule": "只补足缺额；不得重复排除值。其他字段原文锁定，value必须是完整有效内容。",
+        }, ensure_ascii=False)
+        usage = 0
+        raw_content = ""
+        error_type = None
+        error_message = None
+        try:
+            data, usage = await llm.generate_interaction_options(
+                step_key, question, call_context,
+                template_instructions=template_instructions,
+            )
+            raw_content = getattr(data, "raw_content", json.dumps(data, ensure_ascii=False))
+            for item in getattr(data, "rejection_summary", [])[:8]:
+                reject(item.get("reason", "字段格式不符合约束"), item.get("count", 1))
+            if not isinstance(data, dict) or not isinstance(data.get("options"), list):
+                raise ValueError("AI 选项不是有效列表")
+            proposed_question = data.get("question")
+            if isinstance(proposed_question, str) and 0 < len(proposed_question) <= MAX_INTERACTION_ANSWER_LENGTH:
+                final_question = proposed_question
+            for option in data["options"]:
+                if not isinstance(option, dict):
+                    reject("选项不是对象")
+                    continue
+                label = option.get("label")
+                if not isinstance(label, str) or not label.strip() or len(label) > MAX_INTERACTION_ANSWER_LENGTH:
+                    reject("label必须为非空且未超长的文本")
+                    continue
+                if not isinstance(option.get("value"), str):
+                    reject("value必须为文本，不能是对象、列表或缺失值")
+                    continue
+                try:
+                    normalized = setup_fields.normalize_field(step_key, option.get("value"))
+                    setup_fields.validate_safety({**values, step_key: normalized})
+                except ValueError as exc:
+                    reject(str(exc))
+                    continue
+                if normalized in excluded:
+                    reject("规范值与当前旧值相同" if normalized == previous_value else "规范值与已保留选项重复")
+                    continue
+                accepted.append({"label": label.strip(), "value": normalized})
+                excluded.add(normalized)
+                if len(accepted) == 3:
+                    break
+        except Exception as exc:
+            usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
+            raw_content = str(getattr(exc, "raw_content", "") or raw_content)
+            error_type = str(getattr(exc, "error_type", type(exc).__name__))
+            error_message = str(exc)
+            reject(f"{error_type}: {error_message}")
+        rejection_summary = [{"reason": reason, "count": count} for reason, count in rejected.items()]
+        usage = max(0, int(usage or 0))
+        total_usage += usage
+        if usage:
+            await increment_project_tokens(db, project, usage)
+            await db.commit()
+        stale = False
+        try:
+            await assert_setup_writable(db, project, revision)
+            if revision != build_setup_context_revision(project):
+                stale = True
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            stale = True
+        status = "stale" if stale else "success" if len(accepted) == 3 else "partial" if accepted and attempt < MAX_INTERACTION_ATTEMPTS else "failed"
+        await write_setup_ai_audit(
+            user_id=current_user.id, project_id=project.id, action=action,
+            prompt=call_context, response=raw_content, tokens=usage, status=status,
+            step_key=QUICK_REVIEW_FIELD if action == "regenerate_quick_setup_field" else step_key,
+            error_type="stale_context" if stale else error_type or (None if len(accepted) == 3 else "insufficient_valid_options"),
+            error_message="AI 返回前设定已更新或开始生成" if stale else error_message,
+            attempt=attempt,
+        )
+        if stale:
+            raise HTTPException(status_code=409, detail="AI 分析期间项目设定已更新，请刷新后重试。")
+        if len(accepted) == 3:
+            return {"question": final_question, "options": accepted}, total_usage
+    raise HTTPException(status_code=503, detail=f"AI 补齐后仍仅有 {len(accepted)} 个有效新选项，需要 3 个；原草案未改变，请重试。")
+
+
 @app.post("/projects/{project_id}/setup/quick-review/ai-revise")
 async def revise_quick_setup_with_ai(
-    project_id: int,
-    payload: QuickSetupAIReviseRequest,
+    project_id: int, payload: QuickSetupAIReviseRequest,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    project, _ = await require_project_access(
-        db,
-        project_id,
-        current_user.id,
-        minimum_role="editor",
-    )
+    project, _ = await require_project_access(db, project_id, current_user.id, minimum_role="editor")
     await assert_setup_writable(db, project, payload.context_revision)
     if payload.context_revision != build_setup_context_revision(project):
-        raise HTTPException(
-            status_code=409,
-            detail="项目设定已更新，请刷新后重试。",
-        )
-
+        raise HTTPException(status_code=409, detail="项目设定已更新，请刷新后重试。")
+    # Only safety/shape is global here. Invalid repair targets must reach AI;
+    # unrelated values (including whitespace and non-canonical units) stay exact.
     try:
-        values = normalize_quick_setup_values(
-            project,
-            payload.values,
-            preserve_existing=False,
-        )
+        values = setup_fields.validate_safety(payload.values)
+        all_fields = setup_fields.relevant_fields(values.get("project_type", project.project_type or ""))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    all_fields = list(values.keys())
-    editable_fields = [
-        field for field in all_fields if field not in QUICK_CONTROL_FIELDS
-    ]
     if payload.operation == "regenerate_field":
-        if (
-            not payload.target_field
-            or payload.target_field not in all_fields
-            or payload.target_field == "project_type"
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="单项重生必须指定有效 target_field",
-            )
+        if not payload.target_field or payload.target_field not in all_fields or payload.target_field == "project_type":
+            raise HTTPException(status_code=422, detail="单项重生必须指定有效 target_field")
         allowed = [payload.target_field]
     else:
-        allowed = [
-            field
-            for field in payload.edited_fields
-            if field in editable_fields
-        ]
+        allowed = [field for field in payload.edited_fields if field in all_fields and field not in QUICK_CONTROL_FIELDS]
         if not allowed:
-            raise HTTPException(
-                status_code=422,
-                detail="review_edits 必须提供 edited_fields",
-            )
+            raise HTTPException(status_code=422, detail="review_edits 必须提供 edited_fields")
         if payload.scope == "related":
-            allowed = [
-                field
-                for field in all_fields
-                if field not in QUICK_CONTROL_FIELDS
-            ]
-
+            allowed = [field for field in all_fields if field not in QUICK_CONTROL_FIELDS]
     await enforce_user_quota(db, project.owner_id)
-    audit_prompt = json.dumps(
-        {
-            "operation": payload.operation,
-            "scope": payload.scope,
-            "target_field": payload.target_field,
-            "edited_fields": payload.edited_fields,
-            "allowed_fields": allowed,
-            "instruction": payload.instruction or "",
-            "values": values,
-        },
-        ensure_ascii=False,
-    )
+    template_instructions = await get_prompt_addendum(db, stage="interaction", project_type=values.get("project_type", "all"))
+    audit_prompt = json.dumps({
+        "operation": payload.operation, "scope": payload.scope,
+        "target_field": payload.target_field, "edited_fields": payload.edited_fields,
+        "allowed_fields": allowed, "instruction": payload.instruction or "", "values": values,
+    }, ensure_ascii=False)
+    if payload.operation == "regenerate_field":
+        step = next(step for step in SETUP_FLOW_STEPS if step["key"] == payload.target_field)
+        data, usage = await generate_validated_setup_options(
+            db=db, project=project, current_user=current_user,
+            step_key=payload.target_field, question=step["question"], values=values,
+            context=json.dumps({"logline": project.logline or "", "user_instruction": payload.instruction or ""}, ensure_ascii=False),
+            revision=payload.context_revision, template_instructions=template_instructions,
+            action="regenerate_quick_setup_field",
+        )
+        return {"status": "options", "operation": payload.operation,
+                "target_field": payload.target_field, **data, "tokens_used": usage,
+                "total_tokens": int(project.total_tokens or 0), "context_revision": payload.context_revision}
     usage = 0
-    ai_response: Dict[str, Any] = {}
+    raw_content = ""
     revised: Dict[str, str] = {}
     summary = ""
     try:
-        template_instructions = await get_prompt_addendum(
-            db,
-            stage="interaction",
-            project_type=values.get("project_type", "all"),
+        revised, summary, usage = await llm.revise_quick_setup_fields(
+            logline=project.logline or "", values=values, allowed_fields=allowed,
+            instruction=payload.instruction or "", operation=payload.operation,
+            scope=payload.scope, template_instructions=template_instructions,
         )
-        if payload.operation == "regenerate_field":
-            target_step = next(
-                step
-                for step in SETUP_FLOW_STEPS
-                if step["key"] == payload.target_field
-            )
-            option_context = json.dumps(
-                {
-                    "logline": project.logline or "",
-                    "current_draft": values,
-                    "current_target_value": values[payload.target_field],
-                    "user_instruction": payload.instruction or "",
-                    "generation_rule": (
-                        "只为目标字段提供 3 个互不相同的新选项；"
-                        "其他设定全部作为锁定上下文。"
-                    ),
-                },
-                ensure_ascii=False,
-            )
-            ai_response, usage = await llm.generate_interaction_options(
-                payload.target_field,
-                target_step["question"],
-                option_context,
-                template_instructions=template_instructions,
-            )
-        else:
-            revised, summary, usage = await llm.revise_quick_setup_fields(
-                logline=project.logline or "",
-                values=values,
-                allowed_fields=allowed,
-                instruction=payload.instruction or "",
-                operation=payload.operation,
-                scope=payload.scope,
-                template_instructions=template_instructions,
-            )
-            ai_response = {"fields": revised, "summary": summary}
+        raw_content = getattr(revised, "raw_content", json.dumps({"fields": revised, "summary": summary}, ensure_ascii=False))
+        setup_fields.validate_safety(revised, allowed=set(allowed))
+        if not isinstance(summary, str) or len(summary) > MAX_INTERACTION_ANSWER_LENGTH:
+            raise ValueError("AI 修订摘要过长或不是文本")
+        normalized_revised = {field: setup_fields.normalize_field(field, value) for field, value in revised.items()}
+        setup_fields.validate_safety({**values, **normalized_revised})
     except Exception as exc:
-        logger.warning(
-            "Quick setup AI revision failed: %s",
-            type(exc).__name__,
-        )
+        usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
         await record_quick_setup_ai_revision(
-            db=db,
-            project=project,
-            current_user=current_user,
-            operation=payload.operation,
-            prompt=audit_prompt,
-            response="",
-            tokens=0,
-            status="failed",
-            error_type=type(exc).__name__,
-            error_message="AI 修订服务调用失败",
+            db=db, project=project, current_user=current_user, operation=payload.operation,
+            prompt=audit_prompt, response=str(getattr(exc, "raw_content", "") or raw_content),
+            tokens=usage, status="failed",
+            error_type=getattr(exc, "error_type", "invalid_ai_candidate"), error_message=str(exc),
         )
-        raise HTTPException(status_code=503, detail="AI 修订服务暂不可用") from exc
-
-    await db.refresh(
-        project,
-        attribute_names=["project_type", "logline", "global_context", "setup_revision", "setup_cache_revision", "status"],
-    )
-    stale_output = payload.context_revision != build_setup_context_revision(project)
-    if not stale_output:
+        raise HTTPException(status_code=503, detail="AI 修订结果无效，原草案未改变，请重试。") from exc
+    await db.refresh(project, attribute_names=["setup_revision", "setup_cache_revision", "status"])
+    stale = payload.context_revision != build_setup_context_revision(project)
+    if not stale:
         try:
             await assert_setup_writable(db, project, payload.context_revision)
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
-            stale_output = True
-    if stale_output:
-        await record_quick_setup_ai_revision(
-            db=db,
-            project=project,
-            current_user=current_user,
-            operation=payload.operation,
-            prompt=audit_prompt,
-            response=json.dumps(ai_response, ensure_ascii=False),
-            tokens=usage,
-            status="stale",
-            error_type="stale_context",
-            error_message="AI 返回前项目设定已更新或开始生成",
-        )
-        raise HTTPException(
-            status_code=409,
-            detail="AI 分析期间项目设定已更新或开始生成，请刷新后重试。",
-        )
-
-    if payload.operation == "regenerate_field":
-        target_field = payload.target_field
-        validated_options: List[Dict[str, str]] = []
-        seen_values: set[str] = set()
-        for raw_option in ai_response.get("options", []):
-            if not isinstance(raw_option, dict):
-                continue
-            label = str(raw_option.get("label", "") or "").strip()
-            raw_value = str(raw_option.get("value", "") or "").strip()
-            if not label or not raw_value:
-                continue
-            option_values = dict(values)
-            option_values[target_field] = raw_value
-            try:
-                normalized_option_values = normalize_quick_setup_values(
-                    project,
-                    option_values,
-                    preserve_existing=False,
-                )
-            except ValueError:
-                continue
-            normalized_value = normalized_option_values.get(target_field, "")
-            if (
-                not normalized_value
-                or normalized_value == values.get(target_field, "")
-                or normalized_value in seen_values
-            ):
-                continue
-            seen_values.add(normalized_value)
-            validated_options.append(
-                {"label": label, "value": normalized_value}
-            )
-            if len(validated_options) == 3:
-                break
-
-        if len(validated_options) != 3:
-            error_message = "AI 未返回 3 个有效且不同的选项"
-            await record_quick_setup_ai_revision(
-                db=db,
-                project=project,
-                current_user=current_user,
-                operation=payload.operation,
-                prompt=audit_prompt,
-                response=json.dumps(ai_response, ensure_ascii=False),
-                tokens=usage,
-                status="failed",
-                error_type="invalid_ai_options",
-                error_message=error_message,
-            )
-            raise HTTPException(status_code=503, detail=error_message)
-
-        option_response = {
-            "question": str(ai_response.get("question", "") or "").strip(),
-            "options": validated_options,
-        }
-        await record_quick_setup_ai_revision(
-            db=db,
-            project=project,
-            current_user=current_user,
-            operation=payload.operation,
-            prompt=audit_prompt,
-            response=json.dumps(option_response, ensure_ascii=False),
-            tokens=usage,
-            status="success",
-        )
-        return {
-            "status": "options",
-            "operation": payload.operation,
-            "target_field": target_field,
-            "question": option_response["question"],
-            "options": validated_options,
-            "tokens_used": max(0, int(usage or 0)),
-            "total_tokens": int(project.total_tokens or 0),
-            "context_revision": payload.context_revision,
-        }
-
-    candidate_error: Optional[str] = None
-    if not isinstance(revised, dict):
-        candidate_error = "AI 未返回有效的字段集合"
-        revised = {}
-    unexpected_fields = set(revised) - set(allowed)
-    if unexpected_fields:
-        candidate_error = "AI 返回了超出允许范围的字段"
-
-    candidate_values = dict(values)
-    candidate_values.update(revised)
-    try:
-        normalized_candidate_values = normalize_quick_setup_values(
-            project,
-            candidate_values,
-            preserve_existing=False,
-        )
-    except ValueError:
-        candidate_error = "AI 返回的候选设定不合法"
-    else:
-        candidate_values = normalized_candidate_values
-
-    normalized_revised = {
-        field: candidate_values[field]
-        for field in allowed
-        if field in candidate_values and field in revised
-    }
-    if payload.operation == "regenerate_field" and (
-        payload.target_field not in normalized_revised
-        or normalized_revised[payload.target_field]
-        == values.get(payload.target_field, "")
-    ):
-        candidate_error = "AI 未返回有效的新候选"
-
-    if candidate_error:
-        await record_quick_setup_ai_revision(
-            db=db,
-            project=project,
-            current_user=current_user,
-            operation=payload.operation,
-            prompt=audit_prompt,
-            response=json.dumps(
-                {"fields": revised, "summary": str(summary or "")},
-                ensure_ascii=False,
-            ),
-            tokens=usage,
-            status="failed",
-            error_type="invalid_ai_candidate",
-            error_message=candidate_error,
-        )
-        raise HTTPException(status_code=503, detail=candidate_error)
-
-    changes = [
-        {
-            "field": field,
-            "before": values.get(field, ""),
-            "after": value,
-        }
-        for field, value in normalized_revised.items()
-        if value != values.get(field, "")
-    ]
-    response_text = json.dumps(
-        {"fields": normalized_revised, "summary": str(summary or "")},
-        ensure_ascii=False,
-    )
+            stale = True
     await record_quick_setup_ai_revision(
-        db=db,
-        project=project,
-        current_user=current_user,
-        operation=payload.operation,
-        prompt=audit_prompt,
-        response=response_text,
-        tokens=usage,
-        status="success",
+        db=db, project=project, current_user=current_user, operation=payload.operation,
+        prompt=audit_prompt, response=raw_content, tokens=usage,
+        status="stale" if stale else "success",
+        error_type="stale_context" if stale else None,
+        error_message="AI 返回前项目设定已更新或开始生成" if stale else None,
     )
-    return {
-        "status": "candidate",
-        "operation": payload.operation,
-        "scope": payload.scope,
-        "changes": changes,
-        "changed_fields": [change["field"] for change in changes],
-        "summary": str(summary or "").strip(),
-        "tokens_used": max(0, int(usage or 0)),
-        "total_tokens": int(project.total_tokens or 0),
-        "context_revision": payload.context_revision,
-    }
+    if stale:
+        raise HTTPException(status_code=409, detail="AI 分析期间项目设定已更新，请刷新后重试。")
+    changes = [{"field": field, "before": values.get(field, ""), "after": value}
+               for field, value in normalized_revised.items() if value != values.get(field, "")]
+    return {"status": "candidate", "operation": payload.operation, "scope": payload.scope,
+            "changes": changes, "changed_fields": [change["field"] for change in changes],
+            "summary": summary.strip(), "tokens_used": max(0, int(usage or 0)),
+            "total_tokens": int(project.total_tokens or 0), "context_revision": payload.context_revision}
 
 
 @app.post("/projects/{project_id}/setup/quick-review")
@@ -1764,26 +1514,37 @@ async def analyze_logline(
         prefill_changed = False
         prefill_usage = 0
         extracted_setup: Dict[str, Any] = {}
-
+        prefill_error = None
+        prefill_raw = ""
         try:
             extracted_setup, prefill_usage = await llm.extract_setup_from_long_input(project.logline or "")
+            prefill_raw = getattr(extracted_setup, "raw_content", json.dumps(extracted_setup, ensure_ascii=False))
             filled_fields, prefill_changed = apply_auto_prefill(prefill_draft, extracted_setup)
         except Exception as exc:
-            logger.warning(f"Failed to auto-prefill setup from long logline for project {project_id}: {exc}")
+            prefill_error = exc
+            prefill_usage = max(int(prefill_usage or 0), int(getattr(exc, "usage", 0) or 0))
+            prefill_raw = str(getattr(exc, "raw_content", "") or prefill_raw)
+            logger.warning(f"Failed to auto-prefill setup for project {project_id}: {exc}")
             filled_fields, prefill_changed = apply_auto_prefill(prefill_draft, {})
-
         if prefill_usage:
             await increment_project_tokens(db, project, prefill_usage)
             await db.commit()
-            background_tasks.add_task(
-                log_ai_action,
-                user_id=current_user.id,
-                project_id=project_id,
-                action="auto_prefill_setup",
-                prompt=project.logline or "",
-                response=json.dumps(extracted_setup, ensure_ascii=False),
-                tokens=prefill_usage
-            )
+        stale = False
+        try:
+            await assert_setup_writable(db, project, prefill_revision)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            stale = True
+        await write_setup_ai_audit(
+            user_id=current_user.id, project_id=project_id, action="auto_prefill_setup",
+            prompt=project.logline or "", response=prefill_raw, tokens=prefill_usage,
+            status="stale" if stale else "failed" if prefill_error else "success",
+            error_type="stale_context" if stale else getattr(prefill_error, "error_type", type(prefill_error).__name__) if prefill_error else None,
+            error_message="预填返回前项目设定已变化" if stale else str(prefill_error) if prefill_error else None,
+        )
+        if stale:
+            raise HTTPException(status_code=409, detail="AI 预填期间项目设定已更新，请刷新后重试。")
 
         if filled_fields:
             logger.info(f"项目 {project_id} 已从长输入自动补全字段: {', '.join(filled_fields)}")
@@ -1824,48 +1585,47 @@ async def analyze_logline(
         draft_usage = 0
         last_error: Optional[Exception] = None
         for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
+            attempt_usage = 0
+            raw_content = ""
+            error_type = None
             try:
-                generated_values, draft_usage = await llm.generate_quick_setup_draft(
-                    logline=project.logline or "",
-                    current_context=normalized_context,
-                    field_specs=field_specs,
-                    template_instructions=interaction_template,
+                generated_values, attempt_usage = await llm.generate_quick_setup_draft(
+                    logline=project.logline or "", current_context=normalized_context,
+                    field_specs=field_specs, template_instructions=interaction_template,
                 )
+                raw_content = getattr(generated_values, "raw_content", json.dumps(generated_values, ensure_ascii=False))
                 draft_values = normalize_quick_setup_values(project, generated_values)
-                background_tasks.add_task(
-                    log_ai_action,
-                    user_id=current_user.id,
-                    project_id=project_id,
-                    action="generate_quick_setup_draft",
-                    prompt=project.logline or "",
-                    response=json.dumps(draft_values, ensure_ascii=False),
-                    tokens=draft_usage,
-                    status="success",
-                    step_key=QUICK_REVIEW_FIELD,
-                    attempt=attempt,
-                )
-                break
             except Exception as exc:
                 last_error = exc
-                await log_ai_action(
-                    user_id=current_user.id,
-                    project_id=project_id,
-                    action="generate_quick_setup_draft",
-                    prompt=project.logline or "",
-                    response="",
-                    tokens=0,
-                    status="failed",
-                    step_key=QUICK_REVIEW_FIELD,
-                    error_type=type(exc).__name__,
-                    error_message=f"快速设定生成失败（{type(exc).__name__}）",
-                    attempt=attempt,
-                )
-                logger.warning(
-                    "项目 %s 快速设定草案第 %s 次生成失败: %s",
-                    project_id,
-                    attempt,
-                    type(exc).__name__,
-                )
+                draft_values = None
+                attempt_usage = max(int(attempt_usage or 0), int(getattr(exc, "usage", 0) or 0))
+                raw_content = str(getattr(exc, "raw_content", "") or raw_content)
+                error_type = getattr(exc, "error_type", type(exc).__name__)
+            attempt_usage = max(0, int(attempt_usage or 0))
+            draft_usage += attempt_usage
+            if attempt_usage:
+                await increment_project_tokens(db, project, attempt_usage)
+                await db.commit()
+            stale = False
+            try:
+                await assert_setup_writable(db, project, analysis_revision)
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                stale = True
+            await write_setup_ai_audit(
+                user_id=current_user.id, project_id=project_id,
+                action="generate_quick_setup_draft", prompt=project.logline or "",
+                response=raw_content, tokens=attempt_usage,
+                status="stale" if stale else "success" if draft_values is not None else "failed",
+                step_key=QUICK_REVIEW_FIELD, attempt=attempt,
+                error_type="stale_context" if stale else error_type,
+                error_message="AI 返回前项目设定已更新" if stale else str(last_error) if draft_values is None else None,
+            )
+            if stale:
+                raise HTTPException(status_code=409, detail="AI 分析期间项目设定已更新，请刷新后重试。")
+            if draft_values is not None:
+                break
 
         if draft_values is None:
             await assert_setup_writable(db, project, analysis_revision)
@@ -1895,9 +1655,6 @@ async def analyze_logline(
                 }
             )
 
-        if draft_usage:
-            await increment_project_tokens(db, project, draft_usage)
-            await db.commit()
         response_payload = {
             "type": "interaction_required",
             "payload": {
@@ -2086,77 +1843,14 @@ async def analyze_logline(
         project_type=project.project_type,
     )
     
-    # 3.2 For other steps, use LLM to generate context-aware options
-    question_data = None
-    usage = 0
-    last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
-        try:
-            question_data, usage = await llm.generate_interaction_options(
-                step_key=next_step["key"],
-                base_question=next_step["question"],
-                context_str=prompt_context,
-                template_instructions=interaction_template,
-            )
-            background_tasks.add_task(
-                log_ai_action,
-                user_id=current_user.id,
-                project_id=project_id,
-                action=f"analyze_step_{next_step['key']}",
-                prompt=prompt_context,
-                response=str(question_data),
-                tokens=usage,
-                status="success",
-                step_key=next_step["key"],
-                attempt=attempt,
-            )
-            break
-        except Exception as e:
-            last_error = e
-            raw_content = str(getattr(e, "raw_content", "") or "")
-            error_type = str(getattr(e, "error_type", type(e).__name__) or type(e).__name__)
-            error_message = str(e)
-            wait_seconds = min(30, 2 * attempt)
-
-            logger.error(
-                f"LLM 交互生成失败: step={next_step['key']} attempt={attempt} "
-                f"error_type={error_type} error={error_message}"
-            )
-
-            await log_ai_action(
-                user_id=current_user.id,
-                project_id=project_id,
-                action=f"analyze_step_{next_step['key']}",
-                prompt=prompt_context,
-                response=raw_content,
-                tokens=0,
-                status="failed",
-                step_key=next_step["key"],
-                error_type=error_type,
-                error_message=error_message,
-                attempt=attempt,
-            )
-
-            if attempt < MAX_INTERACTION_ATTEMPTS:
-                logger.warning(
-                    f"项目 {project_id} 的步骤 {next_step['key']} 第 {attempt} 次生成失败，"
-                    f"{wait_seconds} 秒后自动重试。"
-                )
-                await asyncio.sleep(wait_seconds)
-
-    if question_data is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "AI 交互选项生成失败，请稍后重试。"
-                if last_error is not None
-                else "AI 未返回有效交互选项。"
-            ),
-        )
-    
-    # Update Token Usage
-    await increment_project_tokens(db, project, usage)
-    await db.commit()
+    question_data, usage = await generate_validated_setup_options(
+        db=db, project=project, current_user=current_user,
+        step_key=next_step["key"], question=next_step["question"],
+        values={key: str(value) for key, value in normalized_context.items() if key in setup_fields.SETUP_FIELDS},
+        context=prompt_context, revision=analysis_revision,
+        template_instructions=interaction_template,
+        action=f"analyze_step_{next_step['key']}",
+    )
     
     # Construction Response
     response_payload = {
@@ -2219,50 +1913,24 @@ async def generate_scenes(
         # Construct summary from context
         style_context = f"Genre: {project.project_type}, Tone: {c.get('tone')}, Style: {c.get('visual_style')}"
 
-    # Extract target episode count / scene count from context
+    # Canonical durations retain exact decimal/unit semantics downstream.
     target_count = 5
     duration_seconds = 0
-    
-    # Priority for Movie: scene_count_target
-    if project.project_type == "movie":
-        raw_count = c.get("scene_count_target")
-    elif project.project_type == "short_video":
-        raw_count = c.get("video_duration_seconds")
-    else:
-        raw_count = c.get("episode_count")
-
-    if raw_count:
-        try:
-            if isinstance(raw_count, int):
-                target_count = raw_count
-            elif isinstance(raw_count, str):
-                # Try to find first number
-                digits = re.findall(r'\d+', raw_count)
-                if digits:
-                    target_count = int(digits[0])
-        except Exception as e:
-            logger.warning(f"Error parsing count: {e}")
-
-    if project.project_type == "short_video":
-        if raw_count:
-            try:
-                duration_seconds = int(re.findall(r"\d+", str(raw_count))[0])
-            except Exception:
-                duration_seconds = 0
-        if duration_seconds <= 0:
-            duration_seconds = 60
-        duration_seconds = min(duration_seconds, NUMERIC_INTERACTION_LIMITS["video_duration_seconds"][1])
-        target_count = max(1, math.ceil(duration_seconds / 15))
-            
-    # If movie duration is set but scene count isn't, estimate
-    if project.project_type == "movie" and not c.get("scene_count_target"):
-        duration = c.get("movie_duration")
-        if duration:
-            try:
-                # 1.5 scenes per minute is a high-detail script, 0.5 is low. 1.0 is standard.
-                target_count = int(int(re.findall(r'\d+', str(duration))[0]) * 0.8)
-            except (IndexError, TypeError, ValueError):
-                pass
+    count_key = "scene_count_target" if project.project_type == "movie" else "episode_count"
+    try:
+        if project.project_type == "short_video":
+            duration_seconds = int(setup_fields.normalize_number("video_duration_seconds", str(c.get("video_duration_seconds") or "60")))
+            target_count = (duration_seconds + 14) // 15
+        elif c.get(count_key):
+            target_count = int(setup_fields.normalize_number(count_key, str(c[count_key])))
+        elif project.project_type == "movie" and c.get("movie_duration"):
+            minutes = Decimal(setup_fields.normalize_number("movie_duration", str(c["movie_duration"])))
+            # A count estimate deliberately floors the exact 0.8 scenes/minute;
+            # the stored/displayed duration is never rounded or truncated.
+            target_count = int((minutes * Decimal("0.8")).to_integral_value(rounding=ROUND_FLOOR))
+    except ValueError as exc:
+        await mark_claimed_project_failed(db, project_id)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     target_limit = GENERATION_TARGET_LIMITS.get(project.project_type or "", 100)
     if target_count > target_limit:

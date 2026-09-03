@@ -31,6 +31,12 @@ import {
     submitQuickReviewRequest,
     type ProjectRequestSnapshot,
 } from './projectRequestGuard'
+import {
+    firstMissingQuickReviewLabel,
+    formatApiErrorDetail,
+    formatSetupFieldValue,
+    normalizeTitleDisplay,
+} from './setupFieldPresentation'
 
 marked.setOptions({ gfm: true, breaks: true })
 const AdminDashboard = defineAsyncComponent(
@@ -324,11 +330,6 @@ const contextFieldLabelMap: Record<string, string> = {
     target_audience: '目标受众'
 }
 
-const extractFirstNumber = (text: string) => {
-    const match = text.match(/\d+/)
-    return match?.[0] || ''
-}
-
 const formatProjectTypeText = (value: unknown) => {
     const raw = toTextValue(value).trim()
     if (!raw) return ''
@@ -348,30 +349,7 @@ const formatContextDisplayValue = (rawKey: unknown, rawValue: unknown) => {
     if (rawText.toLowerCase() === 'pending') {
         return '待确定'
     }
-
-    if (key === 'movie_duration' || key === 'episode_duration') {
-        if (rawText.includes('分钟')) return rawText
-        const n = extractFirstNumber(rawText)
-        return n ? `${n} 分钟` : rawText
-    }
-
-    if (key === 'video_duration_seconds') {
-        if (rawText.includes('秒')) return rawText
-        const n = extractFirstNumber(rawText)
-        return n ? `${n} 秒` : rawText
-    }
-
-    if (key === 'scene_count_target') {
-        const n = extractFirstNumber(rawText)
-        return n ? `${n} 场` : rawText
-    }
-
-    if (key === 'episode_count') {
-        const n = extractFirstNumber(rawText)
-        return n ? `${n} 集` : rawText
-    }
-
-    return rawText
+    return formatSetupFieldValue(key, rawText)
 }
 
 const getContextFieldLabel = (rawKey: unknown) => {
@@ -418,39 +396,16 @@ const sortedProjectList = computed(() => {
     return [...projectList.value].sort((a, b) => (Number(b?.id) || 0) - (Number(a?.id) || 0))
 })
 
-const titlePatterns = [
-    /《\s*([^《》\n]{1,60}?)\s*》/,
-    /〈\s*([^〈〉\n]{1,60}?)\s*〉/,
-    /「\s*([^「」\n]{1,60}?)\s*」/,
-    /『\s*([^『』\n]{1,60}?)\s*』/
-]
-
-const titleBreakPattern = /[，。！？：；,.!?;:\n]|--+|——|—|-/
-
 const extractStoryTitleText = (value: unknown): string => {
-    const text = toTextValue(value).trim()
-    if (!text) return ''
-
-    for (const pattern of titlePatterns) {
-        const match = text.match(pattern)
-        if (match?.[1]) return match[1].trim()
-    }
-
-    const shortTitle = text
-        .split(titleBreakPattern, 1)[0]
-        .trim()
-        .replace(/^["'“”‘’《》〈〉「」『』]+|["'“”‘’《》〈〉「」『』]+$/g, '')
-
-    if (shortTitle && shortTitle.length <= 30) return shortTitle
-    return text
+    return normalizeTitleDisplay(toTextValue(value))
 }
 
 const getProjectTitle = (project: any) => {
-    const contextTitle = extractStoryTitleText(project?.global_context?.title || '')
-    if (contextTitle) return contextTitle
-
     const projectTitle = extractStoryTitleText(project?.title || '')
     if (projectTitle) return projectTitle
+
+    const contextTitle = extractStoryTitleText(project?.global_context?.title || '')
+    if (contextTitle) return contextTitle
 
     return toTextValue(project?.logline || '').trim()
 }
@@ -1105,7 +1060,7 @@ const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'rela
         const status = e.response?.status
         const message = status === 409
             ? '设定已在其他地方更新，请刷新后再试。'
-            : (e.response?.data?.detail || 'AI 整改失败，请稍后重试')
+            : formatApiErrorDetail(e.response?.data?.detail, 'AI 整改失败，请稍后重试')
         quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: message }
         ElMessage.error(message)
     } finally {
@@ -1198,7 +1153,9 @@ const regenerateQuickReviewField = async (field: string) => {
             quickReviewAiRequestSequence.value !== requestSequence
             || !isProjectRequestCurrent(projectRequest)
         ) return
-        const message = e.response?.status === 409 ? '设定已在其他地方更新，请刷新后再试。' : (e.response?.data?.detail || '重新生成失败，请稍后重试')
+        const message = e.response?.status === 409
+            ? '设定已在其他地方更新，请刷新后再试。'
+            : formatApiErrorDetail(e.response?.data?.detail, '重新生成失败，请稍后重试')
         quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: message }; ElMessage.error(message)
     } finally {
         if (quickReviewAiRequestSequence.value === requestSequence) {
@@ -1257,12 +1214,10 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
     const values = { ...quickReviewValues.value }
     const editedFields = [...quickReviewEditedFields.value]
     if (action === 'confirm') {
-        for (const section of interaction.value?.sections || []) {
-            const key = toTextValue(section?.key).trim()
-            if (!key || !toTextValue(values[key]).trim()) {
-                ElMessage.warning(`请完善“${toTextValue(section?.label) || key}”后再确认`)
-                return
-            }
+        const missingLabel = firstMissingQuickReviewLabel(interaction.value?.sections || [], values)
+        if (missingLabel) {
+            ElMessage.warning(`请完善“${missingLabel}”后再确认`)
+            return
         }
     }
 
@@ -1301,7 +1256,7 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
         await analyzeLogline(projectId)
     } catch (e: any) {
         console.error(e)
-        ElMessage.error(e.response?.data?.detail || '快速设定提交失败，请稍后重试')
+        ElMessage.error(formatApiErrorDetail(e.response?.data?.detail, '快速设定提交失败，请稍后重试'))
     } finally {
         finishProjectLoading(request)
     }

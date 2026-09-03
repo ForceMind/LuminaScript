@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { ProjectRequestGuard, analyzeProjectRequest } from '../src/projectRequestGuard.ts'
+import { normalizeTitleDisplay } from '../src/setupFieldPresentation.ts'
 
 const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
 
@@ -158,4 +159,21 @@ test('实际删除成功清理旧loading，即使分析已推进同项目的revi
     assert.equal(state.currentProject.value, null)
     assert.equal(state.loading.value, false)
     assert.equal(state.switchingProject.value, false)
+})
+
+test('实际 getProjectTitle 优先保留权威 project.title 的内部标点', () => {
+    const app = install({
+        normalizeTitleDisplay,
+        toTextValue: (value: unknown) => String(value ?? ''),
+    }, [
+        ['extractStoryTitleText', 'getProjectTitle'],
+        ['getProjectTitle', 'getProjectDisplayText'],
+    ])
+    assert.equal(
+        app.getProjectTitle({
+            title: '标题： 《暮色: 第二章—归来》',
+            global_context: { title: '旧标题' },
+        }),
+        '暮色: 第二章—归来',
+    )
 })

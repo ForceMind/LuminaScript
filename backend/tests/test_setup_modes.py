@@ -404,7 +404,8 @@ async def test_ai_revision_rejects_invalid_numeric_candidate_and_charges_usage(m
     assert error.value.status_code == 503
     assert project.project_type == "pending"
     assert project.global_context == {}
-    assert project.total_tokens == 6
+    assert project.total_tokens == 12
+    assert len(audits) == 2
     assert audits[0]["status"] == "failed"
 
 
