@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
 import asyncio
-import hashlib
 import json
 import math
 import re
@@ -63,6 +62,16 @@ from services.project_access import (
 from services.prompt_templates import get_prompt_addendum
 from services.usage import enforce_user_quota
 from services.versions import create_project_version
+from services.setup_state import (
+    assert_setup_writable,
+    context_revision as setup_context_revision,
+    detached_setup,
+    revision_meta,
+    valid_setup_cache,
+    write_scene_prompt_cache,
+    write_setup,
+    write_setup_cache,
+)
 
 # Configure Logging
 logging.basicConfig(
@@ -245,20 +254,7 @@ def has_existing_setup_progress(project: models.Project) -> bool:
 
 
 def build_setup_context_revision(project: models.Project) -> str:
-    internal_context = get_internal_project_context(project)
-    payload = {
-        "project_type": project.project_type or "pending",
-        "logline": project.logline or "",
-        "setup_mode": internal_context.get(SETUP_MODE_KEY, ""),
-        "context": build_normalized_context(project),
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:24]
+    return setup_context_revision(project)
 
 
 def quick_setup_field_specs() -> List[Dict[str, str]]:
@@ -670,6 +666,23 @@ def should_invalidate_cached_question(cache_payload: Any, current_context: Dict[
     return False
 
 
+def has_valid_setup_cache(project: models.Project, *, mode: str, stage: str) -> bool:
+    if not valid_setup_cache(project, mode=mode, stage=stage):
+        return False
+    if stage == QUICK_REVIEW_FIELD:
+        sections = project.next_step_cache["payload"]["sections"]
+        values = {item["key"]: item["value"] for item in sections}
+        if len(values) != len(sections):
+            return False
+        try:
+            normalized = normalize_quick_setup_values(project, values, preserve_existing=False)
+        except ValueError:
+            return False
+        if normalized != values:
+            return False
+    return not should_invalidate_cached_question(project.next_step_cache, build_normalized_context(project))
+
+
 def rewind_project_setup(project: models.Project, target_key: str) -> Dict[str, Any]:
     current_context = dict(project.global_context) if isinstance(project.global_context, dict) else {}
     project_type = project.project_type if project.project_type and project.project_type != "pending" else current_context.get("project_type", "movie")
@@ -772,6 +785,8 @@ async def ensure_story_synopsis(
     project: models.Project,
     context: Dict[str, Any],
     db: Optional[AsyncSession] = None,
+    *,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     enriched_context = dict(context or {})
     has_brief = bool(str(enriched_context.get("synopsis_brief", "") or "").strip())
@@ -804,7 +819,7 @@ async def ensure_story_synopsis(
     if detailed:
         enriched_context["synopsis_detailed"] = detailed
 
-    if enriched_context != (project.global_context or {}):
+    if persist and enriched_context != (project.global_context or {}):
         project.global_context = enriched_context
 
     return enriched_context
@@ -909,14 +924,8 @@ async def list_projects(
         .order_by(models.Project.id.desc())
     )
     projects = result.scalars().all()
-    title_updated = False
     for project in projects:
         project.access_role = await project_role(db, project, current_user.id) or "viewer"
-        title_updated = normalize_project_title(project) or title_updated
-        title_updated = normalize_project_context(project) or title_updated
-
-    if title_updated:
-        await db.commit()
 
     return projects
 
@@ -934,14 +943,6 @@ async def get_project(
         load_scenes=True,
     )
     project.access_role = role
-
-    normalized = False
-    if normalize_project_title(project):
-        normalized = True
-    if normalize_project_context(project):
-        normalized = True
-    if normalized:
-        await db.commit()
 
     return project
 
@@ -984,16 +985,22 @@ async def update_project(
         raise HTTPException(status_code=404, detail="Project not found")
     project.access_role = role
 
+    await assert_setup_writable(db, project, project_update.context_revision)
     if project_update.project_type:
-        project.project_type = project_update.project_type
-    
+        current_context = get_internal_project_context(project)
+        current_context.pop("final_confirm", None)
+        current_context["project_type"] = project_update.project_type
+        await write_setup(db, project, project_update.context_revision, {
+            "project_type": project_update.project_type,
+            "global_context": current_context,
+        })
     await db.commit()
-    await db.refresh(project)
     return project
 
 class InteractionRequest(BaseModel):
     answer: str = Field(min_length=1, max_length=MAX_INTERACTION_ANSWER_LENGTH)
     context_key: str = Field(min_length=1, max_length=100)
+    context_revision: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("context_key")
     @classmethod
@@ -1008,7 +1015,7 @@ class QuickSetupReviewRequest(BaseModel):
     action: Literal["confirm", "guided"] = "confirm"
     values: Dict[str, str] = Field(default_factory=dict)
     edited_fields: List[str] = Field(default_factory=list, max_length=20)
-    context_revision: str = Field(min_length=8, max_length=128)
+    context_revision: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("values")
     @classmethod
@@ -1040,7 +1047,7 @@ class QuickSetupAIReviseRequest(BaseModel):
     values: Dict[str, str] = Field(default_factory=dict)
     target_field: Optional[str] = None
     edited_fields: List[str] = Field(default_factory=list, max_length=20)
-    context_revision: str = Field(min_length=8, max_length=128)
+    context_revision: Optional[str] = Field(default=None, max_length=128)
     instruction: Optional[str] = Field(default=None, max_length=MAX_INTERACTION_ANSWER_LENGTH)
 
     @field_validator("values")
@@ -1176,9 +1183,9 @@ async def submit_interaction(
         minimum_role="editor",
     )
 
-    # Update context
-    # Note: sqlalchemy JSON field needs reassignment to trigger update
-    current_context = dict(project.global_context) if project.global_context else {}
+    await assert_setup_writable(db, project, interaction.context_revision)
+    draft = detached_setup(project)
+    current_context = get_internal_project_context(draft)
     previous_title = project.title
     
     # Special Handling: Reset
@@ -1190,8 +1197,7 @@ async def submit_interaction(
         if answer_text not in {SETUP_MODE_AI_FAST, SETUP_MODE_GUIDED}:
             raise HTTPException(status_code=422, detail="不支持的设定方式")
         current_context[SETUP_MODE_KEY] = answer_text
-        project.global_context = current_context
-        project.next_step_cache = None
+        await write_setup(db, project, interaction.context_revision, {"global_context": current_context})
         await db.commit()
         return {
             "status": "setup_mode_updated",
@@ -1199,24 +1205,29 @@ async def submit_interaction(
             "context": project.global_context,
             "title": project.title or previous_title or "",
             "total_tokens": int(project.total_tokens or 0),
+            **revision_meta(project),
         }
 
     if interaction.context_key == 'final_confirm' and answer_text == 'reset':
         logger.info(f"项目 {project_id} 收到重置请求，清空上下文重新开始设定流程")
-        project.global_context = {}
-        project.next_step_cache = None
-        project.project_type = "pending"
+        await write_setup(db, project, interaction.context_revision, {
+            "global_context": {}, "project_type": "pending",
+        })
         await db.commit()
-        return {"status": "reset", "context": {}}
+        return {"status": "reset", "context": {}, **revision_meta(project)}
 
     if interaction.context_key == 'final_confirm' and answer_text.startswith('edit:'):
         target_key = answer_text.split(':', 1)[1].strip()
-        rewind_project_setup(project, target_key)
+        rewind_project_setup(draft, target_key)
+        await write_setup(db, project, interaction.context_revision, {
+            "global_context": draft.global_context, "title": draft.title,
+        })
         await db.commit()
         return {
             "status": "rewind",
             "context": project.global_context,
             "title": project.title or previous_title or "",
+            **revision_meta(project),
         }
 
     if interaction.context_key == 'final_confirm' and answer_text not in FINAL_CONFIRM_ALLOWED_VALUES:
@@ -1224,7 +1235,7 @@ async def submit_interaction(
 
     # Ensure project_type is synced if that was the key (legacy support)
     if interaction.context_key == 'project_type':
-        project.project_type = answer_text
+        draft.project_type = answer_text
     
     # Handle Title Update specifically
     if interaction.context_key == 'title':
@@ -1232,18 +1243,21 @@ async def submit_interaction(
         clean_title = extract_story_title(answer_text)
         if clean_title:
             current_context[interaction.context_key] = clean_title
-            project.title = clean_title
-            logger.info(f"Project Title Updated to: {project.title}")
+            draft.title = clean_title
+            logger.info(f"Project Title Updated to: {draft.title}")
         else:
              current_context.pop(interaction.context_key, None)
              logger.warning(f"Ignored suspicious title update: {answer_text}")
     else:
         current_context[interaction.context_key] = answer_text
 
-    project.global_context = current_context
-
-    # Clear the cache because state has changed
-    project.next_step_cache = None
+    if interaction.context_key != "final_confirm":
+        current_context.pop("final_confirm", None)
+    await write_setup(db, project, interaction.context_revision, {
+        "global_context": current_context,
+        "project_type": draft.project_type,
+        "title": draft.title,
+    })
 
     await db.commit()
     logger.info(f"项目 {project_id} 上下文已更新，缓存已清除")
@@ -1252,6 +1266,7 @@ async def submit_interaction(
         "context": project.global_context,
         "title": project.title or previous_title or "",
         "total_tokens": int(project.total_tokens or 0),
+        **revision_meta(project),
     }
 
 
@@ -1268,6 +1283,7 @@ async def revise_quick_setup_with_ai(
         current_user.id,
         minimum_role="editor",
     )
+    await assert_setup_writable(db, project, payload.context_revision)
     if payload.context_revision != build_setup_context_revision(project):
         raise HTTPException(
             status_code=409,
@@ -1396,9 +1412,17 @@ async def revise_quick_setup_with_ai(
 
     await db.refresh(
         project,
-        attribute_names=["project_type", "logline", "global_context"],
+        attribute_names=["project_type", "logline", "global_context", "setup_revision", "setup_cache_revision", "status"],
     )
-    if payload.context_revision != build_setup_context_revision(project):
+    stale_output = payload.context_revision != build_setup_context_revision(project)
+    if not stale_output:
+        try:
+            await assert_setup_writable(db, project, payload.context_revision)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            stale_output = True
+    if stale_output:
         await record_quick_setup_ai_revision(
             db=db,
             project=project,
@@ -1409,11 +1433,11 @@ async def revise_quick_setup_with_ai(
             tokens=usage,
             status="stale",
             error_type="stale_context",
-            error_message="AI 返回前项目设定已更新",
+            error_message="AI 返回前项目设定已更新或开始生成",
         )
         raise HTTPException(
             status_code=409,
-            detail="AI 分析期间项目设定已更新，请刷新后重试。",
+            detail="AI 分析期间项目设定已更新或开始生成，请刷新后重试。",
         )
 
     if payload.operation == "regenerate_field":
@@ -1592,6 +1616,7 @@ async def submit_quick_setup_review(
         current_user.id,
         minimum_role="editor",
     )
+    await assert_setup_writable(db, project, payload.context_revision)
     current_revision = build_setup_context_revision(project)
     if payload.context_revision != current_revision:
         raise HTTPException(
@@ -1603,8 +1628,7 @@ async def submit_quick_setup_review(
     if payload.action == "guided":
         current_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
         current_context.pop(QUICK_EDITED_FIELDS_KEY, None)
-        project.global_context = current_context
-        project.next_step_cache = None
+        await write_setup(db, project, payload.context_revision, {"global_context": current_context})
         await db.commit()
         return {
             "status": "guided",
@@ -1612,6 +1636,7 @@ async def submit_quick_setup_review(
             "context": project.global_context,
             "title": project.title or "",
             "total_tokens": int(project.total_tokens or 0),
+            **revision_meta(project),
         }
 
     try:
@@ -1633,15 +1658,16 @@ async def submit_quick_setup_review(
     ):
         current_context.pop(derived_key, None)
 
-    project.project_type = normalized_values["project_type"]
     for key, value in normalized_values.items():
         current_context[key] = value
-    project.title = normalized_values["title"]
     current_context[SETUP_MODE_KEY] = SETUP_MODE_AI_FAST
     current_context[QUICK_EDITED_FIELDS_KEY] = payload.edited_fields
     current_context["final_confirm"] = "confirmed"
-    project.global_context = current_context
-    project.next_step_cache = None
+    await write_setup(db, project, payload.context_revision, {
+        "global_context": current_context,
+        "project_type": normalized_values["project_type"],
+        "title": normalized_values["title"],
+    })
     await db.commit()
 
     return {
@@ -1650,6 +1676,7 @@ async def submit_quick_setup_review(
         "context": project.global_context,
         "title": project.title,
         "total_tokens": int(project.total_tokens or 0),
+        **revision_meta(project),
     }
 
 
@@ -1674,18 +1701,28 @@ async def analyze_logline(
 
     def with_runtime_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(payload or {})
+        result.pop("_setup_cache", None)
+        result.update(revision_meta(project))
+        if isinstance(result.get("payload"), dict):
+            result["payload"] = {**result["payload"], "context_revision": build_setup_context_revision(project)}
         result["total_tokens"] = int(project.total_tokens or 0)
         result["setup_mode"] = str(
             get_internal_project_context(project).get(SETUP_MODE_KEY, "") or ""
         )
         return result
 
+    await assert_setup_writable(db, project, build_setup_context_revision(project))
+    normalization_revision = build_setup_context_revision(project)
+    normalized_draft = detached_setup(project)
     normalized = False
-    if normalize_project_title(project):
+    if normalize_project_title(normalized_draft):
         normalized = True
-    if normalize_project_context(project):
+    if normalize_project_context(normalized_draft):
         normalized = True
     if normalized:
+        await write_setup(db, project, normalization_revision, {
+            "title": normalized_draft.title, "global_context": normalized_draft.global_context,
+        })
         await db.commit()
 
     normalized_context = build_normalized_context(project)
@@ -1694,7 +1731,7 @@ async def analyze_logline(
     if setup_mode not in {SETUP_MODE_AI_FAST, SETUP_MODE_GUIDED}:
         if has_existing_setup_progress(project):
             internal_context[SETUP_MODE_KEY] = SETUP_MODE_GUIDED
-            project.global_context = internal_context
+            await write_setup(db, project, build_setup_context_revision(project), {"global_context": internal_context})
             setup_mode = SETUP_MODE_GUIDED
             await db.commit()
         else:
@@ -1721,6 +1758,8 @@ async def analyze_logline(
             )
 
     if should_auto_prefill_from_logline(project, normalized_context):
+        prefill_revision = build_setup_context_revision(project)
+        prefill_draft = detached_setup(project)
         filled_fields: List[str] = []
         prefill_changed = False
         prefill_usage = 0
@@ -1728,13 +1767,14 @@ async def analyze_logline(
 
         try:
             extracted_setup, prefill_usage = await llm.extract_setup_from_long_input(project.logline or "")
-            filled_fields, prefill_changed = apply_auto_prefill(project, extracted_setup)
+            filled_fields, prefill_changed = apply_auto_prefill(prefill_draft, extracted_setup)
         except Exception as exc:
             logger.warning(f"Failed to auto-prefill setup from long logline for project {project_id}: {exc}")
-            filled_fields, prefill_changed = apply_auto_prefill(project, {})
+            filled_fields, prefill_changed = apply_auto_prefill(prefill_draft, {})
 
         if prefill_usage:
             await increment_project_tokens(db, project, prefill_usage)
+            await db.commit()
             background_tasks.add_task(
                 log_ai_action,
                 user_id=current_user.id,
@@ -1747,21 +1787,25 @@ async def analyze_logline(
 
         if filled_fields:
             logger.info(f"项目 {project_id} 已从长输入自动补全字段: {', '.join(filled_fields)}")
-            project.next_step_cache = None
-
-        if prefill_changed or prefill_usage:
+        if prefill_changed:
+            await write_setup(db, project, prefill_revision, {
+                "global_context": prefill_draft.global_context,
+                "title": prefill_draft.title,
+                "project_type": prefill_draft.project_type,
+            })
             await db.commit()
 
         normalized_context = build_normalized_context(project)
 
-    # Check Cache First (For resuming sessions)
-    if project.next_step_cache:
-        if should_invalidate_cached_question(project.next_step_cache, normalized_context):
-            project.next_step_cache = None
-            await db.commit()
-        else:
-            logger.info(f"项目 {project_id} 命中缓存，直接返回之前的提问。")
-            return with_runtime_meta(project.next_step_cache)
+    # A legacy/mismatched cache is ignored, never relabelled as current.
+    stage = QUICK_REVIEW_FIELD if setup_mode == SETUP_MODE_AI_FAST and "final_confirm" not in normalized_context else next(
+        (step["key"] for step in get_relevant_setup_steps(normalized_context.get("project_type", "movie"))
+         if step["key"] not in normalized_context), "completed"
+    )
+    if has_valid_setup_cache(project, mode=setup_mode, stage=stage):
+        logger.info(f"项目 {project_id} 命中缓存，直接返回之前的提问。")
+        return with_runtime_meta(project.next_step_cache)
+    analysis_revision = build_setup_context_revision(project)
 
     logger.info(f"正在分析项目 {project_id} 的进度状况...")
 
@@ -1824,6 +1868,7 @@ async def analyze_logline(
                 )
 
         if draft_values is None:
+            await assert_setup_writable(db, project, analysis_revision)
             return with_runtime_meta(
                 {
                     "type": "interaction_required",
@@ -1852,6 +1897,7 @@ async def analyze_logline(
 
         if draft_usage:
             await increment_project_tokens(db, project, draft_usage)
+            await db.commit()
         response_payload = {
             "type": "interaction_required",
             "payload": {
@@ -1861,7 +1907,10 @@ async def analyze_logline(
                 "sections": build_quick_review_sections(project, draft_values),
             },
         }
-        project.next_step_cache = response_payload
+        response_payload = await write_setup_cache(
+            db, project, analysis_revision, response_payload,
+            mode=setup_mode, stage=QUICK_REVIEW_FIELD,
+        )
         await db.commit()
         return with_runtime_meta(response_payload)
 
@@ -1975,7 +2024,13 @@ async def analyze_logline(
             project,
             normalized_context,
             db,
+            persist=False,
         )
+        # Synopsis enrichment is a setup write as well; preserve internal fields.
+        enriched_context = {**get_internal_project_context(project), **normalized_context}
+        if enriched_context != get_internal_project_context(project):
+            await db.commit()  # preserve already-used AI tokens even if CAS rejects stale output
+            await write_setup(db, project, analysis_revision, {"global_context": enriched_context})
         if project.project_type and project.project_type != "pending":
             normalized_context["project_type"] = project.project_type
 
@@ -2101,6 +2156,7 @@ async def analyze_logline(
     
     # Update Token Usage
     await increment_project_tokens(db, project, usage)
+    await db.commit()
     
     # Construction Response
     response_payload = {
@@ -2118,7 +2174,10 @@ async def analyze_logline(
         )
     
     # Cache the result to DB so next fetch is instant
-    project.next_step_cache = response_payload
+    response_payload = await write_setup_cache(
+        db, project, analysis_revision, response_payload,
+        mode=setup_mode, stage=next_step["key"],
+    )
     await db.commit()
 
     return with_runtime_meta(response_payload)
@@ -2471,6 +2530,20 @@ async def regenerate_scene(
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
 
+    # The project may have changed between access lookup and the atomic claim.
+    # Refresh under the claim's write lock before clearing derived context.
+    await db.refresh(project)
+    # A restore can delete/recreate scenes (including reusing an old row id).
+    # Resolve the requested logical scene again while holding the claim lock.
+    scene = await db.scalar(
+        select(models.Scene)
+        .where(models.Scene.project_id == project_id)
+        .where(models.Scene.scene_index == scene_index)
+        .execution_options(populate_existing=True)
+    )
+    if scene is None:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="场次已变化或不存在，请刷新后重试")
     await create_project_version(
         db,
         project_id,
@@ -2545,6 +2618,11 @@ async def rewrite_scene_to_prompt(
     if cached_prompt:
         return {"scene_index": scene_index, "prompt": cached_prompt, "cached": True}
 
+    prompt_revision = build_setup_context_revision(project)
+    prompt_scene_id = scene.id
+    prompt_scene_outline = scene.outline
+    prompt_scene_content = scene.content
+    prompt_actor_id = current_user.id
     rewrite_prompt = (
         f"project_id={project_id}, scene_index={scene_index}, "
         f"outline={scene.outline or ''}, content={scene.content or ''}"
@@ -2584,11 +2662,29 @@ async def rewrite_scene_to_prompt(
     if not final_prompt:
         raise HTTPException(status_code=503, detail="AI 未返回有效提示词，请稍后重试")
 
-    prompt_cache[cache_key] = final_prompt
-    context["_scene_ai_prompts"] = prompt_cache
-    project.global_context = context
+    # Preserve known usage even when the response is no longer applicable.
+    # Never put the pre-AI context back on the tracked ORM object.
     await increment_project_tokens(db, project, usage)
     await db.commit()
+    try:
+        await write_scene_prompt_cache(
+            db, project, prompt_revision,
+            scene_id=prompt_scene_id, scene_index=scene_index,
+            scene_outline=prompt_scene_outline, scene_content=prompt_scene_content,
+            prompt=final_prompt,
+        )
+        await db.commit()
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        await log_ai_action(
+            user_id=prompt_actor_id, project_id=project_id,
+            action=f"scene_to_prompt_{scene_index}", prompt=rewrite_prompt,
+            response=final_prompt, tokens=int(usage or 0), status="stale",
+            step_key=f"scene:{scene_index}", error_type="stale_context",
+            error_message="提示词返回前项目设定、生成状态或场次内容已变化",
+        )
+        raise HTTPException(status_code=409, detail="提示词生成期间项目已更新，请刷新后重试。") from exc
 
     await log_ai_action(
         user_id=current_user.id,

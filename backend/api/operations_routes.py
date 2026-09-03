@@ -15,6 +15,7 @@ import auth
 import models
 from api.dependencies import require_admin
 from database import get_db
+from repositories.projects import claim_generation
 from services.backups import (
     BackupSettings,
     backup_path,
@@ -29,6 +30,7 @@ from services.project_access import project_role, require_project_access
 from services.prompt_templates import ALLOWED_TEMPLATE_STAGES
 from services.system_logs import read_system_log
 from services.usage import enforce_user_quota, get_user_usage
+from services.setup_state import assert_setup_writable, revision_meta
 from services.versions import (
     create_project_version,
     diff_version_snapshots,
@@ -48,6 +50,7 @@ class VersionCreate(BaseModel):
 
 class VersionRestore(BaseModel):
     confirm: bool
+    context_revision: str | None = Field(default=None, max_length=128)
 
 
 class MemberCreate(BaseModel):
@@ -277,6 +280,10 @@ async def admin_retry_job(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     await enforce_user_quota(db, project.owner_id)
+    if not await claim_generation(db, project.id, project.owner_id):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
+    await db.refresh(project)
     if old_job.kind == "outline_generation":
         await db.execute(delete(models.Scene).where(models.Scene.project_id == project.id))
     else:
@@ -344,6 +351,10 @@ async def retry_job(
     if old_job.status not in {models.JobStatus.FAILED, models.JobStatus.CANCELED}:
         raise HTTPException(status_code=409, detail="只有失败或已取消任务可以重试")
     await enforce_user_quota(db, project.owner_id)
+    if not await claim_generation(db, project.id, current_user.id):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
+    await db.refresh(project)
     if old_job.kind == "outline_generation":
         await db.execute(delete(models.Scene).where(models.Scene.project_id == project.id))
     else:
@@ -428,10 +439,11 @@ async def restore_version(
     version = await db.get(models.ProjectVersion, version_id)
     if not version or version.project_id != project_id:
         raise HTTPException(status_code=404, detail="版本不存在")
+    await assert_setup_writable(db, project, payload.context_revision)
     await create_project_version(db, project_id, current_user.id, "恢复前自动快照")
-    await restore_project_version(db, project, version)
+    await restore_project_version(db, project, version, payload.context_revision)
     await db.commit()
-    return {"status": "restored"}
+    return {"status": "restored", **revision_meta(project)}
 
 
 @router.get("/projects/{project_id}/members")

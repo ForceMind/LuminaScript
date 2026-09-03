@@ -437,7 +437,7 @@ async def test_guided_mode_continues_existing_question_flow():
         user, _project = await seed_project(session)
         await main.submit_interaction(
             1,
-            main.InteractionRequest(answer="guided", context_key="setup_mode"),
+            main.InteractionRequest(answer="guided", context_key="setup_mode", context_revision="setup-v2:0:0"),
             db=session,
             current_user=user,
         )
@@ -486,7 +486,7 @@ async def test_quick_mode_generates_reviews_and_atomically_confirms(monkeypatch)
         user, _project = await seed_project(session)
         await main.submit_interaction(
             1,
-            main.InteractionRequest(answer="ai_fast", context_key="setup_mode"),
+            main.InteractionRequest(answer="ai_fast", context_key="setup_mode", context_revision="setup-v2:0:0"),
             db=session,
             current_user=user,
         )
@@ -542,7 +542,7 @@ async def test_quick_review_rejects_stale_context(monkeypatch):
         user, project = await seed_project(session)
         await main.submit_interaction(
             1,
-            main.InteractionRequest(answer="ai_fast", context_key="setup_mode"),
+            main.InteractionRequest(answer="ai_fast", context_key="setup_mode", context_revision="setup-v2:0:0"),
             db=session,
             current_user=user,
         )
@@ -552,11 +552,13 @@ async def test_quick_review_rejects_stale_context(monkeypatch):
             db=session,
             current_user=user,
         )
-        project.global_context = {
-            **project.global_context,
-            "tone": "另一个标签页修改后的基调",
-        }
-        await session.commit()
+        await main.submit_interaction(
+            1,
+            main.InteractionRequest(
+                context_key="tone", answer="另一个标签页修改后的基调",
+                context_revision=draft_response["context_revision"],
+            ), db=session, current_user=user,
+        )
 
         with pytest.raises(HTTPException) as error:
             await main.submit_quick_setup_review(
@@ -586,7 +588,7 @@ async def test_quick_generation_failure_offers_retry_or_guided(monkeypatch):
         user, _project = await seed_project(session)
         await main.submit_interaction(
             1,
-            main.InteractionRequest(answer="ai_fast", context_key="setup_mode"),
+            main.InteractionRequest(answer="ai_fast", context_key="setup_mode", context_revision="setup-v2:0:0"),
             db=session,
             current_user=user,
         )
@@ -629,7 +631,7 @@ async def test_quick_mode_preserves_answers_already_confirmed(monkeypatch):
         )
         await main.submit_interaction(
             1,
-            main.InteractionRequest(answer="ai_fast", context_key="setup_mode"),
+            main.InteractionRequest(answer="ai_fast", context_key="setup_mode", context_revision="setup-v2:0:0"),
             db=session,
             current_user=user,
         )

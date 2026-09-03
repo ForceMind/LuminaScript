@@ -28,6 +28,7 @@
 - `GET /projects/`
 - 返回轻量列表，不包含分场内容
 - 包含 `access_role`：`owner`、`editor` 或 `viewer`
+- 项目响应包含 `setup_revision`、`setup_cache_revision` 和 `context_revision`。
 
 ### 获取单个项目详情
 - `GET /projects/{project_id}`
@@ -37,16 +38,37 @@
 - `POST /projects/{project_id}/analyze`
 - 新项目首先返回 `setup_mode`，可选 `ai_fast`（AI 快速完成）或 `guided`（自己掌控）
 - `ai_fast` 会返回 `quick_review` 完整草案；草案在确认前只缓存，不写入项目正式设定
+- 响应顶层及交互 payload 返回最新 `context_revision`；缓存变化也会推进版本，客户端应采用最新返回值。
+
+### 设定版本与写入冲突
+- `context_revision` 使用 `setup-v2:S:C` 格式，分别绑定正式设定版本和草案/提问缓存版本。
+- 修改设定、切模式、重置/回退、确认、项目类型 PATCH 和版本恢复均需发送当前 token。
+- 缺失、旧格式或过期 token 返回 `409`；必须重新获取项目/交互状态，不能去掉版本字段重试。
+- 同一版本的并发写入只允许一方成功；活动生成任务期间拒绝修改基础设定。
+- Token 用量累计不改变设定版本。读取项目不再隐式持久化标题或上下文规范化结果。
 
 ### 提交单项设定或切换设定方式
 - `POST /projects/{project_id}/interact`
 - 切换方式时使用 `context_key=setup_mode`，`answer=ai_fast|guided`
+- JSON 同时携带 `context_revision`。
+
+### 修改项目类型
+- `PATCH /projects/{project_id}`，JSON 为 `project_type` 和 `context_revision`。
+- 成功后采用响应中的最新版本；与旧类型关联的缓存不再沿用。
 
 ### 确认 AI 快速设定草案
 - `POST /projects/{project_id}/setup/quick-review`
 - `action=confirm`：校验并原子写入整份草案
 - `action=guided`：丢弃未确认草案并切换到逐步掌控
 - 请求必须携带草案返回的 `context_revision`；项目已被其他标签页修改时返回 `409`
+
+### 单项重生与 AI 复核
+- `POST /projects/{project_id}/setup/quick-review/ai-revise`
+- 共同请求字段：`values`（完整当前草案）、`edited_fields`、`context_revision`、可选 `instruction`。
+- `operation=regenerate_field` 需 `target_field`；成功返回 `status=options` 和三个 `label/value` 选项，只供客户端选择，不写正式设定。
+- `operation=review_edits` 使用 `scope=edited_only|related`；成功返回 `status=candidate`、`changes` 和摘要，应用前须由用户确认。
+- 返回 `tokens_used`、`total_tokens` 和版本；过期请求不得覆盖更新后的设定或缓存。
+- 生成期间本地草案再次变化时，客户端应拒绝应用旧候选。
 
 ### 生成分场大纲
 - `POST /projects/{project_id}/generate_scenes`
@@ -115,7 +137,7 @@
 ### 版本
 - `GET|POST /projects/{project_id}/versions`
 - `GET /projects/{project_id}/versions/{version_id}/diff`
-- `POST /projects/{project_id}/versions/{version_id}/restore`，JSON 需 `confirm=true`
+- `POST /projects/{project_id}/versions/{version_id}/restore`，JSON 需 `confirm=true` 和 `context_revision`；活动生成任务或版本冲突时拒绝恢复。
 
 ### 协作成员
 - `GET|POST /projects/{project_id}/members`

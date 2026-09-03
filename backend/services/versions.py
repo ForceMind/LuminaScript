@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import models
+from services.setup_state import context_revision, write_setup
 
 
 def utc_iso() -> str:
@@ -45,10 +46,15 @@ async def create_project_version(
     user_id: int,
     label: str,
 ) -> models.ProjectVersion:
+    # Preserve intentional pending changes before refreshing the identity map.
+    # populate_existing also refreshes selectinloaded children after a restore
+    # may have deleted rows and reused their database ids in another session.
+    await db.flush()
     result = await db.execute(
         select(models.Project)
         .where(models.Project.id == project_id)
         .options(selectinload(models.Project.scenes))
+        .execution_options(populate_existing=True)
     )
     project = result.scalars().first()
     if not project:
@@ -69,16 +75,18 @@ async def restore_project_version(
     db: AsyncSession,
     project: models.Project,
     version: models.ProjectVersion,
+    expected_revision: str | None = None,
 ) -> None:
     snapshot = dict(version.snapshot or {})
-    project.title = snapshot.get("title") or project.title
-    project.logline = snapshot.get("logline") or project.logline
-    project.project_type = snapshot.get("project_type") or project.project_type
-    project.genre = snapshot.get("genre")
-    project.global_context = snapshot.get("global_context") or {}
-    project.global_summary = snapshot.get("global_summary")
-    project.total_tokens = int(snapshot.get("total_tokens") or 0)
-    project.status = models.ProcessingStatus.PENDING
+    await write_setup(db, project, expected_revision or context_revision(project), {
+        "title": snapshot.get("title") or project.title,
+        "logline": snapshot.get("logline") or project.logline,
+        "project_type": snapshot.get("project_type") or project.project_type,
+        "genre": snapshot.get("genre"),
+        "global_context": snapshot.get("global_context") or {},
+        "global_summary": snapshot.get("global_summary"),
+        "status": models.ProcessingStatus.PENDING,
+    })
     await db.execute(delete(models.Scene).where(models.Scene.project_id == project.id))
     for item in snapshot.get("scenes") or []:
         status_value = item.get("status") or "pending"

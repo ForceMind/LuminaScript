@@ -33,6 +33,7 @@ class ProjectCreate(ProjectBase):
 
 class ProjectUpdate(BaseModel):
     project_type: Optional[ProjectType] = None
+    context_revision: Optional[str] = Field(default=None, max_length=128)
 
 class ProjectListResponse(ProjectBase):
     id: int
@@ -43,6 +44,9 @@ class ProjectListResponse(ProjectBase):
     total_tokens: int = 0
     status: ProcessingStatus = ProcessingStatus.PENDING
     access_role: str = "owner"
+    setup_revision: int = 0
+    setup_cache_revision: int = 0
+    context_revision: str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -271,4 +275,3 @@ class InteractionPayload(BaseModel):
 class InteractionResponse(BaseModel):
     type: str = "interaction_required"
     payload: InteractionPayload
-

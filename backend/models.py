@@ -90,6 +90,13 @@ class Project(Base):
     
     # Stores the next interaction step to cache specific questions
     next_step_cache = Column(JSON, nullable=True)
+    # Monotonic setup state and derived-question revisions; never restored from snapshots.
+    setup_revision = Column(Integer, default=0, server_default="0", nullable=False)
+    setup_cache_revision = Column(Integer, default=0, server_default="0", nullable=False)
+
+    @property
+    def context_revision(self) -> str:
+        return f"setup-v2:{int(self.setup_revision or 0)}:{int(self.setup_cache_revision or 0)}"
     
     # Stores the overall summary/hook
     global_summary = Column(Text, nullable=True)

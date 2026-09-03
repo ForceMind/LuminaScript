@@ -23,6 +23,14 @@ import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
+import { APP_VERSION } from './version'
+import {
+    ProjectRequestGuard,
+    applyQuickReviewCandidateAtomically,
+    analyzeProjectRequest,
+    submitQuickReviewRequest,
+    type ProjectRequestSnapshot,
+} from './projectRequestGuard'
 
 marked.setOptions({ gfm: true, breaks: true })
 const AdminDashboard = defineAsyncComponent(
@@ -79,6 +87,7 @@ const authLoading = ref(false)
 const logline = ref('')
 const currentProject = ref<any>(null)
 const interaction = ref<any>(null)
+const projectRequestGuard = new ProjectRequestGuard()
 const selectedOption = ref('')
 const customInput = ref('')
 const quickReviewValues = ref<Record<string, string>>({})
@@ -111,6 +120,7 @@ const isStarted = ref(false)
 const projectToolsVisible = ref(false)
 const projectToolsTab = ref('versions')
 const projectToolsLoading = ref(false)
+let projectToolsRequestSequence = 0
 const projectVersions = ref<any[]>([])
 const projectMembers = ref<any[]>([])
 const projectJobs = ref<any[]>([])
@@ -121,6 +131,50 @@ const versionDiffText = ref('')
 const memberForm = ref({ username: '', role: 'viewer' })
 const canEditCurrentProject = computed(() => ['owner', 'editor'].includes(currentProject.value?.access_role || 'owner'))
 const ownsCurrentProject = computed(() => (currentProject.value?.access_role || 'owner') === 'owner')
+
+const currentProjectRevision = () => toTextValue(currentProject.value?.context_revision).trim()
+const beginProjectRequest = (
+    projectId = currentProject.value?.id,
+    contextRevision = currentProjectRevision(),
+    channel = 'default',
+) => projectRequestGuard.begin(projectId, contextRevision, channel)
+const isProjectRequestCurrent = (request: ProjectRequestSnapshot) =>
+    projectRequestGuard.isCurrent(request, currentProject.value?.id, currentProjectRevision())
+const isProjectRequestForActiveProject = (request: ProjectRequestSnapshot) =>
+    projectRequestGuard.isSameProjectEpoch(request, currentProject.value?.id)
+const startProjectLoading = (request: ProjectRequestSnapshot, text?: string) => {
+    projectRequestGuard.startLoading(request)
+    if (text) loadingText.value = text
+    loading.value = true
+}
+const finishProjectLoading = (request: ProjectRequestSnapshot) => {
+    if (projectRequestGuard.mayFinishLoading(request, currentProject.value?.id, currentProjectRevision())) {
+        loading.value = false
+    }
+}
+const invalidateProjectRequests = () => {
+    projectRequestGuard.invalidate()
+    quickReviewAiRequestSequence.value += 1
+}
+
+const syncProjectResponse = (payload: any, updateInteraction = false) => {
+    if (!currentProject.value || !payload) return
+    const source = payload?.project || payload
+    const contextRevision = toTextValue(source?.context_revision || payload?.context_revision).trim()
+    const setupRevision = source?.setup_revision ?? payload?.setup_revision
+    const setupCacheRevision = source?.setup_cache_revision ?? payload?.setup_cache_revision
+    if (!contextRevision && setupRevision === undefined && setupCacheRevision === undefined) return
+
+    currentProject.value = {
+        ...currentProject.value,
+        ...(contextRevision ? { context_revision: contextRevision } : {}),
+        ...(setupRevision !== undefined ? { setup_revision: setupRevision } : {}),
+        ...(setupCacheRevision !== undefined ? { setup_cache_revision: setupCacheRevision } : {}),
+    }
+    if (updateInteraction && interaction.value && contextRevision) {
+        interaction.value = { ...interaction.value, context_revision: contextRevision }
+    }
+}
 
 const pollRequestInFlight = ref(false)
 const ACTIVE_PROJECT_POLL_INTERVAL_MS = 8000
@@ -202,9 +256,13 @@ const upsertProjectListItem = (project: any) => {
 
 const syncCurrentProjectSummary = (project: any) => {
     if (!currentProject.value || !project || currentProject.value.id !== project.id) return
+    // The list is only a display summary. It must not replace the active
+    // editor's revision token with a delayed list response.
+    const { context_revision: _contextRevision, setup_revision: _setupRevision,
+        setup_cache_revision: _setupCacheRevision, global_context: _globalContext, ...summary } = project
     currentProject.value = {
         ...currentProject.value,
-        ...project,
+        ...summary,
         scenes: currentProject.value.scenes || []
     }
 }
@@ -661,9 +719,11 @@ const fetchProjects = async () => {
 }
 
 const fetchProjectDetail = async (projectId: number) => {
-    if (!token.value || !projectId) return null
+    if (!token.value || !projectId || currentProject.value?.id !== projectId) return null
+    const request = beginProjectRequest(projectId, currentProjectRevision(), 'detail')
     try {
         const res = await api.get(`/projects/${projectId}`)
+        if (!isProjectRequestCurrent(request)) return null
         const project = res.data
         upsertProjectListItem(project)
         if (currentProject.value?.id === projectId) {
@@ -674,25 +734,29 @@ const fetchProjectDetail = async (projectId: number) => {
         }
         return project
     } catch (e: any) {
+        if (!isProjectRequestCurrent(request)) return null
         if (e.response?.status === 404) {
             projectList.value = projectList.value.filter((item: any) => item.id !== projectId)
             if (currentProject.value?.id === projectId) {
-                currentProject.value = null
-                projectJobs.value = []
+                startNewProject()
+                ElMessage.warning('项目已删除或无访问权限，请选择其他项目。')
             }
             return null
         }
         if (e.response?.status !== 401) {
             console.error(e)
+            ElMessage.error('项目加载失败，请稍后重试。')
         }
         return null
     }
 }
 
 const fetchProjectJobs = async (projectId: number) => {
-    if (!token.value || !projectId) return []
+    if (!token.value || !projectId || currentProject.value?.id !== projectId) return []
+    const request = beginProjectRequest(projectId, currentProjectRevision(), 'jobs')
     try {
         const response = await api.get('/jobs', { params: { project_id: projectId } })
+        if (!isProjectRequestCurrent(request)) return []
         const jobs = Array.isArray(response.data?.items) ? response.data.items : []
         if (currentProject.value?.id === projectId) projectJobs.value = jobs
         return jobs
@@ -702,8 +766,9 @@ const fetchProjectJobs = async (projectId: number) => {
     }
 }
 
-const syncProjectTokensFromResponse = (payload: any) => {
+const syncProjectTokensFromResponse = (payload: any, updateInteraction = false) => {
     if (!currentProject.value || !payload) return
+    syncProjectResponse(payload, updateInteraction)
     const nextTokens = Number(payload?.total_tokens)
     if (!Number.isFinite(nextTokens) || nextTokens < 0) return
     currentProject.value = {
@@ -768,6 +833,7 @@ const handleVisibilityChange = () => {
 
 const logout = () => {
     try { stopPolling() } catch(e) { console.error(e) }
+    invalidateProjectRequests()
     token.value = ''
     user.value = null
     showAdmin.value = false
@@ -776,6 +842,11 @@ const logout = () => {
     currentProject.value = null
     projectJobs.value = []
     interaction.value = null
+    resetQuickReviewState()
+    loading.value = false
+    switchingProject.value = false
+    drawerOpen.value = false
+    projectToolsVisible.value = false
     scenePromptMap.value = {}
     scenePromptLoadingMap.value = {}
     ElMessage.info('已退出登录')
@@ -872,10 +943,11 @@ const createProject = async () => {
       ElMessage.warning('请输入您的创意')
       return
   }
+  const request = beginProjectRequest(null, '', 'create')
   const reviewedLogline = await reviewAndMaybeRewriteInput(logline.value, '用户输入')
+  if (!isProjectRequestCurrent(request)) return
   logline.value = reviewedLogline
-  loading.value = true
-  loadingText.value = '正在为您构建故事世界...'
+  startProjectLoading(request, '正在为您构建故事世界...')
   try {
     // 1. Create Project (Logline Only)
     const res = await api.post('/projects/', {
@@ -883,6 +955,8 @@ const createProject = async () => {
       title: "创意草稿 " + new Date().toLocaleDateString(),
       project_type: "pending" // Explicitly mark as pending classification
     })
+    if (!isProjectRequestCurrent(request)) return
+    invalidateProjectRequests()
     currentProject.value = res.data
     scenePromptMap.value = {}
     scenePromptLoadingMap.value = {}
@@ -896,7 +970,7 @@ const createProject = async () => {
       ElMessage.error('创建失败，请稍后重试')
       console.error(e)
   } finally {
-    loading.value = false
+    finishProjectLoading(request)
   }
 }
 
@@ -942,29 +1016,37 @@ const markQuickReviewFieldEdited = (key: string) => {
 
 const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
     if (!currentProject.value?.id) return
+    const projectId = currentProject.value.id
+    const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
+    if (!contextRevision) {
+        ElMessage.error('设定版本已过期，请刷新项目后重试。')
+        return
+    }
+    const request = beginProjectRequest(projectId, contextRevision, 'setup-mode')
     if (mode === 'ai_fast' && (quickReviewEditedFields.value.length || quickReviewAiAdjustedFields.value.length)) {
         try {
             await ElMessageBox.confirm('已有本地修改，重新生成整份会覆盖这些修改，是否继续？', '确认重新生成', { type: 'warning' })
         } catch { return }
     }
-    loading.value = true
-    loadingText.value = mode === 'ai_fast'
+    startProjectLoading(request, mode === 'ai_fast'
         ? 'AI 正在联合生成完整故事设定...'
-        : '正在进入逐步掌控模式...'
+        : '正在进入逐步掌控模式...')
     try {
-        const response = await api.post(`/projects/${currentProject.value.id}/interact`, {
+        const response = await api.post(`/projects/${projectId}/interact`, {
             answer: mode,
             context_key: 'setup_mode',
+            context_revision: contextRevision,
         })
+        if (!isProjectRequestCurrent(request)) return
         if (response.data?.context) currentProject.value.global_context = response.data.context
         syncProjectTokensFromResponse(response.data)
         interaction.value = null
-        await analyzeLogline(currentProject.value.id)
+        await analyzeLogline(projectId)
     } catch (e: any) {
         console.error(e)
         ElMessage.error(e.response?.data?.detail || '切换设定方式失败，请稍后重试')
     } finally {
-        loading.value = false
+        finishProjectLoading(request)
     }
 }
 
@@ -991,6 +1073,7 @@ const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'rela
     if (!currentProject.value?.id || !interaction.value?.context_revision) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
+    const projectRequest = beginProjectRequest(projectId, contextRevision, 'quick-ai')
     const operation = field ? 'regenerate_field' : 'review_edits'
     const key = field || `review_${scope}`
     if (!field && !quickReviewEditedFields.value.length) return
@@ -1001,24 +1084,23 @@ const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'rela
     quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: true }
     quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: '' }
     const requestValues = { ...quickReviewValues.value }
+    const editedFields = [...quickReviewEditedFields.value]
     try {
         const response = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
             operation, scope, values: requestValues, target_field: field || null,
-            edited_fields: quickReviewEditedFields.value,
+            edited_fields: editedFields,
             context_revision: contextRevision, instruction: ''
         })
         if (
             quickReviewAiRequestSequence.value !== requestSequence
-            || currentProject.value?.id !== projectId
-            || interaction.value?.context_revision !== contextRevision
+            || !isProjectRequestCurrent(projectRequest)
         ) return
-        syncProjectTokensFromResponse(response.data)
+        syncProjectTokensFromResponse(response.data, true)
         showQuickReviewCandidate(response.data, requestValues)
     } catch (e: any) {
         if (
             quickReviewAiRequestSequence.value !== requestSequence
-            || currentProject.value?.id !== projectId
-            || interaction.value?.context_revision !== contextRevision
+            || !isProjectRequestCurrent(projectRequest)
         ) return
         const status = e.response?.status
         const message = status === 409
@@ -1091,6 +1173,7 @@ const regenerateQuickReviewField = async (field: string) => {
     if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
+    const projectRequest = beginProjectRequest(projectId, contextRevision, 'quick-ai')
     const requestSequence = quickReviewAiRequestSequence.value + 1
     quickReviewAiRequestSequence.value = requestSequence
     quickReviewAiCandidateBusy.value = true
@@ -1098,23 +1181,22 @@ const regenerateQuickReviewField = async (field: string) => {
     quickReviewAiLoading.value = { ...quickReviewAiLoading.value, [key]: true }
     quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: '' }
     const requestValues = { ...quickReviewValues.value }
+    const editedFields = [...quickReviewEditedFields.value]
     try {
         const { data } = await api.post(`/projects/${projectId}/setup/quick-review/ai-revise`, {
             operation: 'regenerate_field', scope: 'edited_only', values: requestValues, target_field: field,
-            edited_fields: quickReviewEditedFields.value, context_revision: contextRevision, instruction: ''
+            edited_fields: editedFields, context_revision: contextRevision, instruction: ''
         })
         if (
             quickReviewAiRequestSequence.value !== requestSequence
-            || currentProject.value?.id !== projectId
-            || interaction.value?.context_revision !== contextRevision
+            || !isProjectRequestCurrent(projectRequest)
         ) return
-        syncProjectTokensFromResponse(data)
+        syncProjectTokensFromResponse(data, true)
         showQuickReviewFieldOptions(data, field, requestValues)
     } catch (e: any) {
         if (
             quickReviewAiRequestSequence.value !== requestSequence
-            || currentProject.value?.id !== projectId
-            || interaction.value?.context_revision !== contextRevision
+            || !isProjectRequestCurrent(projectRequest)
         ) return
         const message = e.response?.status === 409 ? '设定已在其他地方更新，请刷新后再试。' : (e.response?.data?.detail || '重新生成失败，请稍后重试')
         quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [key]: message }; ElMessage.error(message)
@@ -1135,38 +1217,45 @@ const applyQuickReviewCandidate = () => {
         return
     }
 
-    const candidateFieldsAreValid = changes.every((change: any) => {
-        const field = toTextValue(change?.field).trim()
-        return Boolean(field) && Object.prototype.hasOwnProperty.call(
-            quickReviewCandidateBaseValues.value,
-            field,
-        )
-    })
-    const hasLocalConflict = Object.entries(quickReviewCandidateBaseValues.value).some(
-        ([field, value]) => quickReviewValues.value[field] !== value,
+    const nextValues = applyQuickReviewCandidateAtomically(
+        quickReviewValues.value,
+        quickReviewCandidateBaseValues.value,
+        changes,
     )
-    if (!candidateFieldsAreValid || hasLocalConflict) {
+    if (!nextValues) {
         ElMessage.warning('候选生成期间内容已被修改，请重新复核后再应用')
         return
     }
 
+    const nextAdjustedFields = [...quickReviewAiAdjustedFields.value]
+    const nextErrors = { ...quickReviewAiErrors.value }
     for (const change of changes) {
         const field = toTextValue(change?.field).trim()
-        if (field) quickReviewValues.value[field] = toTextValue(change.after)
-        if (field && !quickReviewAiAdjustedFields.value.includes(field)) {
-            quickReviewAiAdjustedFields.value = [...quickReviewAiAdjustedFields.value, field]
+        if (field && !nextAdjustedFields.includes(field)) {
+            nextAdjustedFields.push(field)
         }
         if (field) {
-            quickReviewAiErrors.value = { ...quickReviewAiErrors.value, [field]: '' }
+            nextErrors[field] = ''
         }
     }
+    quickReviewValues.value = nextValues
+    quickReviewAiAdjustedFields.value = nextAdjustedFields
+    quickReviewAiErrors.value = nextErrors
     closeQuickReviewCandidate()
     ElMessage.success('AI 候选已应用，可继续修改后再提交')
 }
 
 const submitQuickReview = async (action: 'confirm' | 'guided') => {
     if (!currentProject.value?.id || interactionField.value !== 'quick_review') return
+    const projectId = currentProject.value.id
+    const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
+    if (!contextRevision) {
+        ElMessage.error('设定版本已过期，请刷新项目后重试。')
+        return
+    }
+    const request = beginProjectRequest(projectId, contextRevision, 'quick-submit')
     const values = { ...quickReviewValues.value }
+    const editedFields = [...quickReviewEditedFields.value]
     if (action === 'confirm') {
         for (const section of interaction.value?.sections || []) {
             const key = toTextValue(section?.key).trim()
@@ -1177,39 +1266,44 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
         }
     }
 
-    loading.value = true
-    loadingText.value = action === 'confirm'
+    startProjectLoading(request, action === 'confirm'
         ? '正在保存完整设定...'
-        : '正在切换到逐步掌控...'
+        : '正在切换到逐步掌控...')
     try {
-        if (action === 'confirm') {
-            for (const key of quickReviewEditedFields.value) {
-                values[key] = await reviewAndMaybeRewriteInput(
-                    values[key],
-                    getContextFieldLabel(key),
-                )
-            }
-        }
-        const response = await api.post(
-            `/projects/${currentProject.value.id}/setup/quick-review`,
-            {
-                action,
+        const result = action === 'confirm'
+            ? await submitQuickReviewRequest({
+                request,
+                isCurrent: () => isProjectRequestCurrent(request),
                 values,
-                edited_fields: quickReviewEditedFields.value,
-                context_revision: interaction.value?.context_revision,
-            },
-        )
+                editedFields,
+                reviewInput: reviewAndMaybeRewriteInput,
+                getLabel: getContextFieldLabel,
+                post: (url, payload) => api.post(url, payload),
+            })
+            : await (async () => {
+                const response = await api.post(`/projects/${projectId}/setup/quick-review`, {
+                    action,
+                    values,
+                    edited_fields: editedFields,
+                    context_revision: contextRevision,
+                })
+                return isProjectRequestCurrent(request)
+                    ? { status: 'success' as const, data: response.data, values }
+                    : { status: 'stale' as const }
+            })()
+        if (result.status === 'stale') return
+        const response = { data: result.data as any }
         if (response.data?.context) currentProject.value.global_context = response.data.context
         if (response.data?.title) currentProject.value.title = response.data.title
         syncProjectTokensFromResponse(response.data)
         interaction.value = null
         resetQuickReviewState()
-        await analyzeLogline(currentProject.value.id)
+        await analyzeLogline(projectId)
     } catch (e: any) {
         console.error(e)
         ElMessage.error(e.response?.data?.detail || '快速设定提交失败，请稍后重试')
     } finally {
-        loading.value = false
+        finishProjectLoading(request)
     }
 }
 
@@ -1218,12 +1312,19 @@ const analyzeLogline = async (id: number) => {
     console.error("Analysis invoked without ID")
     return
   }
+  const request = beginProjectRequest(id, currentProjectRevision(), 'analysis')
+  if (!isProjectRequestCurrent(request)) return
   try {
     interaction.value = null // Clear previous to show loading state if needed
-    loading.value = true
-    loadingText.value = 'AI 正在阅读您的创意并构思问题，如遇波动系统会自动重试...'
+    startProjectLoading(request, 'AI 正在阅读您的创意并构思问题，如遇波动系统会自动重试...')
     
-    const res = await api.post(`/projects/${id}/analyze`)
+    const analysis = await analyzeProjectRequest({
+        request,
+        isCurrent: () => isProjectRequestCurrent(request),
+        post: (url) => api.post(url),
+    })
+    if (analysis.status === 'stale') return
+    const res = { data: analysis.data as any }
     syncProjectTokensFromResponse(res.data)
     if (res.data?.setup_mode && currentProject.value) {
         currentProject.value.global_context = {
@@ -1244,6 +1345,7 @@ const analyzeLogline = async (id: number) => {
         // Setup complete. Only auto-generate for fresh projects.
         interaction.value = null
         const latestProject = await fetchProjectDetail(id)
+        if (!isProjectRequestForActiveProject(request)) return
         const activeProject = latestProject || currentProject.value
         const activeStatus = normalizeProjectStatus(activeProject?.status)
         const hasGeneratedScenes = Array.isArray(activeProject?.scenes) && activeProject.scenes.length > 0
@@ -1264,6 +1366,7 @@ const analyzeLogline = async (id: number) => {
             }
         )
 
+        if (!isProjectRequestForActiveProject(request)) return
         await Promise.all([fetchProjectDetail(id), fetchProjectJobs(id)])
     } else {
         interaction.value = null
@@ -1275,13 +1378,21 @@ const analyzeLogline = async (id: number) => {
         console.error(e) 
         ElMessage.error(e.response?.data?.detail || '分析失败，请检查网络或后端日志')
     } finally {
-      loading.value = false
+      finishProjectLoading(request)
       startPolling()
   }
 }
 
 const submitChoice = async () => {
     if (!currentProject.value) return
+    const projectId = currentProject.value.id
+    const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
+    if (!contextRevision) {
+        ElMessage.error('设定版本已过期，请刷新项目后重试。')
+        return
+    }
+    const request = beginProjectRequest(projectId, contextRevision, 'choice-submit')
+    const interactionSnapshot = { ...(interaction.value || {}) }
     
     let finalAnswer = selectedOption.value || customInput.value
     if (!finalAnswer) {
@@ -1292,11 +1403,11 @@ const submitChoice = async () => {
     // Only review direct user free text, not AI-provided option values.
     if (!selectedOption.value && customInput.value) {
         finalAnswer = await reviewAndMaybeRewriteInput(customInput.value, '用户输入')
+        if (!isProjectRequestCurrent(request)) return
         customInput.value = finalAnswer
     }
 
-    loading.value = true
-    loadingText.value = '正在记录您的决定并生成下一个问题...'
+    startProjectLoading(request, '正在记录您的决定并生成下一个问题...')
     
     try {
         // We now treat all interactions as "updating project state"
@@ -1314,16 +1425,23 @@ const submitChoice = async () => {
         // WE NEED TO UPDATE BACKEND to accept generic Q&A.
         
         // Temporary Hybrid:
-        if (['movie', 'tv', 'short', 'short_video'].includes(finalAnswer) && !interaction.value.field) {
+        if (['movie', 'tv', 'short', 'short_video'].includes(finalAnswer) && !interactionSnapshot.field) {
              // Backward compatible "Type" selection
-             await api.patch(`/projects/${currentProject.value.id}`, { project_type: finalAnswer })
+             const response = await api.patch(`/projects/${projectId}`, {
+                 project_type: finalAnswer,
+                 context_revision: contextRevision,
+             })
+             if (!isProjectRequestCurrent(request)) return
+             syncProjectResponse(response.data)
         } else {
              // Send answer to analyze endpoint or a new interaction endpoint
              // We'll use a new POST /projects/{id}/submit_interaction
-             const res = await api.post(`/projects/${currentProject.value.id}/interact`, {
+             const res = await api.post(`/projects/${projectId}/interact`, {
                  answer: finalAnswer,
-                 context_key: interaction.value.field || 'unknown' // Backend should provide this in payload
+                 context_key: interactionSnapshot.field || 'unknown', // Backend should provide this in payload
+                 context_revision: contextRevision,
              })
+             if (!isProjectRequestCurrent(request)) return
              if (res.data?.title) currentProject.value.title = res.data.title
              if (res.data?.context) currentProject.value.global_context = res.data.context
              syncProjectTokensFromResponse(res.data)
@@ -1331,12 +1449,12 @@ const submitChoice = async () => {
         
         interaction.value = null
         // Trigger next step immediately
-        await analyzeLogline(currentProject.value.id)
+        await analyzeLogline(projectId)
         
     } catch (e: any) {
         console.error(e)
         ElMessage.error(e.response?.data?.detail || '提交失败，请稍后重试')
-    } finally { loading.value = false }
+    } finally { finishProjectLoading(request) }
 }
 
 const handleOptionSelect = (opt: any) => {
@@ -1345,6 +1463,7 @@ const handleOptionSelect = (opt: any) => {
 }
 
 const startNewProject = () => {
+    invalidateProjectRequests()
     currentProject.value = null
     projectJobs.value = []
     interaction.value = null
@@ -1370,10 +1489,10 @@ const loadProject = async (p: any) => {
     }
     
     switchingProject.value = true
-    loading.value = true
-    loadingText.value = '正在加载历史剧本...'
+    let loadRequest: ProjectRequestSnapshot | null = null
 
     try {
+        invalidateProjectRequests()
         scenePromptMap.value = {}
         scenePromptLoadingMap.value = {}
         currentProject.value = {
@@ -1385,12 +1504,18 @@ const loadProject = async (p: any) => {
         interaction.value = null
         resetQuickReviewState()
 
+        loadRequest = beginProjectRequest(p.id, currentProjectRevision(), 'load')
+        startProjectLoading(loadRequest, '正在加载历史剧本...')
+
         const detailedProject = await fetchProjectDetail(p.id)
+        if (!isProjectRequestCurrent(loadRequest) && !isProjectRequestForActiveProject(loadRequest)) return
+        if (!detailedProject) return
         if (detailedProject) {
             currentProject.value = detailedProject
             upsertProjectListItem(detailedProject)
         }
         await fetchProjectJobs(p.id)
+        if (!isProjectRequestForActiveProject(loadRequest)) return
 
         // Always check state/resume flow
         const activeProject = detailedProject || currentProject.value
@@ -1399,23 +1524,31 @@ const loadProject = async (p: any) => {
         const latestJobStatus = normalizeProjectStatus(latestGenerationJob.value?.status)
 
         if (activeStatus === 'generating' || ['queued', 'running'].includes(latestJobStatus)) {
-            loading.value = false
+            const settledRequest = beginProjectRequest(p.id, currentProjectRevision(), 'load-settle')
+            startProjectLoading(settledRequest)
+            finishProjectLoading(settledRequest)
         } else if (!hasScenes && !latestGenerationJob.value && activeStatus !== 'completed' && activeStatus !== 'failed') {
-            loading.value = true
             loadingText.value = "正在恢复进度..."
             await analyzeLogline(activeProject.id)
         } else {
-            loading.value = false
+            const settledRequest = beginProjectRequest(p.id, currentProjectRevision(), 'load-settle')
+            startProjectLoading(settledRequest)
+            finishProjectLoading(settledRequest)
         }
 
         startPolling()
     } finally {
-        switchingProject.value = false
+        if (loadRequest && isProjectRequestForActiveProject(loadRequest)) {
+            switchingProject.value = false
+            finishProjectLoading(loadRequest)
+        }
     }
 }
 
 const deleteProject = async () => {
     if (!currentProject.value) return
+    const projectId = currentProject.value.id
+    const request = beginProjectRequest(projectId, currentProjectRevision(), 'delete-project')
     
     try {
         await ElMessageBox.confirm(
@@ -1428,10 +1561,11 @@ const deleteProject = async () => {
             }
         )
         
-        await api.delete(`/projects/${currentProject.value.id}`)
+        if (!isProjectRequestForActiveProject(request)) return
+        await api.delete(`/projects/${projectId}`)
+        if (!isProjectRequestForActiveProject(request)) return
         ElMessage.success('已删除')
-        currentProject.value = null
-        projectJobs.value = []
+        startNewProject()
         await fetchProjects()
         startPolling()
     } catch (e) {
@@ -1591,15 +1725,19 @@ const sortedContext = computed(() => {
 
 const fetchProjectTools = async () => {
     if (!currentProject.value?.id) return
+    const projectId = currentProject.value.id
+    const request = beginProjectRequest(projectId, currentProjectRevision(), 'project-tools')
+    const requestSequence = projectToolsRequestSequence + 1
+    projectToolsRequestSequence = requestSequence
     projectToolsLoading.value = true
     try {
-        const projectId = currentProject.value.id
         const [versionsResponse, membersResponse, jobsResponse, usageResponse] = await Promise.all([
             api.get(`/projects/${projectId}/versions`),
             api.get(`/projects/${projectId}/members`),
             api.get(`/jobs?project_id=${projectId}`),
             api.get('/usage/me'),
         ])
+        if (!isProjectRequestCurrent(request)) return
         projectVersions.value = versionsResponse.data?.items || []
         projectMembers.value = membersResponse.data?.items || []
         projectJobs.value = jobsResponse.data?.items || []
@@ -1607,7 +1745,9 @@ const fetchProjectTools = async () => {
     } catch (error: any) {
         ElMessage.error(error?.response?.data?.detail || '无法获取项目工具数据')
     } finally {
-        projectToolsLoading.value = false
+        if (projectToolsRequestSequence === requestSequence && currentProject.value?.id === projectId) {
+            projectToolsLoading.value = false
+        }
     }
 }
 
@@ -1640,14 +1780,28 @@ const showVersionDiff = async (version: any) => {
 }
 
 const restoreProjectVersion = async (version: any) => {
+    if (!currentProject.value?.id) return
+    const projectId = currentProject.value.id
+    const contextRevision = currentProjectRevision()
+    if (!contextRevision) {
+        ElMessage.error('设定版本已过期，请刷新项目后重试。')
+        return
+    }
+    const request = beginProjectRequest(projectId, contextRevision, 'version-restore')
     try {
         await ElMessageBox.confirm(
             `确定恢复到“${version.label}”吗？当前内容会先自动保存为快照。`,
             '恢复项目版本',
             { type: 'warning' },
         )
-        await api.post(`/projects/${currentProject.value.id}/versions/${version.id}/restore`, { confirm: true })
-        await fetchProjectDetail(currentProject.value.id)
+        const response = await api.post(`/projects/${projectId}/versions/${version.id}/restore`, {
+            confirm: true,
+            context_revision: contextRevision,
+        })
+        if (!isProjectRequestCurrent(request)) return
+        syncProjectResponse(response.data)
+        await fetchProjectDetail(projectId)
+        if (!isProjectRequestForActiveProject(request)) return
         await fetchProjectTools()
         ElMessage.success('项目版本已恢复')
     } catch (error: any) {
@@ -1778,6 +1932,7 @@ const copyText = (value: unknown) => {
                     {{ isLoginMode ? '新用户？去注册' : '已有账号？去登录' }}
                 </div>
             </div>
+            <p class="mt-5 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
         </div>
     </div>
 
@@ -1864,6 +2019,7 @@ const copyText = (value: unknown) => {
                             </el-dropdown-menu>
                         </template>
                     </el-dropdown>
+                    <p class="mt-2 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
                 </div>
             </aside>
 
@@ -1920,6 +2076,7 @@ const copyText = (value: unknown) => {
                                 </el-dropdown-menu>
                             </template>
                         </el-dropdown>
+                        <p class="mt-2 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
                     </div>
                 </div>
             </el-drawer>
@@ -2028,16 +2185,18 @@ const copyText = (value: unknown) => {
                                         :name="section.key"
                                     >
                                         <template #title>
-                                            <div class="flex min-w-0 flex-1 items-center gap-3 pr-4">
-                                                <span class="shrink-0 font-medium text-slate-700">{{ section.label }}</span>
-                                                <el-tag size="small" :type="section.source === 'confirmed' ? 'success' : 'info'">
-                                                    {{ section.source === 'confirmed' ? '已确认' : 'AI 推荐' }}
-                                                </el-tag>
-                                                <el-tag v-if="quickReviewEditedFields.includes(section.key)" size="small" type="warning">已修改</el-tag>
-                                                <el-tag v-if="quickReviewAiAdjustedFields.includes(section.key)" size="small" type="success">AI 已调整</el-tag>
-                                                <span class="min-w-0 flex-1 truncate text-right text-sm text-gray-400">
-                                                    {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
-                                                </span>
+                                            <div class="quick-setup-review-title flex min-w-0 flex-1 items-center gap-3 pr-2">
+                                                <div class="quick-setup-review-meta flex min-w-0 flex-1 items-center gap-2">
+                                                    <span class="min-w-0 break-words font-medium text-slate-700">{{ section.label }}</span>
+                                                    <el-tag class="shrink-0" size="small" :type="section.source === 'confirmed' ? 'success' : 'info'">
+                                                        {{ section.source === 'confirmed' ? '已确认' : 'AI 推荐' }}
+                                                    </el-tag>
+                                                    <el-tag v-if="quickReviewEditedFields.includes(section.key)" class="shrink-0" size="small" type="warning">已修改</el-tag>
+                                                    <el-tag v-if="quickReviewAiAdjustedFields.includes(section.key)" class="shrink-0" size="small" type="success">AI 已调整</el-tag>
+                                                    <span class="quick-setup-review-preview min-w-0 flex-1 truncate text-right text-sm text-gray-400">
+                                                        {{ formatContextDisplayValue(section.key, quickReviewValues[section.key]) }}
+                                                    </span>
+                                                </div>
                                                 <el-button
                                                     v-if="section.key !== 'project_type'"
                                                     class="shrink-0"
@@ -2569,6 +2728,25 @@ const copyText = (value: unknown) => {
     margin-bottom: 1rem;
 }
 
+/* Element Plus makes the collapse title wrapper a flex item. Reset its
+   intrinsic width so long setup previews yield space to the action button. */
+.quick-setup-review .el-collapse-item__header,
+.quick-setup-review .el-collapse-item__header > :not(.el-collapse-item__arrow),
+.quick-setup-review-title,
+.quick-setup-review-meta {
+    min-width: 0;
+}
+
+.quick-setup-review .el-collapse-item__header {
+    height: auto;
+    min-height: 48px;
+}
+
+.quick-setup-review .el-collapse-item__arrow,
+.quick-setup-review-title .el-button {
+    flex: 0 0 auto;
+}
+
 @media (max-width: 768px) {
     .project-info-tabs .el-tabs__nav-prev,
     .project-info-tabs .el-tabs__nav-next {
@@ -2599,6 +2777,28 @@ const copyText = (value: unknown) => {
 
     .project-info-tabs .el-tabs__item {
         padding: 0 14px !important;
+    }
+
+    .quick-setup-review .el-collapse-item__header {
+        align-items: flex-start;
+        padding-top: 8px;
+        padding-bottom: 8px;
+    }
+
+    .quick-setup-review-title {
+        align-items: flex-start;
+        gap: 8px;
+        padding-right: 4px;
+    }
+
+    .quick-setup-review-meta {
+        flex-wrap: wrap;
+        align-content: center;
+        gap: 4px 6px;
+    }
+
+    .quick-setup-review-preview {
+        display: none;
     }
 }
 </style>

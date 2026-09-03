@@ -4,6 +4,7 @@ from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import models
+from services.setup_state import active_job_condition
 
 
 async def claim_generation(
@@ -22,6 +23,7 @@ async def claim_generation(
         .where(models.Project.id == project_id)
         .where(or_(models.Project.owner_id == actor_id, editor_membership))
         .where(models.Project.status != models.ProcessingStatus.GENERATING)
+        .where(~active_job_condition())
         .values(status=models.ProcessingStatus.GENERATING)
         .execution_options(synchronize_session=False)
     )

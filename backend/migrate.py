@@ -10,7 +10,8 @@ from core.config import settings
 
 BASE_DIR = Path(__file__).resolve().parent
 BASELINE_REVISION = "20260728_0001"
-HEAD_REVISION = "20260804_0004"
+OPERATIONS_REVISION = "20260804_0004"
+HEAD_REVISION = "20260903_0005"
 
 
 def alembic_config() -> Config:
@@ -51,6 +52,9 @@ def unversioned_sqlite_revision(path: Path) -> Optional[str]:
             row[1]
             for row in connection.execute("PRAGMA table_info(generation_jobs)")
         } if "generation_jobs" in tables else set()
+        project_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(projects)")
+        } if "projects" in tables else set()
     if "users" not in tables or "alembic_version" in tables:
         return None
     if "generation_jobs" in tables:
@@ -64,7 +68,9 @@ def unversioned_sqlite_revision(path: Path) -> Optional[str]:
             and "daily_token_limit" in user_columns
             and "cancel_requested" in job_columns
         ):
-            return HEAD_REVISION
+            if {"setup_revision", "setup_cache_revision"}.issubset(project_columns):
+                return HEAD_REVISION
+            return OPERATIONS_REVISION
         return "20260728_0003"
     return BASELINE_REVISION
 

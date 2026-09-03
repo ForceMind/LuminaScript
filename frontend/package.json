@@ -1,11 +1,12 @@
 {
   "name": "lumina-script-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
+    "test:async": "node --experimental-strip-types --test tests/projectRequestGuard.test.ts tests/appRequestLifecycle.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
