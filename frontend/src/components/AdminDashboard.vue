@@ -5,6 +5,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import { DataLine, Download, Upload } from '@element-plus/icons-vue'
+import { getAiBillingDisplay } from '../aiBillingDisplay'
+import { APP_VERSION } from '../version'
 
 const props = defineProps<{ token: string; currentUserId: number }>()
 const emit = defineEmits(['close'])
@@ -1411,7 +1413,15 @@ onUnmounted(() => {
             <el-tab-pane label="AI 审计日志" name="ai">
                 <el-table :data="aiLogs" stripe v-loading="loading">
                     <el-table-column prop="timestamp" label="时间" width="180" />
-                    <el-table-column prop="user_name" label="用户" width="120" />
+                    <el-table-column label="操作者" width="130">
+                        <template #default="scope">{{ getAiBillingDisplay(scope.row).actor }}</template>
+                    </el-table-column>
+                    <el-table-column label="计费对象" min-width="160">
+                        <template #default="scope">
+                            <span>{{ getAiBillingDisplay(scope.row).billed }}</span>
+                            <el-tag v-if="getAiBillingDisplay(scope.row).legacy" class="ml-2" size="small" type="info">历史记账</el-tag>
+                        </template>
+                    </el-table-column>
                     <el-table-column label="状态" width="100">
                         <template #default="scope">
                             <el-tag :type="getAiStatusType(scope.row.status)">
@@ -1485,7 +1495,7 @@ onUnmounted(() => {
                         clearable
                         filterable
                         class="!w-64"
-                        placeholder="按用户筛选"
+                        placeholder="按操作者筛选"
                     >
                         <el-option
                             v-for="item in aiUserStats"
@@ -1507,7 +1517,15 @@ onUnmounted(() => {
 
                 <el-table :data="aiContentLogs" stripe v-loading="loading">
                     <el-table-column prop="timestamp" label="时间" width="180" />
-                    <el-table-column prop="user_name" label="用户" width="120" />
+                    <el-table-column label="操作者" width="130">
+                        <template #default="scope">{{ getAiBillingDisplay(scope.row).actor }}</template>
+                    </el-table-column>
+                    <el-table-column label="计费对象" min-width="160">
+                        <template #default="scope">
+                            <span>{{ getAiBillingDisplay(scope.row).billed }}</span>
+                            <el-tag v-if="getAiBillingDisplay(scope.row).legacy" class="ml-2" size="small" type="info">历史记账</el-tag>
+                        </template>
+                    </el-table-column>
                     <el-table-column prop="action" label="操作" width="160" />
                     <el-table-column label="状态" width="100">
                         <template #default="scope">
@@ -1559,13 +1577,18 @@ onUnmounted(() => {
                 </div>
             </el-tab-pane>
         </el-tabs>
+        <p class="mt-8 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
     </div>
 
     <el-dialog v-model="aiDetailVisible" width="80%" title="AI 日志完整内容" destroy-on-close>
         <div v-loading="aiDetailLoading" class="min-h-40">
             <template v-if="aiDetail">
                 <div class="grid grid-cols-2 gap-3 mb-4 text-sm">
-                    <div><span class="text-gray-400">用户：</span>{{ aiDetail.user_name || '-' }}</div>
+                    <div><span class="text-gray-400">操作者：</span>{{ getAiBillingDisplay(aiDetail).actor }}</div>
+                    <div>
+                        <span class="text-gray-400">计费对象：</span>{{ getAiBillingDisplay(aiDetail).billed }}
+                        <el-tag v-if="getAiBillingDisplay(aiDetail).legacy" class="ml-2" size="small" type="info">历史：按操作者统计</el-tag>
+                    </div>
                     <div><span class="text-gray-400">时间：</span>{{ aiDetail.timestamp || '-' }}</div>
                     <div><span class="text-gray-400">操作：</span>{{ aiDetail.action || '-' }}</div>
                     <div><span class="text-gray-400">状态：</span>{{ aiDetail.status || 'success' }}</div>

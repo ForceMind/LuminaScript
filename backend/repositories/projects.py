@@ -40,7 +40,7 @@ async def increment_tokens(
         return
 
     await db.flush()
-    await db.execute(
+    result = await db.execute(
         update(models.Project)
         .where(models.Project.id == project.id)
         .values(
@@ -49,7 +49,8 @@ async def increment_tokens(
         .execution_options(synchronize_session=False)
     )
     await db.flush()
-    await db.refresh(project, attribute_names=["total_tokens"])
+    if int(result.rowcount or 0):
+        await db.refresh(project, attribute_names=["total_tokens"])
 
 
 async def mark_claimed_failed(db: AsyncSession, project_id: int) -> None:

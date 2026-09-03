@@ -223,7 +223,8 @@ async def test_cancel_during_llm_call_discards_returned_content(monkeypatch):
         assert project.status == models.ProcessingStatus.FAILED
         assert scene.status == models.ProcessingStatus.PENDING
         assert scene.content is None
-        assert project.total_tokens == 0
+        # Cancellation discards the draft, not already incurred model usage.
+        assert project.total_tokens == 9
 
 
 @pytest.mark.asyncio

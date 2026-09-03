@@ -38,7 +38,7 @@ from services.generation_state import (
     invalidate_scene_prompt_cache,
     record_generation_error,
 )
-from services.audit import log_ai_action
+from services.audit import log_ai_action, update_ai_action_status
 from api.auth_routes import router as auth_router
 from api.admin_routes import router as admin_router
 from api.operations_routes import admin_router as admin_operations_router
@@ -60,7 +60,7 @@ from services.project_access import (
     require_project_access,
 )
 from services.prompt_templates import get_prompt_addendum
-from services.usage import enforce_user_quota
+from services.usage import enforce_user_quota, invoke_with_quota
 from services.versions import create_project_version
 from services.setup_state import (
     assert_setup_writable,
@@ -706,6 +706,8 @@ async def ensure_story_synopsis(
     db: Optional[AsyncSession] = None,
     *,
     persist: bool = True,
+    actor_id: Optional[int] = None,
+    optional: bool = False,
 ) -> Dict[str, Any]:
     enriched_context = dict(context or {})
     has_brief = bool(str(enriched_context.get("synopsis_brief", "") or "").strip())
@@ -713,22 +715,36 @@ async def ensure_story_synopsis(
     if has_brief and has_detailed:
         return enriched_context
 
+    if db is None:
+        raise RuntimeError("Synopsis generation requires a database session for quota and audit")
+    synopsis_revision = build_setup_context_revision(project)
+
+    async def synopsis_is_stale():
+        return build_setup_context_revision(project) != synopsis_revision
+
+    if optional:
+        try:
+            await enforce_user_quota(db, project.owner_id)
+        except HTTPException as exc:
+            if exc.status_code == 429:
+                return enriched_context
+            raise
     try:
-        synopsis, synopsis_usage = await llm.generate_story_synopsis(
-            logline=project.logline or "",
-            context=enriched_context,
-            project_type=project.project_type or "movie"
+        synopsis, _ = await run_project_ai_call(
+            db=db, project=project, actor_id=actor_id or project.owner_id,
+            action="generate_story_synopsis", prompt=json.dumps(enriched_context, ensure_ascii=False),
+            stale_check=synopsis_is_stale,
+            invoke=lambda: llm.generate_story_synopsis(
+                logline=project.logline or "", context=enriched_context,
+                project_type=project.project_type or "movie"
+            ),
         )
-        if synopsis_usage:
-            if db is not None:
-                await increment_project_tokens(db, project, synopsis_usage)
-            else:
-                project.total_tokens = int(project.total_tokens or 0) + int(
-                    synopsis_usage or 0
-                )
+    except HTTPException as exc:
+        if optional and exc.status_code == 429:
+            return enriched_context
+        raise
     except Exception as exc:
-        logger.warning(f"Failed to generate story synopsis for project {project.id}: {exc}")
-        return enriched_context
+        raise HTTPException(status_code=503, detail="AI 梗概生成失败，原设定未改变，请重试。") from exc
 
     brief = str(synopsis.get("brief", "") or "").strip()
     detailed = str(synopsis.get("detailed", "") or "").strip()
@@ -988,16 +1004,94 @@ class QuickSetupAIReviseRequest(BaseModel):
         return result
 
 
-async def write_setup_ai_audit(**entry: Any) -> None:
+async def write_setup_ai_audit(**entry: Any) -> Optional[int]:
     """Fail closed before exposing/applying setup AI results if audit is down."""
     try:
-        await log_ai_action(**entry)
+        return await log_ai_action(**entry)
     except Exception as exc:
         logger.error("Setup AI audit write failed: %s", type(exc).__name__)
         raise HTTPException(
             status_code=503,
-            detail="AI 审计写入失败，原始返回记录未能确认保存，本次 AI 结果未应用；已知用量已保留，请稍后重试。",
+            detail="AI 审计写入失败，原始返回记录未能确认保存，本次 AI 结果未应用；项目存在时已保留已知项目 Token，账户用量记录可能缺失，请管理员检查后重试。",
         ) from exc
+
+
+async def run_project_ai_call(
+    *, db: AsyncSession, project: models.Project, actor_id: int,
+    action: str, prompt: str, invoke: Any, attempt: int = 1,
+    expected_status: Optional[models.ProcessingStatus] = None,
+    validate: Any = None,
+    stale_check: Any = None,
+    result_status: Any = None,
+    audit_ids: Optional[List[int]] = None,
+) -> tuple[Any, int]:
+    """Account every real call before applying its output; capture billing before await.
+
+    Quotas are soft checks, not reservations: concurrent in-flight requests may exceed
+    a limit. Known usage survives invalid responses, cancellation and audit failure.
+    """
+    project_id, billed_user_id = project.id, project.owner_id
+    await enforce_user_quota(db, billed_user_id)
+    result, usage, error, raw = None, 0, None, ""
+    try:
+        result, usage = await invoke_with_quota(billed_user_id, invoke)
+        raw = getattr(result, "raw_content", None)
+        if raw is None:
+            raw = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        if validate is not None:
+            validate(result)
+    except Exception as exc:
+        if isinstance(exc, HTTPException) and exc.status_code == 429:
+            raise
+        error = exc
+        usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
+        raw = str(getattr(exc, "raw_content", "") or raw)
+    usage = max(0, int(usage or 0))
+    if usage:
+        await increment_project_tokens(db, project, usage)
+        await db.commit()
+    live_project = await db.scalar(select(models.Project).where(models.Project.id == project_id).execution_options(populate_existing=True))
+    stale = live_project is None or (expected_status is not None and live_project.status != expected_status)
+    if not stale and stale_check is not None:
+        stale = await stale_check()
+    audit_id = await write_setup_ai_audit(
+        user_id=actor_id, billed_user_id=billed_user_id,
+        project_id=project_id if live_project is not None else None,
+        action=action, prompt=prompt, response=raw, tokens=usage,
+        status="stale" if stale else "failed" if error else result_status(result) if result_status else "success", attempt=attempt,
+        error_type="stale_context" if stale else getattr(error, "error_type", type(error).__name__) if error else None,
+        error_message="AI 返回前项目已删除或生成已停止" if stale else str(error) if error else None,
+    )
+    if audit_ids is not None and audit_id is not None:
+        audit_ids.append(audit_id)
+    if stale:
+        raise HTTPException(status_code=409, detail="AI 返回前项目已变化，本次结果未应用。")
+    if error:
+        raise error
+    return result, usage
+
+
+def validate_ai_text(value: Any) -> None:
+    if not str(value or "").strip():
+        raise ValueError("AI 返回了空正文")
+
+
+def validate_outline_batch(value: Any) -> None:
+    if not isinstance(value, list) or len(value) != 1:
+        raise ValueError("AI 分场大纲必须返回一个场次")
+    if not isinstance(value[0], dict) or not str(value[0].get("outline") or "").strip():
+        raise ValueError("AI 返回了空分场大纲")
+
+
+def validate_continuation(value: Any, scene_index: int, *, outline: bool = False) -> None:
+    if outline:
+        validate_outline_batch(value)
+        text = value[0]["outline"]
+    else:
+        validate_ai_text(value)
+        text = str(value)
+    if looks_like_story_restart(text, scene_index):
+        raise ValueError("连续性守卫拒绝了疑似重新开篇的内容")
 
 
 async def record_quick_setup_ai_revision(
@@ -1010,6 +1104,7 @@ async def record_quick_setup_ai_revision(
     response: str,
     tokens: int,
     status: str,
+    billed_user_id: Optional[int] = None,
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> None:
@@ -1026,6 +1121,7 @@ async def record_quick_setup_ai_revision(
     )
     await write_setup_ai_audit(
         user_id=current_user.id, project_id=project.id, action=action,
+        billed_user_id=billed_user_id if billed_user_id is not None else project.owner_id,
         prompt=prompt, response=response, tokens=token_count, status=status,
         step_key=QUICK_REVIEW_FIELD, error_type=error_type, error_message=error_message,
     )
@@ -1045,21 +1141,36 @@ async def review_content(
     Review free user text and return whether it should be rewritten,
     plus an AI-generated safe rewrite suggestion.
     """
-    await enforce_user_quota(db, current_user.id)
+    if llm.review_requires_ai(payload.text):
+        await enforce_user_quota(db, current_user.id)
     try:
         template_instructions = await get_prompt_addendum(
             db,
             stage="review",
             project_type="all",
         )
-        result = await llm.review_user_input(
+        result = await invoke_with_quota(current_user.id, lambda: llm.review_user_input(
             payload.text,
             template_instructions=template_instructions,
-        )
-        return result
+        ))
     except Exception as e:
-        logger.error(f"Content review failed: {e}")
-        raise HTTPException(status_code=503, detail="Content review service unavailable")
+        if isinstance(e, HTTPException) and e.status_code == 429:
+            raise
+        await write_setup_ai_audit(
+            user_id=current_user.id, billed_user_id=current_user.id, project_id=None,
+            action="review_content", prompt=payload.text,
+            response=str(getattr(e, "raw_content", "") or ""), tokens=max(0, int(getattr(e, "usage", 0) or 0)),
+            status="failed", error_type=getattr(e, "error_type", type(e).__name__), error_message=str(e),
+        )
+        raise HTTPException(status_code=503, detail="Content review service unavailable") from e
+    usage = max(0, int(getattr(result, "usage", 0) or 0))
+    if getattr(result, "ai_called", llm.review_requires_ai(payload.text)):
+        await write_setup_ai_audit(
+            user_id=current_user.id, billed_user_id=current_user.id, project_id=None,
+            action="review_content", prompt=payload.text,
+            response=getattr(result, "raw_content", json.dumps(result, ensure_ascii=False)), tokens=usage,
+        )
+    return {**result, "tokens_used": usage}
 
 @app.post("/projects/{project_id}/interact")
 async def submit_interaction(
@@ -1198,9 +1309,11 @@ async def generate_validated_setup_options(
             previous_value = values[step_key].strip()
     excluded = {previous_value} if previous_value else set()
     total_usage = 0
+    billed_user_id = project.owner_id
     final_question = question
     rejection_summary: List[Dict[str, Any]] = []
     for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
+        await enforce_user_quota(db, billed_user_id)
         rejected: Dict[str, int] = {}
 
         def reject(reason: str, count: int = 1) -> None:
@@ -1226,10 +1339,10 @@ async def generate_validated_setup_options(
         error_type = None
         error_message = None
         try:
-            data, usage = await llm.generate_interaction_options(
+            data, usage = await invoke_with_quota(billed_user_id, lambda: llm.generate_interaction_options(
                 step_key, question, call_context,
                 template_instructions=template_instructions,
-            )
+            ))
             raw_content = getattr(data, "raw_content", json.dumps(data, ensure_ascii=False))
             for item in getattr(data, "rejection_summary", [])[:8]:
                 reject(item.get("reason", "字段格式不符合约束"), item.get("count", 1))
@@ -1263,6 +1376,8 @@ async def generate_validated_setup_options(
                 if len(accepted) == 3:
                     break
         except Exception as exc:
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                raise
             usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
             raw_content = str(getattr(exc, "raw_content", "") or raw_content)
             error_type = str(getattr(exc, "error_type", type(exc).__name__))
@@ -1286,6 +1401,7 @@ async def generate_validated_setup_options(
         status = "stale" if stale else "success" if len(accepted) == 3 else "partial" if accepted and attempt < MAX_INTERACTION_ATTEMPTS else "failed"
         await write_setup_ai_audit(
             user_id=current_user.id, project_id=project.id, action=action,
+            billed_user_id=billed_user_id,
             prompt=call_context, response=raw_content, tokens=usage, status=status,
             step_key=QUICK_REVIEW_FIELD if action == "regenerate_quick_setup_field" else step_key,
             error_type="stale_context" if stale else error_type or (None if len(accepted) == 3 else "insufficient_valid_options"),
@@ -1350,6 +1466,7 @@ async def revise_quick_setup_with_ai(
                     "changes": [], "changed_fields": [], "summary": note, "tokens_used": 0,
                     "total_tokens": int(project.total_tokens or 0), "context_revision": payload.context_revision}
     await enforce_user_quota(db, project.owner_id)
+    billed_user_id = project.owner_id
     template_instructions = await get_prompt_addendum(db, stage="interaction", project_type=values.get("project_type", "all"))
     audit_prompt = json.dumps({
         "operation": payload.operation, "scope": payload.scope,
@@ -1376,13 +1493,13 @@ async def revise_quick_setup_with_ai(
     revised: Dict[str, str] = {}
     summary = ""
     try:
-        revised, summary, usage = await llm.revise_quick_setup_fields(
+        revised, summary, usage = await invoke_with_quota(billed_user_id, lambda: llm.revise_quick_setup_fields(
             logline=project.logline or "", values=values, allowed_fields=allowed,
             instruction=payload.instruction or "", operation=payload.operation,
             scope=payload.scope, template_instructions=template_instructions,
             baseline_values=baseline, changed_fields=changed_fields,
             locked_fields=locked_fields, invalid_changed_fields=invalid_changed_fields,
-        )
+        ))
         raw_content = getattr(revised, "raw_content", json.dumps({"fields": revised, "summary": summary}, ensure_ascii=False))
         setup_fields.validate_safety(revised, allowed=set(allowed))
         if not isinstance(summary, str) or len(summary) > MAX_INTERACTION_ANSWER_LENGTH:
@@ -1390,15 +1507,17 @@ async def revise_quick_setup_with_ai(
         normalized_revised = {field: setup_fields.normalize_field(field, value) for field, value in revised.items()}
         setup_fields.validate_safety({**values, **normalized_revised})
     except Exception as exc:
+        if isinstance(exc, HTTPException) and exc.status_code == 429:
+            raise
         usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
         await record_quick_setup_ai_revision(
             db=db, project=project, current_user=current_user, operation=payload.operation,
             prompt=audit_prompt, response=str(getattr(exc, "raw_content", "") or raw_content),
             tokens=usage, status="failed",
+            billed_user_id=billed_user_id,
             error_type=getattr(exc, "error_type", "invalid_ai_candidate"), error_message=str(exc),
         )
         raise HTTPException(status_code=503, detail="AI 修订结果无效，原草案未改变，请重试。") from exc
-    await db.refresh(project, attribute_names=["setup_revision", "setup_cache_revision", "status"])
     stale = payload.context_revision != build_setup_context_revision(project)
     if not stale:
         try:
@@ -1411,6 +1530,7 @@ async def revise_quick_setup_with_ai(
         db=db, project=project, current_user=current_user, operation=payload.operation,
         prompt=audit_prompt, response=raw_content, tokens=usage,
         status="stale" if stale else "success",
+        billed_user_id=billed_user_id,
         error_type="stale_context" if stale else None,
         error_message="AI 返回前项目设定已更新或开始生成" if stale else None,
     )
@@ -1543,8 +1663,8 @@ async def analyze_logline(
     if saved_draft is not None and saved_mode != SETUP_MODE_GUIDED:
         return with_runtime_meta(working_draft_payload(project, saved_draft, stale=saved_stale))
 
-    await enforce_user_quota(db, project.owner_id)
     await assert_setup_writable(db, project, build_setup_context_revision(project))
+    billed_user_id = project.owner_id
     normalization_revision = build_setup_context_revision(project)
     normalized_draft = detached_setup(project)
     normalized = False
@@ -1591,6 +1711,7 @@ async def analyze_logline(
             )
 
     if saved_draft is None and should_auto_prefill_from_logline(project, normalized_context):
+        await enforce_user_quota(db, billed_user_id)
         prefill_revision = build_setup_context_revision(project)
         prefill_draft = detached_setup(project)
         filled_fields: List[str] = []
@@ -1600,10 +1721,12 @@ async def analyze_logline(
         prefill_error = None
         prefill_raw = ""
         try:
-            extracted_setup, prefill_usage = await llm.extract_setup_from_long_input(project.logline or "")
+            extracted_setup, prefill_usage = await invoke_with_quota(billed_user_id, lambda: llm.extract_setup_from_long_input(project.logline or ""))
             prefill_raw = getattr(extracted_setup, "raw_content", json.dumps(extracted_setup, ensure_ascii=False))
             filled_fields, prefill_changed = apply_auto_prefill(prefill_draft, extracted_setup)
         except Exception as exc:
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                raise
             prefill_error = exc
             prefill_usage = max(int(prefill_usage or 0), int(getattr(exc, "usage", 0) or 0))
             prefill_raw = str(getattr(exc, "raw_content", "") or prefill_raw)
@@ -1621,6 +1744,7 @@ async def analyze_logline(
             stale = True
         await write_setup_ai_audit(
             user_id=current_user.id, project_id=project_id, action="auto_prefill_setup",
+            billed_user_id=billed_user_id,
             prompt=project.logline or "", response=prefill_raw, tokens=prefill_usage,
             status="stale" if stale else "failed" if prefill_error else "success",
             error_type="stale_context" if stale else getattr(prefill_error, "error_type", type(prefill_error).__name__) if prefill_error else None,
@@ -1669,17 +1793,20 @@ async def analyze_logline(
         draft_usage = 0
         last_error: Optional[Exception] = None
         for attempt in range(1, MAX_INTERACTION_ATTEMPTS + 1):
+            await enforce_user_quota(db, billed_user_id)
             attempt_usage = 0
             raw_content = ""
             error_type = None
             try:
-                generated_values, attempt_usage = await llm.generate_quick_setup_draft(
+                generated_values, attempt_usage = await invoke_with_quota(billed_user_id, lambda: llm.generate_quick_setup_draft(
                     logline=project.logline or "", current_context=normalized_context,
                     field_specs=field_specs, template_instructions=interaction_template,
-                )
+                ))
                 raw_content = getattr(generated_values, "raw_content", json.dumps(generated_values, ensure_ascii=False))
                 draft_values = normalize_quick_setup_values(project, generated_values)
             except Exception as exc:
+                if isinstance(exc, HTTPException) and exc.status_code == 429:
+                    raise
                 last_error = exc
                 draft_values = None
                 attempt_usage = max(int(attempt_usage or 0), int(getattr(exc, "usage", 0) or 0))
@@ -1699,6 +1826,7 @@ async def analyze_logline(
                 stale = True
             await write_setup_ai_audit(
                 user_id=current_user.id, project_id=project_id,
+                billed_user_id=billed_user_id,
                 action="generate_quick_setup_draft", prompt=project.logline or "",
                 response=raw_content, tokens=attempt_usage,
                 status="stale" if stale else "success" if draft_values is not None else "failed",
@@ -1870,6 +1998,8 @@ async def analyze_logline(
             normalized_context,
             db,
             persist=False,
+            actor_id=current_user.id,
+            optional=True,
         )
         # Synopsis enrichment is a setup write as well; preserve internal fields.
         enriched_context = {**get_internal_project_context(project), **normalized_context}
@@ -1984,15 +2114,17 @@ async def generate_scenes(
     if role not in {"owner", "editor"}:
         raise HTTPException(status_code=404, detail="Project not found")
     project.access_role = role
-    await enforce_user_quota(db, project.owner_id)
-
     if not await claim_generation(db, project_id, current_user.id):
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
     await db.commit()
     await db.refresh(project)
 
-    c = await ensure_story_synopsis(project, project.global_context or {}, db)
+    try:
+        c = await ensure_story_synopsis(project, project.global_context or {}, db, actor_id=current_user.id)
+    except Exception:
+        await mark_claimed_project_failed(db, project_id)
+        raise
     project.global_context = c
 
     # Use selected_option if string generic, or fallback to stored context values
@@ -2124,22 +2256,26 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
 
                 end_idx = min(current_idx + batch_size - 1, target_count)
                 logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
-                await enforce_user_quota(db, project.owner_id)
-
                 continuity_context = build_outline_continuity_context(
                     story_bible=story_bible,
                     prior_scenes=generated_scenes,
                     current_index=current_idx,
                     total_scenes=target_count,
                 )
-                batch_scenes, usage = await llm.generate_scene_batch(
-                    project.logline, 
-                    style_context, 
-                    current_idx, 
-                    end_idx, 
-                    previous_context=continuity_context,
-                    total_target=target_count,
-                    template_instructions=template_instructions,
+                batch_scenes, usage = await run_project_ai_call(
+                    db=db, project=project, actor_id=user_id, action=f"outline_scene_{current_idx}",
+                    prompt=continuity_context, expected_status=models.ProcessingStatus.GENERATING,
+                    validate=validate_outline_batch,
+                    result_status=lambda value: "partial" if looks_like_story_restart(value[0]["outline"], current_idx) else "success",
+                    invoke=lambda: llm.generate_scene_batch(
+                        project.logline,
+                        style_context,
+                        current_idx,
+                        end_idx,
+                        previous_context=continuity_context,
+                        total_target=target_count,
+                        template_instructions=template_instructions,
+                    ),
                 )
                 await db.refresh(project)
                 if project.status != models.ProcessingStatus.GENERATING:
@@ -2167,14 +2303,19 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                             "禁止使用‘故事开始、序幕、初次相遇、第一次见面’等重启表达。"
                         ),
                     )
-                    retry_scenes, retry_usage = await llm.generate_scene_batch(
-                        project.logline,
-                        style_context,
-                        current_idx,
-                        end_idx,
-                        previous_context=guarded_context,
-                        total_target=target_count,
-                        template_instructions=template_instructions,
+                    retry_scenes, retry_usage = await run_project_ai_call(
+                        db=db, project=project, actor_id=user_id, action=f"outline_scene_{current_idx}",
+                        prompt=guarded_context, attempt=2, expected_status=models.ProcessingStatus.GENERATING,
+                        validate=lambda value: validate_continuation(value, current_idx, outline=True),
+                        invoke=lambda: llm.generate_scene_batch(
+                            project.logline,
+                            style_context,
+                            current_idx,
+                            end_idx,
+                            previous_context=guarded_context,
+                            total_target=target_count,
+                            template_instructions=template_instructions,
+                        ),
                     )
                     await db.refresh(project)
                     if project.status != models.ProcessingStatus.GENERATING:
@@ -2199,8 +2340,6 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                         f"{len(batch_scenes or [])} items; expected {batch_size}."
                     )
 
-                await increment_project_tokens(db, project, usage)
-
                 # Enforce strictly sequential indexing; never trust the model's index.
                 for offset, scene_data in enumerate(batch_scenes):
                     outline = str(scene_data.get("outline", "") or "").strip()
@@ -2218,47 +2357,22 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                     generated_scenes.append(new_scene)
 
                 await db.commit()
-                try:
-                    await log_ai_action(
-                        user_id=user_id,
-                        project_id=project_id,
-                        action=f"outline_scene_{current_idx}",
-                        prompt=f"scene={current_idx}/{target_count}",
-                        response=first_outline,
-                        tokens=usage,
-                        step_key=f"outline:{current_idx}",
-                    )
-                except Exception as log_exc:
-                    logger.error("[Task] Failed to persist outline usage: %s", log_exc)
-
                 current_idx += batch_size
         except Exception as exc:
             await db.rollback()
+            if isinstance(exc, HTTPException) and exc.status_code == 409:
+                return
             logger.exception(f"[Task] Outline generation failed: {exc}")
             project = await db.get(models.Project, project_id)
             if project:
                 project.status = models.ProcessingStatus.FAILED
                 record_generation_error(project, exc, stage="outline")
                 await db.commit()
-            try:
-                await log_ai_action(
-                    user_id=user_id,
-                    project_id=project_id,
-                    action="generate_outline",
-                    prompt=f"target_count={target_count}; style={style_context}",
-                    response="",
-                    tokens=0,
-                    status="failed",
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                )
-            except Exception as log_exc:
-                logger.error(f"[Task] Failed to persist outline error log: {log_exc}")
             return
 
         # After Outline Complete -> Trigger Content Generation
         logger.info("[Task] Outline Complete. Starting Content Gen Loop...")
-        await run_generation_loop(project.id)
+        await run_generation_loop(project.id, user_id=user_id)
 
 
 @app.post("/projects/{project_id}/scenes/{scene_index}/regenerate")
@@ -2271,8 +2385,6 @@ async def regenerate_scene(
     project, _ = await require_project_access(
         db, project_id, current_user.id, minimum_role="editor"
     )
-    await enforce_user_quota(db, project.owner_id)
-
     result = await db.execute(
         select(models.Scene)
         .where(models.Scene.project_id == project_id)
@@ -2319,7 +2431,7 @@ async def regenerate_scene(
             db,
             project_id=project_id,
             kind=CONTENT_JOB,
-            payload={"scene_index": scene_index},
+            payload={"scene_index": scene_index, "user_id": current_user.id},
         )
         await db.commit()
     except Exception as exc:
@@ -2348,8 +2460,6 @@ async def rewrite_scene_to_prompt(
     project, _ = await require_project_access(
         db, project_id, current_user.id, minimum_role="editor"
     )
-    await enforce_user_quota(db, project.owner_id)
-
     result = await db.execute(
         select(models.Scene)
         .where(models.Scene.project_id == project_id)
@@ -2389,39 +2499,40 @@ async def rewrite_scene_to_prompt(
         project_type=project.project_type,
     )
 
+    async def prompt_is_stale():
+        current_scene = await db.scalar(select(models.Scene).where(models.Scene.id == prompt_scene_id).execution_options(populate_existing=True))
+        return (build_setup_context_revision(project) != prompt_revision
+                or project.status == models.ProcessingStatus.GENERATING
+                or current_scene is None or current_scene.status != models.ProcessingStatus.COMPLETED
+                or current_scene.outline != prompt_scene_outline or current_scene.content != prompt_scene_content)
+
+    def validate_prompt(value):
+        if not str(value or "").strip():
+            raise ValueError("AI 未返回有效提示词")
+
+    prompt_audit_ids: List[int] = []
     try:
-        prompt_text, usage = await llm.rewrite_scene_to_ai_prompt(
-            project_type=project.project_type or "movie",
-            logline=project.logline or "",
-            style_guide=project.genre or "",
-            scene_outline=scene.outline or "",
-            scene_content=scene.content or "",
-            scene_index=scene_index,
-            template_instructions=prompt_template,
+        prompt_text, usage = await run_project_ai_call(
+            db=db, project=project, actor_id=prompt_actor_id,
+            action=f"scene_to_prompt_{scene_index}", prompt=rewrite_prompt,
+            stale_check=prompt_is_stale, validate=validate_prompt,
+            audit_ids=prompt_audit_ids,
+            invoke=lambda: llm.rewrite_scene_to_ai_prompt(
+                project_type=project.project_type or "movie",
+                logline=project.logline or "",
+                style_guide=project.genre or "",
+                scene_outline=scene.outline or "",
+                scene_content=scene.content or "",
+                scene_index=scene_index,
+                template_instructions=prompt_template,
+            ),
         )
+    except HTTPException:
+        raise
     except Exception as exc:
-        await log_ai_action(
-            user_id=current_user.id,
-            project_id=project_id,
-            action=f"scene_to_prompt_{scene_index}",
-            prompt=rewrite_prompt,
-            response="",
-            tokens=0,
-            status="failed",
-            step_key=f"scene:{scene_index}",
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-        )
-        raise HTTPException(status_code=503, detail="AI 提示词转写失败，请稍后重试")
+        raise HTTPException(status_code=503, detail="AI 提示词转写失败，请稍后重试") from exc
 
     final_prompt = str(prompt_text or "").strip()
-    if not final_prompt:
-        raise HTTPException(status_code=503, detail="AI 未返回有效提示词，请稍后重试")
-
-    # Preserve known usage even when the response is no longer applicable.
-    # Never put the pre-AI context back on the tracked ORM object.
-    await increment_project_tokens(db, project, usage)
-    await db.commit()
     try:
         await write_scene_prompt_cache(
             db, project, prompt_revision,
@@ -2433,25 +2544,16 @@ async def rewrite_scene_to_prompt(
     except HTTPException as exc:
         if exc.status_code != 409:
             raise
-        await log_ai_action(
-            user_id=prompt_actor_id, project_id=project_id,
-            action=f"scene_to_prompt_{scene_index}", prompt=rewrite_prompt,
-            response=final_prompt, tokens=int(usage or 0), status="stale",
-            step_key=f"scene:{scene_index}", error_type="stale_context",
-            error_message="提示词返回前项目设定、生成状态或场次内容已变化",
-        )
+        # CAS is the final arbiter: if it lost a race after pre-audit validation,
+        # revise the existing row, never append another charged usage record.
+        await db.rollback()
+        try:
+            for audit_id in prompt_audit_ids:
+                await update_ai_action_status(audit_id, status="stale", error_type="stale_context",
+                                              error_message="提示词返回后、保存前项目设定或场次内容已变化")
+        except Exception as audit_exc:
+            raise HTTPException(status_code=503, detail="AI 审计最终状态写入失败，本次结果未应用，请管理员检查。") from audit_exc
         raise HTTPException(status_code=409, detail="提示词生成期间项目已更新，请刷新后重试。") from exc
-
-    await log_ai_action(
-        user_id=current_user.id,
-        project_id=project_id,
-        action=f"scene_to_prompt_{scene_index}",
-        prompt=rewrite_prompt,
-        response=final_prompt,
-        tokens=int(usage or 0),
-        status="success",
-        step_key=f"scene:{scene_index}",
-    )
 
     return {"scene_index": scene_index, "prompt": final_prompt, "cached": False}
 
@@ -2554,7 +2656,7 @@ async def export_project(
 
 # --- Background Task (The Engine) ---
 
-async def _run_generation_loop(project_id: int):
+async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
     """
     The Core Loop: Iterates scenes and generates content with Rolling Summary.
     """
@@ -2565,6 +2667,7 @@ async def _run_generation_loop(project_id: int):
         if not project: 
             logger.error(f"[后台任务] 项目 {project_id} 未找到，任务中止")
             return
+        actor_id = user_id or project.owner_id
         if project.status != models.ProcessingStatus.GENERATING:
             logger.info(f"[后台任务] 项目 {project_id} 当前不是生成状态，任务中止")
             return
@@ -2624,7 +2727,6 @@ async def _run_generation_loop(project_id: int):
             usage = 0
             continuity_context = ""
             try:
-                await enforce_user_quota(db, project.owner_id)
                 continuity_context = build_content_continuity_context(
                     story_bible=story_bible,
                     completed_scenes=completed_scenes,
@@ -2632,23 +2734,35 @@ async def _run_generation_loop(project_id: int):
                     total_scenes=total_scenes,
                 )
                 if project.project_type == "short_video":
-                    generated_content, usage = await llm.write_short_video_prompt(
-                        logline=project.logline,
-                        style_guide=project.genre,
-                        current_scene_outline=scene_outline,
-                        clip_index=scene_index,
-                        previous_context=continuity_context,
-                        template_instructions=template_instructions,
+                    generated_content, usage = await run_project_ai_call(
+                        db=db, project=project, actor_id=actor_id, action=f"write_scene_{scene_index}",
+                        prompt=continuity_context, expected_status=models.ProcessingStatus.GENERATING,
+                        validate=validate_ai_text,
+                        result_status=lambda value: "partial" if looks_like_story_restart(str(value), scene_index) else "success",
+                        invoke=lambda: llm.write_short_video_prompt(
+                            logline=project.logline,
+                            style_guide=project.genre,
+                            current_scene_outline=scene_outline,
+                            clip_index=scene_index,
+                            previous_context=continuity_context,
+                            template_instructions=template_instructions,
+                        ),
                     )
                 else:
-                    generated_content, usage = await llm.write_scene_content(
-                        logline=project.logline,
-                        style_guide=project.genre,
-                        current_scene_outline=scene_outline,
-                        previous_context=continuity_context,
-                        scene_index=scene_index,
-                        total_scenes=total_scenes,
-                        template_instructions=template_instructions,
+                    generated_content, usage = await run_project_ai_call(
+                        db=db, project=project, actor_id=actor_id, action=f"write_scene_{scene_index}",
+                        prompt=continuity_context, expected_status=models.ProcessingStatus.GENERATING,
+                        validate=validate_ai_text,
+                        result_status=lambda value: "partial" if looks_like_story_restart(str(value), scene_index) else "success",
+                        invoke=lambda: llm.write_scene_content(
+                            logline=project.logline,
+                            style_guide=project.genre,
+                            current_scene_outline=scene_outline,
+                            previous_context=continuity_context,
+                            scene_index=scene_index,
+                            total_scenes=total_scenes,
+                            template_instructions=template_instructions,
+                        ),
                     )
 
                 await db.refresh(project)
@@ -2673,23 +2787,33 @@ async def _run_generation_loop(project_id: int):
                         "并保留人物当前的记忆、关系、位置、伤情、道具和未解线索。"
                     )
                     if project.project_type == "short_video":
-                        retry_content, retry_usage = await llm.write_short_video_prompt(
-                            logline=project.logline,
-                            style_guide=project.genre,
-                            current_scene_outline=scene_outline,
-                            clip_index=scene_index,
-                            previous_context=guarded_context,
-                            template_instructions=template_instructions,
+                        retry_content, retry_usage = await run_project_ai_call(
+                            db=db, project=project, actor_id=actor_id, action=f"write_scene_{scene_index}",
+                            prompt=guarded_context, attempt=2, expected_status=models.ProcessingStatus.GENERATING,
+                            validate=lambda value: validate_continuation(value, scene_index),
+                            invoke=lambda: llm.write_short_video_prompt(
+                                logline=project.logline,
+                                style_guide=project.genre,
+                                current_scene_outline=scene_outline,
+                                clip_index=scene_index,
+                                previous_context=guarded_context,
+                                template_instructions=template_instructions,
+                            ),
                         )
                     else:
-                        retry_content, retry_usage = await llm.write_scene_content(
-                            logline=project.logline,
-                            style_guide=project.genre,
-                            current_scene_outline=scene_outline,
-                            previous_context=guarded_context,
-                            scene_index=scene_index,
-                            total_scenes=total_scenes,
-                            template_instructions=template_instructions,
+                        retry_content, retry_usage = await run_project_ai_call(
+                            db=db, project=project, actor_id=actor_id, action=f"write_scene_{scene_index}",
+                            prompt=guarded_context, attempt=2, expected_status=models.ProcessingStatus.GENERATING,
+                            validate=lambda value: validate_continuation(value, scene_index),
+                            invoke=lambda: llm.write_scene_content(
+                                logline=project.logline,
+                                style_guide=project.genre,
+                                current_scene_outline=scene_outline,
+                                previous_context=guarded_context,
+                                scene_index=scene_index,
+                                total_scenes=total_scenes,
+                                template_instructions=template_instructions,
+                            ),
                         )
                     await db.refresh(project)
                     if project.status != models.ProcessingStatus.GENERATING:
@@ -2705,7 +2829,6 @@ async def _run_generation_loop(project_id: int):
                     ):
                         raise RuntimeError("连续性守卫拒绝了疑似重新开篇的场次正文")
 
-                await increment_project_tokens(db, project, usage)
                 scene.content = generated_content
                 scene.summary = summarize_scene_for_continuity(
                     scene_outline,
@@ -2721,6 +2844,8 @@ async def _run_generation_loop(project_id: int):
                 logger.info(f"[后台任务] 第 {scene_index} 场生成完成")
             except Exception as exc:
                 await db.rollback()
+                if isinstance(exc, HTTPException) and exc.status_code == 409:
+                    return
                 project = await db.get(models.Project, project_id)
                 failed_scene = await db.get(models.Scene, scene_id)
                 if project:
@@ -2728,57 +2853,22 @@ async def _run_generation_loop(project_id: int):
                     record_generation_error(project, exc, stage=f"scene:{scene_index}")
                 if failed_scene:
                     failed_scene.status = models.ProcessingStatus.FAILED
-                if project and usage:
-                    await increment_project_tokens(db, project, usage)
                 await db.commit()
 
                 logger.exception(
                     f"[后台任务] 第 {scene_index} 场生成失败: {exc}"
                 )
-                try:
-                    await log_ai_action(
-                        user_id=project.owner_id if project else 0,
-                        project_id=project_id,
-                        action=f"write_scene_{scene_index}",
-                        prompt=(
-                            f"Outline: {scene_outline}, "
-                            f"PrevContextLength: {len(continuity_context)}"
-                        ),
-                        response=generated_content,
-                        tokens=usage,
-                        status="failed",
-                        step_key=f"scene:{scene_index}",
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                except Exception as log_exc:
-                    logger.error(f"[后台任务] 记录生成失败日志时出错: {log_exc}")
                 return
-
-            try:
-                await log_ai_action(
-                    user_id=project.owner_id,
-                    project_id=project.id,
-                    action=f"write_scene_{scene_index}",
-                    prompt=(
-                        f"Outline: {scene_outline}, "
-                        f"PrevContextLength: {len(continuity_context)}"
-                    ),
-                    response=generated_content,
-                    tokens=usage,
-                )
-            except Exception as log_exc:
-                logger.error(f"[后台任务] 记录生成成功日志时出错: {log_exc}")
 
         project.status = models.ProcessingStatus.COMPLETED
         await db.commit()
         logger.info(f"[后台任务] 项目 {project_id} 所有剧本生成任务完成！")
 
 
-async def run_generation_loop(project_id: int):
+async def run_generation_loop(project_id: int, user_id: Optional[int] = None):
     """Run the generation engine and guarantee a terminal failure state."""
     try:
-        await _run_generation_loop(project_id)
+        await _run_generation_loop(project_id, user_id=user_id)
     except Exception as exc:
         logger.exception(
             "[后台任务] 项目 %s 发生未处理的生成错误: %s",

@@ -2865,6 +2865,9 @@ const copyText = (value: unknown) => {
                             <div class="text-xs text-gray-400 mt-2">额度：{{ myUsage.monthly_limit || '不限' }}</div>
                         </div>
                     </div>
+                    <p class="mt-4 text-xs leading-5 text-gray-400">
+                        用量按计费归属统计：项目内 AI 调用计入项目所有者，个人内容审核计入实际操作者；历史日志仍按原操作者兼容统计。
+                    </p>
                 </el-tab-pane>
             </el-tabs>
         </div>

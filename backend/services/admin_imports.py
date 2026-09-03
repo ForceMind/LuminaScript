@@ -213,6 +213,9 @@ async def import_admin_export(
                 genre=_text(item.get("genre"), maximum=100_000) or None,
                 global_context=context if isinstance(context, dict) else {},
                 global_summary=_text(item.get("global_summary"), maximum=500_000) or None,
+                setup_revision=_integer(item.get("setup_revision"), maximum=2**63 - 1),
+                setup_cache_revision=_integer(item.get("setup_cache_revision"), maximum=2**63 - 1),
+                quick_setup_draft=item.get("quick_setup_draft"),
                 total_tokens=_integer(item.get("total_tokens")),
                 status=_processing_status(
                     item.get("status"),
@@ -263,11 +266,19 @@ async def import_admin_export(
         created_ai_logs = 0
         for item in payload["ai_logs"]:
             user = source_user_ids.get(_integer(item.get("user_id"), minimum=1)) or importing_admin
+            billed_user = None
+            if item.get("billed_user_id") is not None:
+                billed_user = source_user_ids.get(_integer(item.get("billed_user_id"), minimum=1))
+                if not billed_user:
+                    billed_user = users_by_username.get(_text(item.get("billed_username"), maximum=64))
+                if not billed_user:
+                    raise ValueError("AI 日志的计费用户无法映射，已取消导入以避免错误归账")
             source_project_id = _integer(item.get("project_id"), minimum=1)
             imported_project = source_project_ids.get(source_project_id) if source_project_id else None
             db.add(
                 models.AIInteractionLog(
                     user_id=user.id,
+                    billed_user_id=billed_user.id if billed_user else None,
                     project_id=imported_project.id if imported_project else None,
                     action=_text(item.get("action"), maximum=255),
                     prompt=_text(item.get("prompt")),

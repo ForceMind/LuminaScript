@@ -30,7 +30,7 @@ class User(Base):
     
     projects = relationship("Project", back_populates="owner")
     login_logs = relationship("LoginLog", back_populates="user")
-    ai_logs = relationship("AIInteractionLog", back_populates="user")
+    ai_logs = relationship("AIInteractionLog", back_populates="user", foreign_keys="AIInteractionLog.user_id")
     project_memberships = relationship(
         "ProjectMember",
         back_populates="user",
@@ -55,6 +55,8 @@ class AIInteractionLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
+    # NULL preserves the historical actor-based attribution; never backfill.
+    billed_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     action = Column(String) # analyze, generate_scene, etc.
     prompt = Column(Text)
@@ -67,7 +69,8 @@ class AIInteractionLog(Base):
     attempt = Column(Integer, default=1)
     timestamp = Column(String) # ISO format
 
-    user = relationship("User", back_populates="ai_logs")
+    user = relationship("User", back_populates="ai_logs", foreign_keys=[user_id])
+    billed_user = relationship("User", foreign_keys=[billed_user_id])
 
 class Project(Base):
     __tablename__ = "projects"

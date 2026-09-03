@@ -129,6 +129,7 @@ async def build_backup_archive(db: AsyncSession, actor_name: str) -> bytes:
     jobs = (await db.execute(select(models.GenerationJob).order_by(models.GenerationJob.id))).scalars().all()
     login_logs = (await db.execute(select(models.LoginLog).order_by(models.LoginLog.id))).scalars().all()
     ai_logs = (await db.execute(select(models.AIInteractionLog).order_by(models.AIInteractionLog.id))).scalars().all()
+    user_names = {user.id: user.username for user in users}
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         manifest = {
@@ -169,13 +170,18 @@ async def build_backup_archive(db: AsyncSession, actor_name: str) -> bytes:
             json.dumps(
                 [
                     {
+                        "id": p.id,
                         "owner_id": p.owner_id,
+                        "owner_username": user_names.get(p.owner_id, ""),
                         "title": p.title,
                         "logline": p.logline,
                         "project_type": p.project_type,
                         "genre": p.genre,
                         "global_context": p.global_context or {},
                         "global_summary": p.global_summary,
+                        "setup_revision": int(p.setup_revision or 0),
+                        "setup_cache_revision": int(p.setup_cache_revision or 0),
+                        "quick_setup_draft": p.quick_setup_draft,
                         "total_tokens": int(p.total_tokens or 0),
                         "scenes": [
                             {
@@ -292,6 +298,8 @@ async def build_backup_archive(db: AsyncSession, actor_name: str) -> bytes:
                 [
                     {
                         "user_id": item.user_id,
+                        "billed_user_id": item.billed_user_id,
+                        "billed_username": user_names.get(item.billed_user_id),
                         "project_id": item.project_id,
                         "action": item.action,
                         "prompt": item.prompt,
@@ -403,12 +411,14 @@ async def restore_projects_as_copies(
         payload = decrypt_backup(payload)
     with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
         projects = json.loads(archive.read("projects.json"))
-    existing_users = set((await db.scalars(select(models.User.id))).all())
+        source_users = json.loads(archive.read("users.json")) if "users.json" in archive.namelist() else []
+    existing_users = (await db.scalars(select(models.User))).all()
+    users_by_name = {user.username: user.id for user in existing_users}
+    source_user_map = {int(user["id"]): users_by_name.get(user.get("username")) for user in source_users if user.get("id")}
     restored = 0
     for item in projects:
-        owner_id = int(item.get("owner_id") or fallback_owner_id)
-        if owner_id not in existing_users:
-            owner_id = fallback_owner_id
+        owner_id = (source_user_map.get(int(item.get("owner_id") or 0))
+                    or users_by_name.get(item.get("owner_username")) or fallback_owner_id)
         project = models.Project(
             owner_id=owner_id,
             title=f"{item.get('title') or '恢复项目'}（恢复副本）",
@@ -417,6 +427,9 @@ async def restore_projects_as_copies(
             genre=item.get("genre"),
             global_context=item.get("global_context") or {},
             global_summary=item.get("global_summary"),
+            setup_revision=int(item.get("setup_revision") or 0),
+            setup_cache_revision=int(item.get("setup_cache_revision") or 0),
+            quick_setup_draft=item.get("quick_setup_draft"),
             total_tokens=int(item.get("total_tokens") or 0),
             status=models.ProcessingStatus.PENDING,
         )

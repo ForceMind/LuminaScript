@@ -510,7 +510,7 @@ async def test_generation_entries_refresh_after_claim_and_preserve_concurrent_se
             assert version.snapshot["global_context"]["tone"] == "claim前另一会话确认的设定"
         else:
             assert "_last_generation_error" not in project.global_context
-            assert queued.payload == old_job.payload
+            assert queued.payload == {**old_job.payload, "user_id": admin.id if operation == "admin_retry" else owner.id}
             assert queued.max_attempts == old_job.max_attempts
 
 
@@ -554,7 +554,8 @@ async def test_concurrent_retry_only_one_claims_before_mutating_scenes(monkeypat
         assert len(jobs) == 2
         assert jobs[0].status == models.JobStatus.FAILED
         assert jobs[1].status == models.JobStatus.QUEUED
-        assert jobs[1].payload == jobs[0].payload
+        assert {key: value for key, value in jobs[1].payload.items() if key != "user_id"} == jobs[0].payload
+        assert jobs[1].payload["user_id"] in ({1, 2} if callers == "mixed" else {2} if callers == "admin" else {1})
         assert jobs[1].max_attempts == jobs[0].max_attempts
         assert (await session.get(models.Project, 1)).global_context["tone"] == "原有正式设定"
         scenes = (await session.scalars(select(models.Scene))).all()
@@ -636,7 +637,7 @@ async def test_regeneration_reloads_scene_identity_after_normal_interleaved_id_r
         if target_in_version:
             assert len(scenes) == 2 and scenes[1].scene_index == 2
             assert scenes[1].content is None
-            assert len(jobs) == 1 and jobs[0].payload == {"scene_index": 2}
+            assert len(jobs) == 1 and jobs[0].payload == {"scene_index": 2, "user_id": 1}
             assert len(versions) == 2
             snapshot_scenes = versions[1].snapshot["scenes"]
             assert [scene["scene_index"] for scene in snapshot_scenes] == [1, 2]

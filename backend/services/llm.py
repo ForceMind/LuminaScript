@@ -5,7 +5,9 @@ import re
 from services import setup_fields
 
 import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+from fastapi import HTTPException
+from services.usage import recheck_ai_quota
 from services.llm_config import (
     AI_CLIENT_USER_AGENT,
     LLMRuntimeConfig,
@@ -209,10 +211,18 @@ class InteractionGenerationError(Exception):
 
 class AIResultDict(dict):
     """Dictionary payload retaining the exact provider text for audit only."""
-    def __init__(self, payload, raw_content=""):
+    def __init__(self, payload, raw_content="", *, usage=0, ai_called=True):
         super().__init__(payload)
         self.raw_content = str(getattr(raw_content, "raw_content", raw_content) or "")
         self.rejection_summary = list(getattr(payload, "rejection_summary", []))[:8]
+        self.usage = max(0, int(usage or 0))
+        self.ai_called = ai_called
+
+
+class AIResultList(list):
+    def __init__(self, payload, raw_content=""):
+        super().__init__(payload)
+        self.raw_content = str(getattr(raw_content, "raw_content", raw_content) or "")
 
 
 class AIText(str):
@@ -318,7 +328,8 @@ async def _create_completion(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception)
+    retry=retry_if_exception(lambda exc: not isinstance(exc, HTTPException) and not getattr(exc, "usage", 0)),
+    reraise=True,
 )
 async def raw_generation(messages, temperature=0.7, json_response=False, task_type="default"):
     """
@@ -332,6 +343,7 @@ async def raw_generation(messages, temperature=0.7, json_response=False, task_ty
             runtime_client = _get_client(runtime_config)
             semaphore = _get_semaphore(runtime_config.max_concurrency)
             async with semaphore:
+                await recheck_ai_quota()
                 logger.info(
                     "LLM调用: 档案=%s 任务=%s 消息数=%s",
                     runtime_config.profile_name,
@@ -358,6 +370,8 @@ async def raw_generation(messages, temperature=0.7, json_response=False, task_ty
                         content = json_match.group(0)
                 return AIText(content, raw_content), usage
         except Exception as e:
+            if isinstance(e, HTTPException) or getattr(e, "usage", 0):
+                raise
             last_error = e
             logger.warning(
                 "LLM 档案 %s 调用失败，尝试下一候选档案: %s",
@@ -376,6 +390,10 @@ async def raw_generation(messages, temperature=0.7, json_response=False, task_ty
         raise last_error
     raise RuntimeError("没有可用的 AI 配置档案")
 
+def review_requires_ai(text: str) -> bool:
+    return _contains_any_pattern(text or "", _PORN_PATTERNS) or _contains_any_pattern(text or "", _HARMFUL_VALUE_PATTERNS)
+
+
 async def review_user_input(text: str, template_instructions: str = ""):
     """
     Review user input for policy risks and produce a safe rewrite suggestion.
@@ -389,12 +407,12 @@ async def review_user_input(text: str, template_instructions: str = ""):
     """
     raw_text = (text or "").strip()
     if not raw_text:
-        return {
+        return AIResultDict({
             "flagged": False,
             "categories": [],
             "reason": "",
             "suggested_rewrite": ""
-        }
+        }, ai_called=False)
 
     categories = []
     if _contains_any_pattern(raw_text, _PORN_PATTERNS):
@@ -404,12 +422,12 @@ async def review_user_input(text: str, template_instructions: str = ""):
 
     # Fast path for clearly safe text to avoid extra latency and token cost.
     if not categories:
-        return {
+        return AIResultDict({
             "flagged": False,
             "categories": [],
             "reason": "",
             "suggested_rewrite": ""
-        }
+        }, ai_called=False)
 
     system_prompt = """
     你是内容审核与改写助手。请判断用户文本是否包含：
@@ -431,8 +449,9 @@ async def review_user_input(text: str, template_instructions: str = ""):
     )
     user_prompt = f"待审核文本：\n{raw_text}"
 
+    content, usage = "", 0
     try:
-        content, _ = await raw_generation(
+        content, usage = await raw_generation(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -443,35 +462,36 @@ async def review_user_input(text: str, template_instructions: str = ""):
         )
         if content:
             parsed = json.loads(content)
-            llm_flagged = bool(parsed.get("flagged", False))
-            llm_categories = parsed.get("categories") or categories
-            if isinstance(llm_categories, str):
-                llm_categories = [llm_categories]
-            llm_reason = str(parsed.get("reason", "") or "").strip()
-            llm_suggestion = str(parsed.get("suggested_rewrite", "") or "").strip()
+            if (not isinstance(parsed, dict) or type(parsed.get("flagged")) is not bool
+                    or not isinstance(parsed.get("categories"), list)
+                    or any(not isinstance(item, str) for item in parsed["categories"])
+                    or not isinstance(parsed.get("reason"), str)
+                    or not isinstance(parsed.get("suggested_rewrite"), str)
+                    or not parsed["suggested_rewrite"].strip()):
+                raise ValueError("Review requires typed flagged/categories/reason/suggested_rewrite fields")
+            llm_flagged = parsed["flagged"]
+            llm_categories = parsed["categories"] or categories
+            llm_reason = parsed["reason"].strip()
+            llm_suggestion = parsed["suggested_rewrite"].strip()
 
             # Be conservative: if rule-based checks flagged it, keep flagged=true.
             flagged = llm_flagged or bool(categories)
             final_categories = list(dict.fromkeys((categories or []) + (llm_categories or [])))
 
-            if not llm_suggestion:
-                llm_suggestion = _fallback_rewrite(raw_text, final_categories)
-
-            return {
+            return AIResultDict({
                 "flagged": flagged,
                 "categories": final_categories,
                 "reason": llm_reason or "检测到潜在不当内容，建议改写为健康合规表达。",
                 "suggested_rewrite": llm_suggestion
-            }
+            }, content, usage=usage)
+        raise ValueError("Empty review payload")
     except Exception as e:
-        logger.warning(f"review_user_input fallback due to LLM error: {e}")
-
-    return {
-        "flagged": True,
-        "categories": categories,
-        "reason": "检测到潜在不当内容，建议改写为健康合规表达。",
-        "suggested_rewrite": _fallback_rewrite(raw_text, categories)
-    }
+        if isinstance(e, HTTPException):
+            raise
+        raise InteractionGenerationError(
+            "Content review returned an invalid response", raw_content=getattr(e, "raw_content", content),
+            usage=max(usage, int(getattr(e, "usage", 0) or 0)), error_type="review_invalid_payload",
+        ) from e
 
 async def generate_story_synopsis(logline: str, context: dict | None = None, project_type: str = "movie"):
     """
@@ -525,17 +545,18 @@ async def generate_story_synopsis(logline: str, context: dict | None = None, pro
     )
 
     if not content:
-        return {"brief": "", "detailed": ""}, usage
+        raise InteractionGenerationError("Empty synopsis payload", raw_content=content, usage=usage, error_type="synopsis_empty_payload")
 
     try:
         parsed = json.loads(content)
-        return {
+        if not isinstance(parsed, dict) or any(not isinstance(parsed.get(key), str) or not parsed[key].strip() for key in ("brief", "detailed")):
+            raise ValueError("Synopsis requires non-empty brief and detailed text")
+        return AIResultDict({
             "brief": str(parsed.get("brief", "") or "").strip(),
             "detailed": str(parsed.get("detailed", "") or "").strip()
-        }, usage
-    except Exception:
-        logger.warning("generate_story_synopsis failed to parse JSON response")
-        return {"brief": "", "detailed": ""}, usage
+        }, content), usage
+    except Exception as exc:
+        raise InteractionGenerationError("Invalid synopsis payload", raw_content=content, usage=usage, error_type="synopsis_invalid_payload") from exc
 
 
 async def extract_setup_from_long_input(long_input: str):
@@ -714,16 +735,17 @@ async def generate_scene_batch(
         json_response=True,
         task_type="outline",
     )
+    raw_content = content
     if content:
         try:
             import re
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match: content = json_match.group(0)
             data = json.loads(content)
-            return data.get("scenes", []), usage
+            return AIResultList(data.get("scenes", []), raw_content), usage
         except Exception as e:
             logger.error(f"Batch {start_idx}-{end_idx} JSON Error: {e}")
-    return [], usage
+    raise InteractionGenerationError("Invalid outline payload", raw_content=raw_content, usage=usage, error_type="outline_invalid_payload")
 
 async def write_scene_content(
     logline: str,

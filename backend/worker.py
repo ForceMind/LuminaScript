@@ -53,15 +53,20 @@ async def execute_job(job: models.GenerationJob) -> None:
     from main import run_generation_loop, run_incremental_outline_generation
 
     payload = job.payload if isinstance(job.payload, dict) else {}
+    async with SessionLocal() as db:
+        project = await db.get(models.Project, job.project_id)
+        if not project:
+            raise RuntimeError(f"Project {job.project_id} no longer exists")
+        actor_id = int(payload.get("user_id") or project.owner_id)
     if job.kind == OUTLINE_JOB:
         await run_incremental_outline_generation(
             project_id=job.project_id,
             style_context=str(payload.get("style_context", "")),
             target_count=max(1, int(payload.get("target_count", 1))),
-            user_id=max(1, int(payload.get("user_id", 1))),
+            user_id=actor_id,
         )
     elif job.kind == CONTENT_JOB:
-        await run_generation_loop(job.project_id)
+        await run_generation_loop(job.project_id, user_id=actor_id)
     else:
         raise RuntimeError(f"Unsupported job kind: {job.kind}")
 

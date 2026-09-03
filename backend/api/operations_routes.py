@@ -29,7 +29,7 @@ from services.generation_state import clear_generation_error
 from services.project_access import project_role, require_project_access
 from services.prompt_templates import ALLOWED_TEMPLATE_STAGES
 from services.system_logs import read_system_log
-from services.usage import enforce_user_quota, get_user_usage
+from services.usage import get_user_usage
 from services.setup_state import assert_setup_writable, revision_meta
 from services.versions import (
     create_project_version,
@@ -279,7 +279,6 @@ async def admin_retry_job(
     project = await db.get(models.Project, old_job.project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    await enforce_user_quota(db, project.owner_id)
     if not await claim_generation(db, project.id, project.owner_id):
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
@@ -299,7 +298,7 @@ async def admin_retry_job(
         db,
         project_id=project.id,
         kind=old_job.kind,
-        payload=dict(old_job.payload or {}),
+        payload={**dict(old_job.payload or {}), "user_id": _admin.id},
         max_attempts=old_job.max_attempts,
     )
     await db.commit()
@@ -350,7 +349,6 @@ async def retry_job(
     )
     if old_job.status not in {models.JobStatus.FAILED, models.JobStatus.CANCELED}:
         raise HTTPException(status_code=409, detail="只有失败或已取消任务可以重试")
-    await enforce_user_quota(db, project.owner_id)
     if not await claim_generation(db, project.id, current_user.id):
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
@@ -370,7 +368,7 @@ async def retry_job(
         db,
         project_id=project.id,
         kind=old_job.kind,
-        payload=dict(old_job.payload or {}),
+        payload={**dict(old_job.payload or {}), "user_id": current_user.id},
         max_attempts=old_job.max_attempts,
     )
     await db.commit()

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 import database
 import models
@@ -63,6 +63,7 @@ def serialize_login_log(log: models.LoginLog, username: str) -> dict[str, Any]:
 def serialize_ai_log(
     log: models.AIInteractionLog,
     username: str,
+    billed_username: Optional[str] = None,
 ) -> dict[str, Any]:
     def safe_text(value: Any, default: str = "") -> str:
         if value is None:
@@ -82,6 +83,8 @@ def serialize_ai_log(
         "id": log.id,
         "user_id": log.user_id,
         "user_name": safe_text(username),
+        "billed_user_id": log.billed_user_id,
+        "billed_username": billed_username if log.billed_user_id is not None else None,
         "project_id": log.project_id,
         "action": safe_text(log.action),
         "prompt": safe_text(log.prompt),
@@ -123,6 +126,9 @@ def serialize_project(
         "total_tokens": project.total_tokens,
         "global_context": project.global_context or {},
         "global_summary": project.global_summary,
+        "setup_revision": int(project.setup_revision or 0),
+        "setup_cache_revision": int(project.setup_cache_revision or 0),
+        "quick_setup_draft": project.quick_setup_draft,
         "scene_count": len(project.scenes or []),
         "scenes": [
             serialize_scene(scene)
@@ -610,9 +616,11 @@ async def list_ai_logs(
 ):
     offset = (page - 1) * page_size
     count_query = select(func.count()).select_from(models.AIInteractionLog)
+    billed_user = aliased(models.User)
     data_query = (
-        select(models.AIInteractionLog, models.User.username)
+        select(models.AIInteractionLog, models.User.username, billed_user.username)
         .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+        .outerjoin(billed_user, models.AIInteractionLog.billed_user_id == billed_user.id)
     )
 
     if user_id is not None:
@@ -664,8 +672,8 @@ async def list_ai_logs(
     return {
         "total": int(total_result.scalar() or 0),
         "items": [
-            serialize_ai_log(log, username or "")
-            for log, username in result
+            serialize_ai_log(log, username or "", billed_username)
+            for log, username, billed_username in result
         ],
     }
 
@@ -714,10 +722,12 @@ async def get_ai_log_detail(
     db: AsyncSession = Depends(get_db),
     _admin: models.User = Depends(require_admin),
 ):
+    billed_user = aliased(models.User)
     try:
         result = await db.execute(
-            select(models.AIInteractionLog, models.User.username)
+            select(models.AIInteractionLog, models.User.username, billed_user.username)
             .join(models.User, models.AIInteractionLog.user_id == models.User.id)
+            .outerjoin(billed_user, models.AIInteractionLog.billed_user_id == billed_user.id)
             .where(models.AIInteractionLog.id == log_id)
             .limit(1)
         )
@@ -727,8 +737,8 @@ async def get_ai_log_detail(
     row = result.first()
     if not row:
         raise HTTPException(status_code=404, detail="AI日志不存在")
-    log, username = row
-    return serialize_ai_log(log, username or "")
+    log, username, billed_username = row
+    return serialize_ai_log(log, username or "", billed_username)
 
 
 @router.get("/export/all")
@@ -840,6 +850,7 @@ async def export_all_data(
                     serialize_ai_log(
                         log,
                         owner_lookup.get(log.user_id, ""),
+                        owner_lookup.get(log.billed_user_id),
                     )
                     for log in ai_logs
                 ],

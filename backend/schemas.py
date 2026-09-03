@@ -239,6 +239,8 @@ class AIInteractionLogResponse(BaseModel):
     id: int
     user_id: int
     user_name: Optional[str] = None
+    billed_user_id: Optional[int] = None
+    billed_username: Optional[str] = None
     project_id: Optional[int] = None
     action: Optional[str] = ""
     prompt: Optional[str] = ""
