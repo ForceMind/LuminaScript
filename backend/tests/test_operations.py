@@ -5,12 +5,12 @@ import zipfile
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 import database
 import models
 import auth
-from api.operations_routes import cancel_job, retry_job
+from api.operations_routes import admin_usage, cancel_job, list_jobs, retry_job
 from services import backups
 from services.admin_imports import (
     ADMIN_EXPORT_FORMAT,
@@ -122,6 +122,94 @@ async def test_quota_blocks_generation_at_limit():
         with pytest.raises(HTTPException) as limited:
             await enforce_user_quota(session, owner.id)
         assert limited.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_admin_usage_aggregates_users_without_per_user_usage_queries():
+    async with database.SessionLocal() as session:
+        owner, viewer, editor, _ = await seed_project(session)
+        session.add_all(
+            [
+                models.AIInteractionLog(
+                    user_id=owner.id,
+                    tokens=3,
+                    timestamp=datetime.now().isoformat(),
+                ),
+                models.AIInteractionLog(
+                    user_id=viewer.id,
+                    billed_user_id=owner.id,
+                    tokens=5,
+                    timestamp=datetime.now().isoformat(),
+                ),
+            ]
+        )
+        await session.commit()
+        statements = []
+
+        def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(database.engine.sync_engine, "before_cursor_execute", capture_select)
+        try:
+            result = await admin_usage(db=session, _admin=editor)
+        finally:
+            event.remove(database.engine.sync_engine, "before_cursor_execute", capture_select)
+
+        owner_usage = next(item for item in result["items"] if item["user_id"] == owner.id)
+        assert owner_usage["daily_tokens"] == owner_usage["monthly_tokens"] == 8
+        assert len(statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_jobs_filter_access_before_limit_without_membership_n_plus_one():
+    async with database.SessionLocal() as session:
+        owner = models.User(id=1, username="job-owner", hashed_password="unused")
+        member = models.User(id=2, username="job-member", hashed_password="unused")
+        other = models.User(id=3, username="job-other", hashed_password="unused")
+        session.add_all([owner, member, other])
+        await session.flush()
+        visible = models.Project(id=1, owner_id=owner.id, title="可见项目", logline="l")
+        hidden = models.Project(id=2, owner_id=other.id, title="隐藏项目", logline="l")
+        invalid_member_project = models.Project(id=3, owner_id=other.id, title="无效成员项目", logline="l")
+        session.add_all([visible, hidden, invalid_member_project])
+        await session.flush()
+        session.add(models.ProjectMember(
+            project_id=visible.id,
+            user_id=member.id,
+            role="viewer",
+            created_at=datetime.now().isoformat(),
+        ))
+        session.add(models.ProjectMember(
+            project_id=invalid_member_project.id,
+            user_id=member.id,
+            role="invalid",
+            created_at=datetime.now().isoformat(),
+        ))
+        session.add(models.GenerationJob(id=1, project_id=visible.id, kind="old-visible"))
+        session.add_all(
+            models.GenerationJob(id=job_id, project_id=hidden.id, kind="new-hidden")
+            for job_id in range(2, 103)
+        )
+        session.add(models.GenerationJob(id=103, project_id=invalid_member_project.id, kind="invalid-member"))
+        await session.commit()
+
+        statements = []
+
+        def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(database.engine.sync_engine, "before_cursor_execute", capture_select)
+        try:
+            member_result = await list_jobs(project_id=None, db=session, current_user=member)
+            owner_result = await list_jobs(project_id=visible.id, db=session, current_user=owner)
+        finally:
+            event.remove(database.engine.sync_engine, "before_cursor_execute", capture_select)
+
+        assert [item["id"] for item in member_result["items"]] == [1]
+        assert [item["id"] for item in owner_result["items"]] == [1]
+        assert len(statements) == 2
 
 
 @pytest.mark.asyncio

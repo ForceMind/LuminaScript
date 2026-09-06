@@ -19,6 +19,9 @@ if DATABASE_URL.startswith("sqlite+aiosqlite:///"):
     def configure_sqlite_connection(dbapi_connection, _connection_record):
         cursor = dbapi_connection.cursor()
         try:
+            # SQLite does not enforce declared foreign keys unless every
+            # application connection enables this setting.
+            cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA busy_timeout=5000")
         finally:

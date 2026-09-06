@@ -54,6 +54,7 @@ def accessible_project_condition(user_id: int):
         select(models.ProjectMember.id)
         .where(models.ProjectMember.project_id == models.Project.id)
         .where(models.ProjectMember.user_id == user_id)
+        .where(models.ProjectMember.role.in_(("viewer", "editor")))
         .exists()
     )
     return or_(models.Project.owner_id == user_id, membership)

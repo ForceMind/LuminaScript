@@ -67,6 +67,10 @@ AI 审计将操作者与计费主体分开存储：`user_id` 保留行为归属�
 配额身份以请求/任务局部作用域传到模型调用边界，不使用可被其他用户请求覆盖的全局用户状态。
 检查发生在每次新调用前，AI 等待期间不持数据库锁；已在途请求采用软额度语义。
 
+SQLite 应用连接显式启用 `foreign_keys=ON`。`ai_logs.project_id` 使用 `ON DELETE SET NULL`：删除项目保留审计记录，只去掉不存在的项目引用。迁移会先将历史悬空项目引用置空，再重建项目外键；旧 `upgrade_admin` 可能留下无项目外键的表形也能升级，用户与计费用户外键保持不变。
+
+日/月额度以一次按计费身份和月份范围的聚合返回，保留历史 `COALESCE(billed_user_id, user_id)` 归属。表达式索引覆盖计费身份和时间；队列领取使用 `(status, available_at, id)` 热路径索引。普通用户的任务列表在 SQL `LIMIT` 前按 owner 或有效 `viewer/editor` 成员过滤，避免全局最新任务挤掉其可访问任务或逐项成员查询。
+
 ```bash
 cd backend
 python migrate.py

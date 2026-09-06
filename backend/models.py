@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, Text, ForeignKey, JSON, Enum, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Text, ForeignKey, JSON, Enum, Index, UniqueConstraint, func
 from sqlalchemy.orm import relationship
 from database import Base
 import enum
@@ -57,7 +57,7 @@ class AIInteractionLog(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     # NULL preserves the historical actor-based attribution; never backfill.
     billed_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
     action = Column(String) # analyze, generate_scene, etc.
     prompt = Column(Text)
     response = Column(Text)
@@ -68,6 +68,15 @@ class AIInteractionLog(Base):
     error_message = Column(Text, nullable=True)
     attempt = Column(Integer, default=1)
     timestamp = Column(String) # ISO format
+
+    __table_args__ = (
+        # Keeps legacy actor-billed records queryable without backfilling them.
+        Index(
+            "ix_ai_logs_billing_identity_timestamp",
+            func.coalesce(billed_user_id, user_id),
+            timestamp,
+        ),
+    )
 
     user = relationship("User", back_populates="ai_logs", foreign_keys=[user_id])
     billed_user = relationship("User", foreign_keys=[billed_user_id])
@@ -158,6 +167,9 @@ class Scene(Base):
 
 class GenerationJob(Base):
     __tablename__ = "generation_jobs"
+    __table_args__ = (
+        Index("ix_generation_jobs_status_available_at_id", "status", "available_at", "id"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"), index=True)

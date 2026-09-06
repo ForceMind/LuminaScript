@@ -26,10 +26,10 @@ from services.backups import (
 )
 from services.job_queue import enqueue_job
 from services.generation_state import clear_generation_error
-from services.project_access import project_role, require_project_access
+from services.project_access import accessible_project_condition, require_project_access
 from services.prompt_templates import ALLOWED_TEMPLATE_STAGES
 from services.system_logs import read_system_log
-from services.usage import get_user_usage
+from services.usage import get_all_user_usage, get_user_usage
 from services.setup_state import assert_setup_writable, revision_meta
 from services.versions import (
     create_project_version,
@@ -146,9 +146,10 @@ async def admin_usage(
     _admin: models.User = Depends(require_admin),
 ):
     users = (await db.execute(select(models.User).order_by(models.User.id))).scalars().all()
+    usage_by_user = await get_all_user_usage(db)
     items = []
     for user in users:
-        usage = await get_user_usage(db, user.id)
+        usage = usage_by_user.get(user.id, {"daily_tokens": 0, "monthly_tokens": 0})
         items.append(
             {
                 "user_id": user.id,
@@ -186,17 +187,14 @@ async def list_jobs(
     query = (
         select(models.GenerationJob, models.Project)
         .join(models.Project, models.GenerationJob.project_id == models.Project.id)
+        .where(accessible_project_condition(current_user.id))
         .order_by(models.GenerationJob.id.desc())
         .limit(100)
     )
     if project_id:
         query = query.where(models.GenerationJob.project_id == project_id)
     rows = (await db.execute(query)).all()
-    items = []
-    for job, project in rows:
-        if await project_role(db, project, current_user.id):
-            items.append(serialize_job(job, project))
-    return {"items": items}
+    return {"items": [serialize_job(job, project) for job, project in rows]}
 
 
 @admin_router.get("/jobs")

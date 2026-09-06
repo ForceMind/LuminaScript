@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from contextvars import ContextVar
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import models
@@ -41,17 +41,44 @@ def period_starts() -> tuple[str, str]:
 
 async def get_user_usage(db: AsyncSession, user_id: int) -> dict[str, int]:
     day_start, month_start = period_starts()
-    daily = await db.scalar(
-        select(func.coalesce(func.sum(models.AIInteractionLog.tokens), 0))
-        .where(func.coalesce(models.AIInteractionLog.billed_user_id, models.AIInteractionLog.user_id) == user_id)
-        .where(models.AIInteractionLog.timestamp >= day_start)
+    logs = models.AIInteractionLog
+    result = await db.execute(
+        select(
+            func.coalesce(
+                func.sum(case((logs.timestamp >= day_start, logs.tokens), else_=0)),
+                0,
+            ).label("daily_tokens"),
+            func.coalesce(func.sum(logs.tokens), 0).label("monthly_tokens"),
+        )
+        .where(func.coalesce(logs.billed_user_id, logs.user_id) == user_id)
+        .where(logs.timestamp >= month_start)
     )
-    monthly = await db.scalar(
-        select(func.coalesce(func.sum(models.AIInteractionLog.tokens), 0))
-        .where(func.coalesce(models.AIInteractionLog.billed_user_id, models.AIInteractionLog.user_id) == user_id)
-        .where(models.AIInteractionLog.timestamp >= month_start)
-    )
+    daily, monthly = result.one()
     return {"daily_tokens": int(daily or 0), "monthly_tokens": int(monthly or 0)}
+
+
+async def get_all_user_usage(db: AsyncSession) -> dict[int, dict[str, int]]:
+    """Aggregate all active billing identities in one bounded historical scan."""
+    day_start, month_start = period_starts()
+    logs = models.AIInteractionLog
+    billing_identity = func.coalesce(logs.billed_user_id, logs.user_id)
+    rows = await db.execute(
+        select(
+            billing_identity.label("user_id"),
+            func.coalesce(
+                func.sum(case((logs.timestamp >= day_start, logs.tokens), else_=0)),
+                0,
+            ).label("daily_tokens"),
+            func.coalesce(func.sum(logs.tokens), 0).label("monthly_tokens"),
+        )
+        .where(logs.timestamp >= month_start)
+        .group_by(billing_identity)
+    )
+    return {
+        int(user_id): {"daily_tokens": int(daily or 0), "monthly_tokens": int(monthly or 0)}
+        for user_id, daily, monthly in rows
+        if user_id is not None
+    }
 
 
 async def enforce_user_quota(db: AsyncSession, user_id: int) -> dict[str, int]:

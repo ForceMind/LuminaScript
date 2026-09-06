@@ -13,7 +13,8 @@ BASELINE_REVISION = "20260728_0001"
 OPERATIONS_REVISION = "20260804_0004"
 SETUP_REVISION = "20260903_0005"
 DRAFT_REVISION = "20260903_0006"
-HEAD_REVISION = "20260904_0007"
+BILLING_REVISION = "20260904_0007"
+HEAD_REVISION = "20260906_0008"
 
 
 def alembic_config() -> Config:
@@ -60,6 +61,13 @@ def unversioned_sqlite_revision(path: Path) -> Optional[str]:
         ai_log_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(ai_logs)")
         } if "ai_logs" in tables else set()
+        ai_log_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(ai_logs)")
+        } if "ai_logs" in tables else set()
+        ai_log_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(ai_logs)")) if "ai_logs" in tables else []
+        job_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(generation_jobs)")
+        } if "generation_jobs" in tables else set()
     if "users" not in tables or "alembic_version" in tables:
         return None
     if "generation_jobs" in tables:
@@ -75,7 +83,19 @@ def unversioned_sqlite_revision(path: Path) -> Optional[str]:
         ):
             if {"setup_revision", "setup_cache_revision"}.issubset(project_columns):
                 if "quick_setup_draft" in project_columns:
-                    return HEAD_REVISION if "billed_user_id" in ai_log_columns else DRAFT_REVISION
+                    if "billed_user_id" in ai_log_columns:
+                        has_project_set_null = any(
+                            row[3] == "project_id" and str(row[6]).upper() == "SET NULL"
+                            for row in ai_log_foreign_keys
+                        )
+                        if (
+                            has_project_set_null
+                            and "ix_ai_logs_billing_identity_timestamp" in ai_log_indexes
+                            and "ix_generation_jobs_status_available_at_id" in job_indexes
+                        ):
+                            return HEAD_REVISION
+                        return BILLING_REVISION
+                    return DRAFT_REVISION
                 return SETUP_REVISION
             return OPERATIONS_REVISION
         return "20260728_0003"

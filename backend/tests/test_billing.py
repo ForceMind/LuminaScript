@@ -10,7 +10,7 @@ import zipfile
 from alembic import command
 from fastapi import BackgroundTasks, HTTPException
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import selectinload
 from tenacity import wait_none
 
@@ -81,6 +81,61 @@ async def test_actor_billing_legacy_usage_and_relationships():
         loaded = await db.scalar(select(models.User).where(models.User.id == 2).options(selectinload(models.User.ai_logs)))
         assert len(loaded.ai_logs) == 2
         assert rows[1].timestamp[:10] == now()[:10]
+
+
+@pytest.mark.asyncio
+async def test_usage_uses_single_indexed_aggregate_for_legacy_and_billed_logs():
+    async with database.SessionLocal() as db:
+        owner, editor, _, _ = await seed(db)
+        month_start = usage.period_starts()[1]
+        db.add_all(
+            [
+                models.AIInteractionLog(user_id=owner.id, tokens=3, timestamp=month_start),
+                models.AIInteractionLog(
+                    user_id=editor.id,
+                    billed_user_id=owner.id,
+                    tokens=5,
+                    timestamp=now(),
+                ),
+            ]
+        )
+        await db.commit()
+        assert await usage.get_user_usage(db, owner.id) == {
+            "daily_tokens": 5,
+            "monthly_tokens": 8,
+        }
+        plan = await db.execute(
+            text(
+                "EXPLAIN QUERY PLAN SELECT sum(tokens) FROM ai_logs "
+                "WHERE COALESCE(billed_user_id, user_id) = :user_id "
+                "AND timestamp >= :month_start"
+            ),
+            {"user_id": owner.id, "month_start": month_start},
+        )
+        detail = " ".join(str(row[-1]).upper() for row in plan)
+        assert "SCAN AI_LOGS" not in detail
+        assert "IX_AI_LOGS_BILLING_IDENTITY_TIMESTAMP" in detail
+
+
+@pytest.mark.asyncio
+async def test_sqlite_connections_enforce_foreign_keys_and_preserve_ai_logs_on_project_delete():
+    async with database.engine.connect() as connection:
+        assert (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one() == 1
+    async with database.SessionLocal() as db:
+        owner, _, _, project = await seed(db)
+        db.add(
+            models.AIInteractionLog(
+                user_id=owner.id,
+                project_id=project.id,
+                tokens=3,
+                timestamp=now(),
+            )
+        )
+        await db.commit()
+        await db.delete(project)
+        await db.commit()
+        log = await db.scalar(select(models.AIInteractionLog))
+        assert log is not None and log.project_id is None
 
 
 @pytest.mark.asyncio
@@ -402,6 +457,81 @@ def test_0006_migration_keeps_legacy_logs_null_and_detects_unversioned_schema(tm
         assert db.execute("SELECT user_id,billed_user_id,tokens,timestamp FROM ai_logs").fetchone() == (1, None, 19, "2026-01-01T01:00:00")
         db.execute("DROP TABLE alembic_version")
     assert migrate.unversioned_sqlite_revision(path) == migrate.HEAD_REVISION
+
+
+def test_0008_migration_nulls_dangling_projects_and_adds_hot_path_indexes(tmp_path, monkeypatch):
+    path = tmp_path / "integrity-old.db"
+    monkeypatch.setattr(migrate.settings, "database_url", f"sqlite+aiosqlite:///{path}")
+    config = migrate.alembic_config()
+    command.upgrade(config, migrate.BILLING_REVISION)
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("INSERT INTO users(id,username,hashed_password) VALUES(1,'owner','unused')")
+        db.execute("INSERT INTO projects(id,title,owner_id) VALUES(1,'kept',1)")
+        db.execute(
+            "INSERT INTO ai_logs(id,user_id,project_id,tokens,timestamp) "
+            "VALUES(1,1,99,7,'2026-09-06T00:00:00')"
+        )
+        db.commit()
+    command.upgrade(config, migrate.HEAD_REVISION)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT id,project_id,tokens FROM ai_logs").fetchone() == (1, None, 7)
+        foreign_keys = list(db.execute("PRAGMA foreign_key_list(ai_logs)"))
+        assert any(row[3] == "project_id" and row[6].upper() == "SET NULL" for row in foreign_keys)
+        indexes = {row[1] for row in db.execute("PRAGMA index_list(ai_logs)")}
+        assert "ix_ai_logs_billing_identity_timestamp" in indexes
+        job_indexes = {row[1] for row in db.execute("PRAGMA index_list(generation_jobs)")}
+        assert "ix_generation_jobs_status_available_at_id" in job_indexes
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("DELETE FROM projects WHERE id=1")
+        assert db.execute("SELECT id,project_id,tokens FROM ai_logs").fetchone() == (1, None, 7)
+
+
+def test_0008_migration_repairs_legacy_project_column_without_foreign_key(tmp_path, monkeypatch):
+    path = tmp_path / "integrity-no-project-fk.db"
+    monkeypatch.setattr(migrate.settings, "database_url", f"sqlite+aiosqlite:///{path}")
+    config = migrate.alembic_config()
+    command.upgrade(config, migrate.BILLING_REVISION)
+    with sqlite3.connect(path) as db:
+        # This is the shape produced by the historical upgrade_admin path:
+        # project_id exists but was added outside Alembic and has no FK.
+        db.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE ai_logs_legacy (
+                id INTEGER NOT NULL PRIMARY KEY,
+                user_id INTEGER,
+                project_id INTEGER,
+                action VARCHAR,
+                prompt TEXT,
+                response TEXT,
+                tokens INTEGER,
+                status VARCHAR,
+                step_key VARCHAR,
+                error_type VARCHAR,
+                error_message TEXT,
+                attempt INTEGER,
+                timestamp VARCHAR,
+                billed_user_id INTEGER,
+                CONSTRAINT fk_ai_logs_user_id_users FOREIGN KEY(user_id) REFERENCES users(id),
+                CONSTRAINT fk_ai_logs_billed_user_id_users FOREIGN KEY(billed_user_id) REFERENCES users(id)
+            );
+            INSERT INTO users(id,username,hashed_password) VALUES(1,'owner','unused');
+            INSERT INTO ai_logs_legacy(id,user_id,project_id,billed_user_id,tokens,timestamp)
+                VALUES(1,1,99,1,7,'2026-09-06T00:00:00');
+            DROP TABLE ai_logs;
+            ALTER TABLE ai_logs_legacy RENAME TO ai_logs;
+            CREATE INDEX ix_ai_logs_id ON ai_logs(id);
+            CREATE INDEX ix_ai_logs_billed_user_id ON ai_logs(billed_user_id);
+            """
+        )
+    command.upgrade(config, migrate.HEAD_REVISION)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT id,project_id,billed_user_id,tokens FROM ai_logs").fetchone() == (1, None, 1, 7)
+        foreign_keys = list(db.execute("PRAGMA foreign_key_list(ai_logs)"))
+        assert any(row[3] == "project_id" and row[6].upper() == "SET NULL" for row in foreign_keys)
+        assert any(row[3] == "user_id" for row in foreign_keys)
+        assert any(row[3] == "billed_user_id" for row in foreign_keys)
 
 
 @pytest.mark.asyncio
