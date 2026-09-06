@@ -64,9 +64,16 @@ async def execute_job(job: models.GenerationJob) -> None:
             style_context=str(payload.get("style_context", "")),
             target_count=max(1, int(payload.get("target_count", 1))),
             user_id=actor_id,
+            job_id=job.id,
+            lock_token=job.lock_token,
         )
     elif job.kind == CONTENT_JOB:
-        await run_generation_loop(job.project_id, user_id=actor_id)
+        await run_generation_loop(
+            job.project_id,
+            user_id=actor_id,
+            job_id=job.id,
+            lock_token=job.lock_token,
+        )
     else:
         raise RuntimeError(f"Unsupported job kind: {job.kind}")
 

@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import models
@@ -11,6 +11,53 @@ import models
 OUTLINE_JOB = "outline_generation"
 CONTENT_JOB = "content_generation"
 SUPPORTED_JOB_KINDS = {OUTLINE_JOB, CONTENT_JOB}
+
+
+class JobLeaseLost(RuntimeError):
+    """The worker may no longer perform provider calls or business writes."""
+
+
+def active_lease_conditions(job_id: int, lock_token: str):
+    return (
+        models.GenerationJob.id == job_id,
+        models.GenerationJob.status == models.JobStatus.RUNNING,
+        models.GenerationJob.lock_token == lock_token,
+        models.GenerationJob.cancel_requested.is_(False),
+    )
+
+
+async def require_job_lease(
+    db: AsyncSession,
+    job_id: int,
+    lock_token: str,
+    *,
+    fence_write: bool = False,
+) -> None:
+    """Validate ownership, optionally locking it through the caller's commit.
+
+    Read checks are used immediately around provider awaits. A write fence is a
+    short conditional no-op UPDATE; callers then make their business changes
+    and commit without awaiting a provider, so cancellation/reclaim cannot
+    interleave between the ownership check and those changes.
+    """
+    if not job_id or not lock_token:
+        raise JobLeaseLost("Generation job lease is missing")
+    if fence_write:
+        result = await db.execute(
+            update(models.GenerationJob)
+            .where(*active_lease_conditions(job_id, lock_token))
+            .values(updated_at=models.GenerationJob.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        active = int(result.rowcount or 0) == 1
+    else:
+        active = await db.scalar(
+            select(models.GenerationJob.id).where(
+                *active_lease_conditions(job_id, lock_token)
+            )
+        ) is not None
+    if not active:
+        raise JobLeaseLost(f"Generation job {job_id} lease is no longer active")
 
 
 def utc_now() -> datetime:
@@ -57,6 +104,7 @@ async def claim_next_job(
     candidate_result = await db.execute(
         select(models.GenerationJob.id)
         .where(models.GenerationJob.status == models.JobStatus.QUEUED)
+        .where(models.GenerationJob.cancel_requested.is_(False))
         .where(models.GenerationJob.attempts < models.GenerationJob.max_attempts)
         .where(models.GenerationJob.available_at <= now)
         .order_by(
@@ -74,6 +122,7 @@ async def claim_next_job(
         update(models.GenerationJob)
         .where(models.GenerationJob.id == job_id)
         .where(models.GenerationJob.status == models.JobStatus.QUEUED)
+        .where(models.GenerationJob.cancel_requested.is_(False))
         .values(
             status=models.JobStatus.RUNNING,
             attempts=models.GenerationJob.attempts + 1,
@@ -95,7 +144,14 @@ async def prepare_job_attempt(
     db: AsyncSession,
     job: models.GenerationJob,
 ) -> None:
+    await require_job_lease(
+        db,
+        job.id,
+        job.lock_token,
+        fence_write=True,
+    )
     if int(job.attempts or 0) <= 1:
+        await db.rollback()
         return
 
     project = await db.get(models.Project, job.project_id)
@@ -103,13 +159,7 @@ async def prepare_job_attempt(
         raise RuntimeError(f"Project {job.project_id} no longer exists")
 
     project.status = models.ProcessingStatus.GENERATING
-    if job.kind == OUTLINE_JOB:
-        await db.execute(
-            delete(models.Scene).where(
-                models.Scene.project_id == job.project_id
-            )
-        )
-    elif job.kind == CONTENT_JOB:
+    if job.kind == CONTENT_JOB:
         await db.execute(
             update(models.Scene)
             .where(models.Scene.project_id == job.project_id)
@@ -142,6 +192,7 @@ async def complete_job(
         .where(models.GenerationJob.id == job_id)
         .where(models.GenerationJob.status == models.JobStatus.RUNNING)
         .where(models.GenerationJob.lock_token == lock_token)
+        .where(models.GenerationJob.cancel_requested.is_(False))
         .values(
             status=models.JobStatus.COMPLETED,
             locked_at=None,
@@ -165,6 +216,7 @@ async def heartbeat_job(
         .where(models.GenerationJob.id == job_id)
         .where(models.GenerationJob.status == models.JobStatus.RUNNING)
         .where(models.GenerationJob.lock_token == lock_token)
+        .where(models.GenerationJob.cancel_requested.is_(False))
         .values(locked_at=now, updated_at=now)
     )
     await db.commit()
@@ -180,10 +232,18 @@ async def fail_job(
     job = await db.get(models.GenerationJob, job_id)
     if not job:
         return models.JobStatus.FAILED
-    if (
-        job.status != models.JobStatus.RUNNING
-        or job.lock_token != lock_token
-    ):
+    try:
+        await require_job_lease(
+            db,
+            job_id,
+            lock_token,
+            fence_write=True,
+        )
+    except JobLeaseLost:
+        await db.rollback()
+        job = await db.get(models.GenerationJob, job_id, populate_existing=True)
+        if not job:
+            return models.JobStatus.FAILED
         return job.status
 
     now_value = utc_now()
@@ -218,6 +278,7 @@ async def recover_stale_jobs(
     result = await db.execute(
         select(models.GenerationJob)
         .where(models.GenerationJob.status == models.JobStatus.RUNNING)
+        .where(models.GenerationJob.cancel_requested.is_(False))
         .where(models.GenerationJob.locked_at <= stale_before)
     )
     stale_jobs = result.scalars().all()
@@ -226,22 +287,41 @@ async def recover_stale_jobs(
     now = to_iso(utc_now())
 
     for job in stale_jobs:
-        job.locked_at = None
-        job.lock_token = None
-        job.updated_at = now
-        job.last_error = "Worker lease expired before completion."
-        if int(job.attempts or 0) < int(job.max_attempts or 1):
-            job.status = models.JobStatus.QUEUED
-            job.available_at = now
-            project = await db.get(models.Project, job.project_id)
-            if project:
-                project.status = models.ProcessingStatus.GENERATING
+        should_retry = int(job.attempts or 0) < int(job.max_attempts or 1)
+        next_status = (
+            models.JobStatus.QUEUED if should_retry else models.JobStatus.FAILED
+        )
+        values = {
+            "status": next_status,
+            "locked_at": None,
+            "lock_token": None,
+            "updated_at": now,
+            "last_error": "Worker lease expired before completion.",
+        }
+        if should_retry:
+            values["available_at"] = now
+        claim = await db.execute(
+            update(models.GenerationJob)
+            .where(models.GenerationJob.id == job.id)
+            .where(models.GenerationJob.status == models.JobStatus.RUNNING)
+            .where(models.GenerationJob.cancel_requested.is_(False))
+            .where(models.GenerationJob.lock_token == job.lock_token)
+            .where(models.GenerationJob.locked_at <= stale_before)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if int(claim.rowcount or 0) != 1:
+            continue
+        project = await db.get(models.Project, job.project_id)
+        if project:
+            project.status = (
+                models.ProcessingStatus.GENERATING
+                if should_retry
+                else models.ProcessingStatus.FAILED
+            )
+        if should_retry:
             requeued += 1
         else:
-            job.status = models.JobStatus.FAILED
-            project = await db.get(models.Project, job.project_id)
-            if project:
-                project.status = models.ProcessingStatus.FAILED
             failed += 1
 
     await db.commit()

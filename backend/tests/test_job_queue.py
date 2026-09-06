@@ -2,8 +2,10 @@ import asyncio
 from datetime import timedelta
 
 import pytest
+from sqlalchemy import select
 
 import database
+import main
 import models
 import worker
 from repositories.projects import recover_interrupted
@@ -14,6 +16,7 @@ from services.job_queue import (
     enqueue_job,
     fail_job,
     heartbeat_job,
+    prepare_job_attempt,
     recover_stale_jobs,
     to_iso,
     utc_now,
@@ -153,6 +156,52 @@ async def test_expired_worker_cannot_update_a_reclaimed_job():
 
 
 @pytest.mark.asyncio
+async def test_outline_attempt_two_preserves_three_durable_scenes():
+    async with database.SessionLocal() as session:
+        await seed_project(session)
+        session.add_all(
+            [
+                models.Scene(
+                    project_id=1,
+                    scene_index=index,
+                    outline=f"大纲{index}",
+                    content=f"正文{index}",
+                    summary=f"摘要{index}",
+                    status=models.ProcessingStatus.COMPLETED,
+                )
+                for index in range(1, 4)
+            ]
+        )
+        job = models.GenerationJob(
+            project_id=1,
+            kind=OUTLINE_JOB,
+            status=models.JobStatus.RUNNING,
+            attempts=2,
+            max_attempts=3,
+            lock_token="attempt-two-token",
+            cancel_requested=False,
+        )
+        session.add(job)
+        await session.commit()
+
+        await prepare_job_attempt(session, job)
+
+        scenes = list(
+            await session.scalars(
+                select(models.Scene)
+                .where(models.Scene.project_id == 1)
+                .order_by(models.Scene.scene_index)
+            )
+        )
+        assert len(scenes) == 3
+        assert [scene.content for scene in scenes] == ["正文1", "正文2", "正文3"]
+        assert all(
+            scene.status == models.ProcessingStatus.COMPLETED
+            for scene in scenes
+        )
+
+
+@pytest.mark.asyncio
 async def test_api_recovery_preserves_projects_with_active_queue_jobs():
     async with database.SessionLocal() as session:
         await seed_project(session)
@@ -208,6 +257,38 @@ async def test_worker_completes_claimed_job(monkeypatch):
         assert job.status == models.JobStatus.COMPLETED
         assert job.attempts == 1
         assert job.locked_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["outline_generation", "content_generation"])
+async def test_worker_forwards_job_identity_to_generation_engine(monkeypatch, kind):
+    async with database.SessionLocal() as session:
+        await seed_project(session)
+
+    seen = {}
+
+    async def complete_project(*_args, **kwargs):
+        seen.update(kwargs)
+        async with database.SessionLocal() as session:
+            project = await session.get(models.Project, 1)
+            project.status = models.ProcessingStatus.COMPLETED
+            await session.commit()
+
+    monkeypatch.setattr(main, "run_incremental_outline_generation", complete_project)
+    monkeypatch.setattr(main, "run_generation_loop", complete_project)
+    await worker.execute_job(
+        models.GenerationJob(
+            id=77,
+            project_id=1,
+            kind=kind,
+            payload={"user_id": 1, "target_count": 1},
+            lock_token="forwarded-token",
+        )
+    )
+
+    assert seen["job_id"] == 77
+    assert seen["lock_token"] == "forwarded-token"
+    assert seen["user_id"] == 1
 
 
 @pytest.mark.asyncio

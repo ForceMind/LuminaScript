@@ -1756,12 +1756,20 @@ const analyzeLogline = async (id: number) => {
 
         loadingText.value = '基础设定完成！AI 正在为您生成分场大纲（这可能需要几分钟，请耐心等待）...'
         ElMessage.success('基础设定完成！正在生成分场大纲...')
+        const generationRevision = currentProjectRevision()
+        if (!generationRevision) {
+            ElMessage.error('设定版本缺失，请刷新项目后再生成。')
+            return
+        }
 
         await api.post(
             `/projects/${id}/generate_scenes`,
             null,
             {
-                params: { selected_option: 'auto' },
+                params: {
+                    selected_option: 'auto',
+                    context_revision: generationRevision,
+                },
                 timeout: 300000 // 5 minutes timeout for large batches
             }
         )

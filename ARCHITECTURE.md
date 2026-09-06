@@ -107,6 +107,14 @@ python worker.py
 `stop`、`restart` 和 `logs worker` 均会管理该进程。可通过
 `WORKER_POLL_SECONDS` 和 `WORKER_LEASE_SECONDS` 调整轮询与租约。
 
+### 生成准入、恢复与租约围栏
+
+分场任务仅在正式设定已确认、设定字段完整且客户端 `context_revision` 与当前双版本一致时入队。已有场次只有明确的全量重新生成动作会清空；自动重试从已存在的场次序号继续，不删除已完成场次、正文或摘要。
+
+Worker 在每次 provider 调用前后和每段业务写入前检查 `GenerationJob` 的 `RUNNING` 状态、租约 token 及取消标志。业务写入通过短事务条件更新围栏，provider 等待期间不持有数据库写锁。任务取消或租约失效不能终止已经发出的 provider HTTP 请求，但其返回结果只可作为 stale 审计记录，不能改写项目、场次或触发后续调用。
+
+已知 provider usage 在活跃租约下先累计到项目并写入审计；租约失效后只尝试独立 stale 审计。若该审计存储也失败，错误明确要求按上游账单对账，不声称本地已保留 usage。
+
 ## 后续生产增强
 
 - 生产数据库迁移到 PostgreSQL，并为多 Worker 领取任务引入

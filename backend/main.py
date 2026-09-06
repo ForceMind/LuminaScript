@@ -45,7 +45,13 @@ from api.operations_routes import admin_router as admin_operations_router
 from api.operations_routes import router as operations_router
 from migrate import run_migrations
 from services.admin_provisioning import ensure_admin_policy
-from services.job_queue import CONTENT_JOB, OUTLINE_JOB, enqueue_job
+from services.job_queue import (
+    CONTENT_JOB,
+    OUTLINE_JOB,
+    JobLeaseLost,
+    enqueue_job,
+    require_job_lease,
+)
 from services.continuity import (
     build_content_continuity_context,
     build_outline_continuity_context,
@@ -1004,15 +1010,41 @@ class QuickSetupAIReviseRequest(BaseModel):
         return result
 
 
-async def write_setup_ai_audit(**entry: Any) -> Optional[int]:
-    """Fail closed before exposing/applying setup AI results if audit is down."""
+async def write_setup_ai_audit(
+    *,
+    project_token_preserved: bool,
+    lease_lost: bool = False,
+    **entry: Any,
+) -> Optional[int]:
+    """Fail closed with an accurate statement of durable usage state."""
     try:
         return await log_ai_action(**entry)
     except Exception as exc:
         logger.error("Setup AI audit write failed: %s", type(exc).__name__)
+        known_usage = max(0, int(entry.get("tokens", 0) or 0))
+        if known_usage <= 0:
+            usage_detail = "本次没有已知 Token 用量需要入账。"
+        elif project_token_preserved:
+            usage_detail = (
+                "项目 Token 已持久化，但账户用量审计记录缺失，"
+                "需要管理员核对。"
+            )
+        elif lease_lost:
+            usage_detail = (
+                "任务租约已失效，项目 Token 未写入，审计账本也未保存；"
+                "本次已知用量没有持久记录，需要根据 AI 提供商账单进行计费对账。"
+            )
+        else:
+            usage_detail = (
+                "本次已知用量没有持久记录，"
+                "需要根据 AI 提供商账单进行计费对账。"
+            )
         raise HTTPException(
             status_code=503,
-            detail="AI 审计写入失败，原始返回记录未能确认保存，本次 AI 结果未应用；项目存在时已保留已知项目 Token，账户用量记录可能缺失，请管理员检查后重试。",
+            detail=(
+                "AI 审计写入失败，原始返回记录未能确认保存，"
+                f"本次 AI 结果未应用；{usage_detail}"
+            ),
         ) from exc
 
 
@@ -1024,14 +1056,27 @@ async def run_project_ai_call(
     stale_check: Any = None,
     result_status: Any = None,
     audit_ids: Optional[List[int]] = None,
+    job_id: Optional[int] = None,
+    lock_token: Optional[str] = None,
 ) -> tuple[Any, int]:
     """Account every real call before applying its output; capture billing before await.
 
     Quotas are soft checks, not reservations: concurrent in-flight requests may exceed
-    a limit. Known usage survives invalid responses, cancellation and audit failure.
+    a limit. With an active lease, known usage is committed to the project's Token
+    aggregate before audit. After lease loss the old worker cannot mutate the project,
+    so only a successful independent audit durably records usage; audit failure then
+    requires provider-billing reconciliation.
     """
     project_id, billed_user_id = project.id, project.owner_id
+    if job_id is not None:
+        await assert_generation_job_active(job_id, lock_token)
     await enforce_user_quota(db, billed_user_id)
+    if job_id is not None:
+        # Quota/template reads must not leave a transaction open across the
+        # provider await. Generation callers commit their business changes
+        # before reaching this boundary.
+        await db.commit()
+        await assert_generation_job_active(job_id, lock_token)
     result, usage, error, raw = None, 0, None, ""
     try:
         result, usage = await invoke_with_quota(billed_user_id, invoke)
@@ -1047,28 +1092,81 @@ async def run_project_ai_call(
         usage = max(int(usage or 0), int(getattr(exc, "usage", 0) or 0))
         raw = str(getattr(exc, "raw_content", "") or raw)
     usage = max(0, int(usage or 0))
-    if usage:
+    lease_lost = False
+    if job_id is not None:
+        try:
+            await require_job_lease(
+                db,
+                job_id,
+                lock_token or "",
+                fence_write=True,
+            )
+        except JobLeaseLost:
+            await db.rollback()
+            lease_lost = True
+    if usage and not lease_lost:
         await increment_project_tokens(db, project, usage)
+    if job_id is not None and not lease_lost:
+        await db.commit()
+    elif usage and job_id is None:
         await db.commit()
     live_project = await db.scalar(select(models.Project).where(models.Project.id == project_id).execution_options(populate_existing=True))
-    stale = live_project is None or (expected_status is not None and live_project.status != expected_status)
+    stale = lease_lost or live_project is None or (expected_status is not None and live_project.status != expected_status)
     if not stale and stale_check is not None:
         stale = await stale_check()
     audit_id = await write_setup_ai_audit(
+        project_token_preserved=bool(usage and not lease_lost),
+        lease_lost=lease_lost,
         user_id=actor_id, billed_user_id=billed_user_id,
         project_id=project_id if live_project is not None else None,
         action=action, prompt=prompt, response=raw, tokens=usage,
         status="stale" if stale else "failed" if error else result_status(result) if result_status else "success", attempt=attempt,
-        error_type="stale_context" if stale else getattr(error, "error_type", type(error).__name__) if error else None,
-        error_message="AI 返回前项目已删除或生成已停止" if stale else str(error) if error else None,
+        error_type="stale_job_lease" if lease_lost else "stale_context" if stale else getattr(error, "error_type", type(error).__name__) if error else None,
+        error_message="AI 返回前生成任务已取消或租约已失效" if lease_lost else "AI 返回前项目已删除或生成已停止" if stale else str(error) if error else None,
     )
     if audit_ids is not None and audit_id is not None:
         audit_ids.append(audit_id)
     if stale:
+        if lease_lost:
+            raise JobLeaseLost(
+                f"Generation job {job_id} lease ended while the provider call was in flight"
+            )
         raise HTTPException(status_code=409, detail="AI 返回前项目已变化，本次结果未应用。")
     if error:
         raise error
     return result, usage
+
+
+async def assert_generation_job_active(
+    job_id: int,
+    lock_token: Optional[str],
+) -> None:
+    """End the lease-check transaction before any provider await."""
+    async with database.SessionLocal() as lease_db:
+        await require_job_lease(lease_db, job_id, lock_token or "")
+        await lease_db.rollback()
+
+
+async def fence_generation_job_write(
+    db: AsyncSession,
+    job_id: Optional[int],
+    lock_token: Optional[str],
+) -> None:
+    if job_id is not None:
+        if db.new or db.dirty or db.deleted:
+            raise RuntimeError(
+                "Generation job write fence must be acquired before staging business changes"
+            )
+        # End any read snapshot before upgrading to the short write-fence
+        # transaction. This avoids SQLite WAL snapshot-upgrade failures when a
+        # heartbeat committed between the read and this write.
+        await db.commit()
+        await require_job_lease(
+            db,
+            job_id,
+            lock_token or "",
+            fence_write=True,
+        )
 
 
 def validate_ai_text(value: Any) -> None:
@@ -1120,6 +1218,7 @@ async def record_quick_setup_ai_revision(
         else "review_quick_setup_edits"
     )
     await write_setup_ai_audit(
+        project_token_preserved=bool(token_count),
         user_id=current_user.id, project_id=project.id, action=action,
         billed_user_id=billed_user_id if billed_user_id is not None else project.owner_id,
         prompt=prompt, response=response, tokens=token_count, status=status,
@@ -1157,6 +1256,7 @@ async def review_content(
         if isinstance(e, HTTPException) and e.status_code == 429:
             raise
         await write_setup_ai_audit(
+            project_token_preserved=False,
             user_id=current_user.id, billed_user_id=current_user.id, project_id=None,
             action="review_content", prompt=payload.text,
             response=str(getattr(e, "raw_content", "") or ""), tokens=max(0, int(getattr(e, "usage", 0) or 0)),
@@ -1166,6 +1266,7 @@ async def review_content(
     usage = max(0, int(getattr(result, "usage", 0) or 0))
     if getattr(result, "ai_called", llm.review_requires_ai(payload.text)):
         await write_setup_ai_audit(
+            project_token_preserved=False,
             user_id=current_user.id, billed_user_id=current_user.id, project_id=None,
             action="review_content", prompt=payload.text,
             response=getattr(result, "raw_content", json.dumps(result, ensure_ascii=False)), tokens=usage,
@@ -1400,6 +1501,7 @@ async def generate_validated_setup_options(
             stale = True
         status = "stale" if stale else "success" if len(accepted) == 3 else "partial" if accepted and attempt < MAX_INTERACTION_ATTEMPTS else "failed"
         await write_setup_ai_audit(
+            project_token_preserved=bool(usage),
             user_id=current_user.id, project_id=project.id, action=action,
             billed_user_id=billed_user_id,
             prompt=call_context, response=raw_content, tokens=usage, status=status,
@@ -1743,6 +1845,7 @@ async def analyze_logline(
                 raise
             stale = True
         await write_setup_ai_audit(
+            project_token_preserved=bool(prefill_usage),
             user_id=current_user.id, project_id=project_id, action="auto_prefill_setup",
             billed_user_id=billed_user_id,
             prompt=project.logline or "", response=prefill_raw, tokens=prefill_usage,
@@ -1825,6 +1928,7 @@ async def analyze_logline(
                     raise
                 stale = True
             await write_setup_ai_audit(
+                project_token_preserved=bool(attempt_usage),
                 user_id=current_user.id, project_id=project_id,
                 billed_user_id=billed_user_id,
                 action="generate_quick_setup_draft", prompt=project.logline or "",
@@ -2098,6 +2202,7 @@ async def analyze_logline(
 async def generate_scenes(
     project_id: int,
     selected_option: Optional[str] = Query(default=None, max_length=1000),
+    context_revision: Optional[str] = Query(default=None, max_length=128),
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
@@ -2114,11 +2219,72 @@ async def generate_scenes(
     if role not in {"owner", "editor"}:
         raise HTTPException(status_code=404, detail="Project not found")
     project.access_role = role
+
+    def validate_generation_setup() -> dict[str, Any]:
+        if not isinstance(context_revision, str) or (
+            context_revision != setup_context_revision(project)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="设定版本已失效，请刷新并确认正式设定后重试。",
+            )
+        formal_context = (
+            dict(project.global_context)
+            if isinstance(project.global_context, dict)
+            else {}
+        )
+        if formal_context.get("final_confirm") != "confirmed":
+            raise HTTPException(
+                status_code=409,
+                detail="正式设定尚未确认，请完成设定并确认后再生成。",
+            )
+        try:
+            setup_fields.normalize_complete({
+                **{
+                    key: value
+                    for key, value in formal_context.items()
+                    if key in setup_fields.SETUP_FIELDS
+                },
+                "project_type": project.project_type,
+                "title": formal_context.get("title") or project.title,
+            })
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"正式设定不完整：{exc}",
+            ) from exc
+        return formal_context
+
+    validate_generation_setup()
     if not await claim_generation(db, project_id, current_user.id):
         await db.rollback()
         raise HTTPException(status_code=409, detail="该项目已有生成任务正在运行")
-    await db.commit()
     await db.refresh(project)
+    try:
+        validate_generation_setup()
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    existing_scene_count = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(models.Scene)
+            .where(models.Scene.project_id == project_id)
+        )
+        or 0
+    )
+    explicit_regeneration = (
+        isinstance(selected_option, str)
+        and selected_option.strip().lower() == "auto"
+    )
+    if existing_scene_count and not explicit_regeneration:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="项目已有场次；请明确选择全量重新生成后重试。",
+        )
+    await db.commit()
 
     try:
         c = await ensure_story_synopsis(project, project.global_context or {}, db, actor_id=current_user.id)
@@ -2174,14 +2340,6 @@ async def generate_scenes(
 
     # Force clearing of any old scenes from a previous attempt
     try:
-        existing_scene_count = int(
-            await db.scalar(
-                select(func.count())
-                .select_from(models.Scene)
-                .where(models.Scene.project_id == project_id)
-            )
-            or 0
-        )
         if existing_scene_count:
             await create_project_version(
                 db,
@@ -2198,6 +2356,7 @@ async def generate_scenes(
                 "style_context": style_context,
                 "target_count": target_count,
                 "user_id": current_user.id,
+                "context_revision": context_revision,
             },
         )
         await db.commit()
@@ -2221,9 +2380,19 @@ async def generate_scenes(
 
 # --- Background Task Implementation ---
 
-async def run_incremental_outline_generation(project_id: int, style_context: str, target_count: int, user_id: int):
+async def run_incremental_outline_generation(
+    project_id: int,
+    style_context: str,
+    target_count: int,
+    user_id: int,
+    *,
+    job_id: Optional[int] = None,
+    lock_token: Optional[str] = None,
+):
     logger.info(f"[Task] Starting Incremental Outline Gen for Project {project_id}")
-    
+    if job_id is not None:
+        await assert_generation_job_active(job_id, lock_token)
+
     async with database.SessionLocal() as db:
         project = await db.get(models.Project, project_id)
         if not project:
@@ -2233,7 +2402,19 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
         # Using 1 allows frontend to see each scene pop up.
         batch_size = 1 
         current_idx = 1
-        generated_scenes: list[models.Scene] = []
+        existing_scenes = (
+            await db.scalars(
+                select(models.Scene)
+                .where(models.Scene.project_id == project_id)
+                .order_by(models.Scene.scene_index)
+            )
+        ).all()
+        scenes_by_index = {
+            int(scene.scene_index): scene
+            for scene in existing_scenes
+            if int(scene.scene_index or 0) > 0
+        }
+        generated_scenes: list[models.Scene] = list(existing_scenes)
         story_bible = build_story_bible(
             logline=project.logline,
             project_type=project.project_type,
@@ -2248,17 +2429,32 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
         
         try:
             while current_idx <= target_count:
+                if job_id is not None:
+                    await assert_generation_job_active(job_id, lock_token)
                 # Re-check status in case user cancelled or a restart recovered the job.
                 await db.refresh(project)
                 if project.status != models.ProcessingStatus.GENERATING:
                     logger.info("[Task] Outline generation no longer active.")
                     return
 
+                # Automatic worker retries resume from durable output. Only the
+                # explicit full-regeneration API clears existing scenes.
+                if current_idx in scenes_by_index:
+                    current_idx += batch_size
+                    continue
+
                 end_idx = min(current_idx + batch_size - 1, target_count)
                 logger.info(f"[Task] Generating scenes {current_idx}-{end_idx}...")
                 continuity_context = build_outline_continuity_context(
                     story_bible=story_bible,
-                    prior_scenes=generated_scenes,
+                    prior_scenes=sorted(
+                        (
+                            scene
+                            for scene in generated_scenes
+                            if int(scene.scene_index) < current_idx
+                        ),
+                        key=lambda scene: scene.scene_index,
+                    ),
                     current_index=current_idx,
                     total_scenes=target_count,
                 )
@@ -2276,7 +2472,11 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                         total_target=target_count,
                         template_instructions=template_instructions,
                     ),
+                    job_id=job_id,
+                    lock_token=lock_token,
                 )
+                if job_id is not None:
+                    await assert_generation_job_active(job_id, lock_token)
                 await db.refresh(project)
                 if project.status != models.ProcessingStatus.GENERATING:
                     logger.info(
@@ -2295,7 +2495,14 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                     )
                     guarded_context = build_outline_continuity_context(
                         story_bible=story_bible,
-                        prior_scenes=generated_scenes,
+                        prior_scenes=sorted(
+                            (
+                                scene
+                                for scene in generated_scenes
+                                if int(scene.scene_index) < current_idx
+                            ),
+                            key=lambda scene: scene.scene_index,
+                        ),
                         current_index=current_idx,
                         total_scenes=target_count,
                         extra_warning=(
@@ -2316,7 +2523,11 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                             total_target=target_count,
                             template_instructions=template_instructions,
                         ),
+                        job_id=job_id,
+                        lock_token=lock_token,
                     )
+                    if job_id is not None:
+                        await assert_generation_job_active(job_id, lock_token)
                     await db.refresh(project)
                     if project.status != models.ProcessingStatus.GENERATING:
                         logger.info(
@@ -2341,6 +2552,11 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                     )
 
                 # Enforce strictly sequential indexing; never trust the model's index.
+                await fence_generation_job_write(
+                    db,
+                    job_id,
+                    lock_token,
+                )
                 for offset, scene_data in enumerate(batch_scenes):
                     outline = str(scene_data.get("outline", "") or "").strip()
                     if not outline:
@@ -2355,14 +2571,24 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
                     )
                     db.add(new_scene)
                     generated_scenes.append(new_scene)
+                    scenes_by_index[current_idx + offset] = new_scene
 
                 await db.commit()
                 current_idx += batch_size
         except Exception as exc:
             await db.rollback()
+            if isinstance(exc, JobLeaseLost):
+                logger.info("[Task] Outline generation lease ended; old worker stopped.")
+                return
             if isinstance(exc, HTTPException) and exc.status_code == 409:
                 return
             logger.exception(f"[Task] Outline generation failed: {exc}")
+            try:
+                await fence_generation_job_write(db, job_id, lock_token)
+            except JobLeaseLost:
+                await db.rollback()
+                logger.info("[Task] Outline failure discarded after lease loss.")
+                return
             project = await db.get(models.Project, project_id)
             if project:
                 project.status = models.ProcessingStatus.FAILED
@@ -2372,7 +2598,14 @@ async def run_incremental_outline_generation(project_id: int, style_context: str
 
         # After Outline Complete -> Trigger Content Generation
         logger.info("[Task] Outline Complete. Starting Content Gen Loop...")
-        await run_generation_loop(project.id, user_id=user_id)
+        if job_id is not None:
+            await assert_generation_job_active(job_id, lock_token)
+        await run_generation_loop(
+            project.id,
+            user_id=user_id,
+            job_id=job_id,
+            lock_token=lock_token,
+        )
 
 
 @app.post("/projects/{project_id}/scenes/{scene_index}/regenerate")
@@ -2656,12 +2889,20 @@ async def export_project(
 
 # --- Background Task (The Engine) ---
 
-async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
+async def _run_generation_loop(
+    project_id: int,
+    user_id: Optional[int] = None,
+    *,
+    job_id: Optional[int] = None,
+    lock_token: Optional[str] = None,
+):
     """
     The Core Loop: Iterates scenes and generates content with Rolling Summary.
     """
     logger.info(f"[后台任务] 开始为项目 {project_id} 生成剧本内容...")
-    
+    if job_id is not None:
+        await assert_generation_job_active(job_id, lock_token)
+
     async with database.SessionLocal() as db:
         project = await db.get(models.Project, project_id)
         if not project: 
@@ -2680,6 +2921,7 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
         scenes = result.scalars().all()
         if not scenes:
             exc = RuntimeError("项目没有可生成的场次")
+            await fence_generation_job_write(db, job_id, lock_token)
             project.status = models.ProcessingStatus.FAILED
             record_generation_error(project, exc, stage="content")
             await db.commit()
@@ -2701,6 +2943,8 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
         )
 
         for scene in scenes:
+            if job_id is not None:
+                await assert_generation_job_active(job_id, lock_token)
             try:
                 await db.refresh(project)
             except Exception:
@@ -2720,6 +2964,7 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
             scene_index = scene.scene_index
             scene_outline = scene.outline
             logger.info(f"[后台任务] 正在生成第 {scene_index} 场: {scene_outline[:30]}...")
+            await fence_generation_job_write(db, job_id, lock_token)
             scene.status = models.ProcessingStatus.GENERATING
             await db.commit()
 
@@ -2747,6 +2992,8 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                             previous_context=continuity_context,
                             template_instructions=template_instructions,
                         ),
+                        job_id=job_id,
+                        lock_token=lock_token,
                     )
                 else:
                     generated_content, usage = await run_project_ai_call(
@@ -2763,8 +3010,12 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                             total_scenes=total_scenes,
                             template_instructions=template_instructions,
                         ),
+                        job_id=job_id,
+                        lock_token=lock_token,
                     )
 
+                if job_id is not None:
+                    await assert_generation_job_active(job_id, lock_token)
                 await db.refresh(project)
                 if project.status != models.ProcessingStatus.GENERATING:
                     logger.info(
@@ -2799,6 +3050,8 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                                 previous_context=guarded_context,
                                 template_instructions=template_instructions,
                             ),
+                            job_id=job_id,
+                            lock_token=lock_token,
                         )
                     else:
                         retry_content, retry_usage = await run_project_ai_call(
@@ -2814,7 +3067,11 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                                 total_scenes=total_scenes,
                                 template_instructions=template_instructions,
                             ),
+                            job_id=job_id,
+                            lock_token=lock_token,
                         )
+                    if job_id is not None:
+                        await assert_generation_job_active(job_id, lock_token)
                     await db.refresh(project)
                     if project.status != models.ProcessingStatus.GENERATING:
                         logger.info(
@@ -2829,6 +3086,7 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                     ):
                         raise RuntimeError("连续性守卫拒绝了疑似重新开篇的场次正文")
 
+                await fence_generation_job_write(db, job_id, lock_token)
                 scene.content = generated_content
                 scene.summary = summarize_scene_for_continuity(
                     scene_outline,
@@ -2844,7 +3102,22 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                 logger.info(f"[后台任务] 第 {scene_index} 场生成完成")
             except Exception as exc:
                 await db.rollback()
+                if isinstance(exc, JobLeaseLost):
+                    logger.info(
+                        "[后台任务] 第 %s 场在租约结束后丢弃，旧 worker 停止。",
+                        scene_index,
+                    )
+                    return
                 if isinstance(exc, HTTPException) and exc.status_code == 409:
+                    return
+                try:
+                    await fence_generation_job_write(db, job_id, lock_token)
+                except JobLeaseLost:
+                    await db.rollback()
+                    logger.info(
+                        "[后台任务] 第 %s 场的失败状态因租约失效而丢弃。",
+                        scene_index,
+                    )
                     return
                 project = await db.get(models.Project, project_id)
                 failed_scene = await db.get(models.Scene, scene_id)
@@ -2860,15 +3133,33 @@ async def _run_generation_loop(project_id: int, user_id: Optional[int] = None):
                 )
                 return
 
+        await fence_generation_job_write(db, job_id, lock_token)
         project.status = models.ProcessingStatus.COMPLETED
         await db.commit()
         logger.info(f"[后台任务] 项目 {project_id} 所有剧本生成任务完成！")
 
 
-async def run_generation_loop(project_id: int, user_id: Optional[int] = None):
+async def run_generation_loop(
+    project_id: int,
+    user_id: Optional[int] = None,
+    *,
+    job_id: Optional[int] = None,
+    lock_token: Optional[str] = None,
+):
     """Run the generation engine and guarantee a terminal failure state."""
     try:
-        await _run_generation_loop(project_id, user_id=user_id)
+        await _run_generation_loop(
+            project_id,
+            user_id=user_id,
+            job_id=job_id,
+            lock_token=lock_token,
+        )
+    except JobLeaseLost:
+        logger.info(
+            "[后台任务] 项目 %s 的任务租约已结束，旧 worker 不再写入。",
+            project_id,
+        )
+        return
     except Exception as exc:
         logger.exception(
             "[后台任务] 项目 %s 发生未处理的生成错误: %s",
@@ -2877,9 +3168,13 @@ async def run_generation_loop(project_id: int, user_id: Optional[int] = None):
         )
         try:
             async with database.SessionLocal() as db:
-                await mark_claimed_project_failed(db, project_id)
+                if job_id is not None:
+                    await fence_generation_job_write(db, job_id, lock_token)
+                else:
+                    await mark_claimed_project_failed(db, project_id)
                 project = await db.get(models.Project, project_id)
                 if project:
+                    project.status = models.ProcessingStatus.FAILED
                     record_generation_error(project, exc, stage="content")
                 await db.execute(
                     update(models.Scene)
@@ -2888,6 +3183,11 @@ async def run_generation_loop(project_id: int, user_id: Optional[int] = None):
                     .values(status=models.ProcessingStatus.FAILED)
                 )
                 await db.commit()
+        except JobLeaseLost:
+            logger.info(
+                "[后台任务] 项目 %s 的异常恢复写入因租约失效而丢弃。",
+                project_id,
+            )
         except Exception as recovery_exc:
             logger.critical(
                 "[后台任务] 项目 %s 的失败状态无法写入: %s",

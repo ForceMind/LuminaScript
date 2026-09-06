@@ -366,10 +366,27 @@ async def test_nonempty_semantically_invalid_target_can_be_repaired(monkeypatch,
 ])
 async def test_generation_queue_uses_precise_duration_semantics(project_type, duration_key, duration, count):
     async with database.SessionLocal() as session:
-        user, project = await seed_project(session, project_type=project_type, context={
-            duration_key: duration, "synopsis_brief": "已存在梗概", "synopsis_detailed": "已存在详细梗概",
+        context = draft(project_type)
+        context.update({
+            duration_key: duration,
+            "final_confirm": "confirmed",
+            "synopsis_brief": "已存在梗概",
+            "synopsis_detailed": "已存在详细梗概",
         })
-        result = await main.generate_scenes(1, selected_option="auto", db=session, current_user=user)
+        if project_type == "movie":
+            context["scene_count_target"] = str(count)
+        user, project = await seed_project(
+            session,
+            project_type=project_type,
+            context=context,
+        )
+        result = await main.generate_scenes(
+            1,
+            selected_option="auto",
+            context_revision=project.context_revision,
+            db=session,
+            current_user=user,
+        )
         job = await session.get(models.GenerationJob, result["job_id"])
         assert job.payload["target_count"] == count
         if project_type == "short_video":

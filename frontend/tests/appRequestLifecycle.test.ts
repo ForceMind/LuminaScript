@@ -124,9 +124,11 @@ test('实际 analyze 在生成请求等待时切项目，不再发旧项目的�
     state.currentProject.value = { id: 1, context_revision: 'setup-v2:0:0', status: 'pending', scenes: [] }
     state.fetchProjectDetail = async () => { details += 1; return state.currentProject.value }
     state.fetchProjectJobs = async () => { jobs += 1; return [] }
-    state.api.post = async (url: string) => {
+    state.api.post = async (url: string, _payload?: unknown, config?: any) => {
         if (url.endsWith('/analyze')) return { data: { type: 'completed' } }
         assert.equal(url, '/projects/1/generate_scenes')
+        assert.equal(config?.params?.selected_option, 'auto')
+        assert.equal(config?.params?.context_revision, 'setup-v2:0:0')
         started()
         return new Promise((resolve) => { releaseGeneration = resolve })
     }
