@@ -126,6 +126,8 @@ const quickReviewAiCandidateBusy = ref(false)
 const quickReviewAiRequestSequence = ref(0)
 const loading = ref(false)
 const loadingText = ref('AI 正在思考中...')
+const createProjectSubmitting = ref(false)
+const submitChoiceSubmitting = ref(false)
 const switchingProject = ref(false)
 const projectList = ref<any[]>([])
 const scenePromptMap = ref<Record<number, string>>({})
@@ -1116,16 +1118,18 @@ onUnmounted(() => {
 
 const createProject = async () => {
   if (!requireOnlineAction()) return
+  if (createProjectSubmitting.value) return
   if (!logline.value) {
       ElMessage.warning('请输入您的创意')
       return
   }
   const request = beginProjectRequest(null, '', 'create')
-  const reviewedLogline = await reviewAndMaybeRewriteInput(logline.value, '用户输入')
-  if (!isProjectRequestCurrent(request)) return
-  logline.value = reviewedLogline
-  startProjectLoading(request, '正在为您构建故事世界...')
+  createProjectSubmitting.value = true
   try {
+    const reviewedLogline = await reviewAndMaybeRewriteInput(logline.value, '用户输入')
+    if (!isProjectRequestCurrent(request)) return
+    logline.value = reviewedLogline
+    startProjectLoading(request, '正在为您构建故事世界...')
     // 1. Create Project (Logline Only)
     const res = await api.post('/projects/', {
       logline: reviewedLogline,
@@ -1133,6 +1137,10 @@ const createProject = async () => {
       project_type: "pending" // Explicitly mark as pending classification
     })
     if (!isProjectRequestCurrent(request)) return
+    // `create` starts before a project exists. Settle its null-project request
+    // before installing the returned project, so its finally block cannot leave
+    // the next project's loading lifecycle stuck.
+    finishProjectLoading(request)
     invalidateProjectRequests()
     currentProject.value = res.data
     scenePromptMap.value = {}
@@ -1147,6 +1155,7 @@ const createProject = async () => {
       ElMessage.error('创建失败，请稍后重试')
       console.error(e)
   } finally {
+    createProjectSubmitting.value = false
     finishProjectLoading(request)
   }
 }
@@ -1776,6 +1785,7 @@ const analyzeLogline = async (id: number) => {
 
 const submitChoice = async () => {
     if (!requireOnlineAction()) return
+    if (submitChoiceSubmitting.value) return
     if (!currentProject.value) return
     const projectId = currentProject.value.id
     const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
@@ -1785,23 +1795,28 @@ const submitChoice = async () => {
     }
     const request = beginProjectRequest(projectId, contextRevision, 'choice-submit')
     const interactionSnapshot = { ...(interaction.value || {}) }
-    
-    let finalAnswer = selectedOption.value || customInput.value
+    const selectedOptionSnapshot = selectedOption.value
+    const customInputSnapshot = customInput.value
+    let finalAnswer = selectedOptionSnapshot || customInputSnapshot
     if (!finalAnswer) {
         ElMessage.warning('请选择一个选项或自行输入')
         return
     }
+    submitChoiceSubmitting.value = true
+    startProjectLoading(request, '正在审核并记录您的决定...')
 
-    // Only review direct user free text, not AI-provided option values.
-    if (!selectedOption.value && customInput.value) {
-        finalAnswer = await reviewAndMaybeRewriteInput(customInput.value, '用户输入')
-        if (!isProjectRequestCurrent(request)) return
-        customInput.value = finalAnswer
-    }
-
-    startProjectLoading(request, '正在记录您的决定并生成下一个问题...')
-    
     try {
+        // Only review direct user free text, not AI-provided option values.
+        if (!selectedOptionSnapshot && customInputSnapshot) {
+            finalAnswer = await reviewAndMaybeRewriteInput(customInputSnapshot, '用户输入')
+            if (!isProjectRequestCurrent(request)) return
+            if (selectedOption.value !== selectedOptionSnapshot || customInput.value !== customInputSnapshot) {
+                ElMessage.warning('提交期间检测到新的输入，已保留新内容，请确认后重新提交。')
+                return
+            }
+            customInput.value = finalAnswer
+        }
+        loadingText.value = '正在记录您的决定并生成下一个问题...'
         // We now treat all interactions as "updating project state"
         // The backend `update_project` PATCH can handle generic context updates if we design it so.
         // But currently we have specific logic.
@@ -1846,10 +1861,14 @@ const submitChoice = async () => {
     } catch (e: any) {
         console.error(e)
         ElMessage.error(e.response?.data?.detail || '提交失败，请稍后重试')
-    } finally { finishProjectLoading(request) }
+    } finally {
+        submitChoiceSubmitting.value = false
+        finishProjectLoading(request)
+    }
 }
 
 const handleOptionSelect = (opt: any) => {
+    if (submitChoiceSubmitting.value) return
     selectedOption.value = opt.value
     customInput.value = '' // clear manual input
 }
@@ -1921,7 +1940,7 @@ const loadProject = async (p: any) => {
             const settledRequest = beginProjectRequest(p.id, currentProjectRevision(), 'load-settle')
             startProjectLoading(settledRequest)
             finishProjectLoading(settledRequest)
-        } else if (!hasScenes && !latestGenerationJob.value && activeStatus !== 'completed' && activeStatus !== 'failed') {
+        } else if (!hasScenes && !latestGenerationJob.value && activeStatus !== 'completed' && activeStatus !== 'failed' && activeProject?.access_role !== 'viewer') {
             loadingText.value = "正在恢复进度..."
             await analyzeLogline(activeProject.id)
         } else {
@@ -1941,7 +1960,7 @@ const loadProject = async (p: any) => {
 
 const deleteProject = async () => {
     if (!requireOnlineAction()) return
-    if (!currentProject.value) return
+    if (!currentProject.value || !ownsCurrentProject.value) return
     const projectId = currentProject.value.id
     const request = beginProjectRequest(projectId, currentProjectRevision(), 'delete-project')
     
@@ -1973,9 +1992,12 @@ const deleteProject = async () => {
 
 const regenerateScene = async (sceneId: number, sceneIndex: number) => {
     if (!requireOnlineAction()) return
-    if (!currentProject.value) return;
+    if (!currentProject.value?.id || !canEditCurrentProject.value) return
+    const projectId = currentProject.value.id
+    const request = beginProjectRequest(projectId, currentProjectRevision(), `scene-regenerate-${sceneId}`)
     try {
-        await api.post(`/projects/${currentProject.value.id}/scenes/${sceneIndex}/regenerate`)
+        await api.post(`/projects/${projectId}/scenes/${sceneIndex}/regenerate`)
+        if (!isProjectRequestCurrent(request)) return
         ElMessage.success(`已请求重写第 ${sceneIndex} 场`)
         // Update local state to reflect pending
         const s = currentProject.value.scenes.find((x:any) => x.id === sceneId)
@@ -1983,9 +2005,13 @@ const regenerateScene = async (sceneId: number, sceneIndex: number) => {
             s.status = 'pending'
             s.content = ''
         }
-        await fetchProjectDetail(currentProject.value.id)
+        await fetchProjectDetail(projectId)
+        if (!isProjectRequestCurrent(request)) return
         startPolling()
-    } catch(e) { console.error(e); ElMessage.error('重试请求失败') }
+    } catch(e) {
+        console.error(e)
+        if (isProjectRequestCurrent(request)) ElMessage.error('重试请求失败')
+    }
 }
 
 const getScenePrompt = (sceneId: number) => {
@@ -1998,16 +2024,19 @@ const isScenePromptLoading = (sceneId: number) => {
 
 const convertSceneToPrompt = async (scene: any) => {
     if (!requireOnlineAction()) return
-    if (!currentProject.value?.id || !scene?.scene_index || !scene?.id) return
+    if (!currentProject.value?.id || !scene?.scene_index || !scene?.id || !canEditCurrentProject.value) return
 
     const sceneId = Number(scene.id)
     const sceneIndex = Number(scene.scene_index)
     if (!sceneId || !sceneIndex) return
+    const projectId = currentProject.value.id
+    const request = beginProjectRequest(projectId, currentProjectRevision(), `scene-prompt-${sceneId}`)
 
     scenePromptLoadingMap.value = { ...scenePromptLoadingMap.value, [sceneId]: true }
 
     try {
-        const res = await api.post(`/projects/${currentProject.value.id}/scenes/${sceneIndex}/to_prompt`)
+        const res = await api.post(`/projects/${projectId}/scenes/${sceneIndex}/to_prompt`)
+        if (!isProjectRequestCurrent(request)) return
         const promptText = toTextValue(res.data?.prompt).trim()
         if (!promptText) {
             ElMessage.warning('AI 提示词为空，请重试')
@@ -2020,9 +2049,11 @@ const convertSceneToPrompt = async (scene: any) => {
         ElMessage.success('已生成 AI 提示词')
     } catch (e: any) {
         console.error(e)
-        ElMessage.error(e.response?.data?.detail || '转写失败，请稍后重试')
+        if (isProjectRequestCurrent(request)) ElMessage.error(e.response?.data?.detail || '转写失败，请稍后重试')
     } finally {
-        scenePromptLoadingMap.value = { ...scenePromptLoadingMap.value, [sceneId]: false }
+        if (isProjectRequestCurrent(request)) {
+            scenePromptLoadingMap.value = { ...scenePromptLoadingMap.value, [sceneId]: false }
+        }
     }
 }
 
@@ -2524,9 +2555,10 @@ const copyText = (value: unknown) => {
                             placeholder="例如：一位退休的刺客因为他的狗被偷而被迫重出江湖..."
                             class="!text-lg !border-none"
                             resize="none"
+                            :disabled="createProjectSubmitting"
                         />
                          <div class="p-2 flex justify-end">
-                            <el-button type="primary" size="large" circle class="!w-12 !h-12 shadow-md" @click="createProject" :loading="loading">
+                            <el-button type="primary" size="large" circle class="!w-12 !h-12 shadow-md" @click="createProject" :disabled="createProjectSubmitting" :loading="createProjectSubmitting">
                                 <el-icon class="text-xl"><MagicStick /></el-icon>
                             </el-button>
                         </div>
@@ -2691,6 +2723,7 @@ const copyText = (value: unknown) => {
                                     <button
                                         v-for="opt in interaction.options"
                                         :key="opt.value"
+                                        :disabled="submitChoiceSubmitting"
                                         @click="handleOptionSelect(opt)"
                                         class="w-full text-left p-4 rounded-xl border-2 transition-all duration-200 flex items-center justify-between group hover:shadow-sm"
                                         :class="selectedOption === opt.value ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-100 hover:border-blue-200 hover:bg-gray-50'"
@@ -2711,6 +2744,7 @@ const copyText = (value: unknown) => {
                                         v-model="customInput"
                                         :placeholder="customInputPlaceholder"
                                         size="large"
+                                        :disabled="submitChoiceSubmitting"
                                         @input="selectedOption = ''"
                                     />
                                 </div>
@@ -2725,7 +2759,7 @@ const copyText = (value: unknown) => {
                                     >
                                         ✨ 剩余内容交给 AI
                                     </el-button>
-                                    <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="!selectedOption && !customInput" :loading="loading">
+                                    <el-button type="primary" class="w-full !rounded-xl !h-12 !text-lg shadow-blue-200 shadow-lg" @click="submitChoice" :disabled="submitChoiceSubmitting || (!selectedOption && !customInput)" :loading="submitChoiceSubmitting">
                                         下一步
                                     </el-button>
                                 </div>
@@ -2791,7 +2825,7 @@ const copyText = (value: unknown) => {
                                 {{ currentProjectTitle }}
                             </h2>
                             <el-button class="shrink-0" size="small" circle :icon="Plus" @click="requestStartNewProject" title="开启新创意"></el-button>
-                            <el-button class="shrink-0" size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
+                            <el-button v-if="ownsCurrentProject" class="shrink-0" size="small" type="danger" circle :icon="Delete" @click="deleteProject" title="删除/终止任务"></el-button>
                         </div>
                         <div class="flex items-center gap-3 shrink-0 max-w-full">
                             <div class="hidden md:flex items-center gap-1 text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded-full whitespace-nowrap">
@@ -2937,6 +2971,16 @@ const copyText = (value: unknown) => {
                                 <el-button v-if="canEditCurrentProject" type="primary" round @click="retryProjectJob(latestGenerationJob)">重新执行生成任务</el-button>
                                 <el-button v-if="currentProject?.id && canEditCurrentProject" plain round @click="analyzeLogline(currentProject.id)">重新检查基础设定</el-button>
                              </div>
+                             <div v-else-if="currentProject?.access_role === 'viewer'" class="py-4 max-w-3xl mx-auto">
+                                <el-alert
+                                    title="该项目暂时没有可显示的剧本场次"
+                                    description="你拥有只读权限。请等待项目所有者或协作编辑继续设定和生成；此页面不会自动发起生成请求。"
+                                    type="info"
+                                    :closable="false"
+                                    show-icon
+                                    class="text-left mb-4"
+                                />
+                             </div>
                              <div v-else class="py-4 max-w-3xl mx-auto">
                                 <el-alert
                                     title="当前没有可显示的剧本场次"
@@ -2973,11 +3017,12 @@ const copyText = (value: unknown) => {
                                      </el-button>
 
                                      <el-button
-                                        v-if="isStatus(scene.status, 'completed')"
+                                        v-if="isStatus(scene.status, 'completed') && canEditCurrentProject"
                                         size="small"
                                         link
                                         type="success"
                                         :loading="isScenePromptLoading(scene.id)"
+                                        :disabled="isScenePromptLoading(scene.id)"
                                         @click="convertSceneToPrompt(scene)"
                                         title="转写为 AI 提示词"
                                      >
@@ -2986,7 +3031,7 @@ const copyText = (value: unknown) => {
 
                                      <!-- Regenerate Button -->
                                      <el-button 
-                                        v-if="isStatus(scene.status, 'completed')" 
+                                        v-if="isStatus(scene.status, 'completed') && canEditCurrentProject"
                                         size="small" 
                                         link 
                                         type="primary" 

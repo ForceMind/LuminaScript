@@ -99,8 +99,19 @@ const systemLogData = reactive({
     truncated: false,
     content: '',
     error: '',
+    source: '' as 'backend' | 'worker' | 'frontend' | '',
+    lines: 0,
+    keyword: '',
 })
 let systemLogTimer: ReturnType<typeof window.setInterval> | null = null
+let systemLogRequestSequence = 0
+let systemLogRequestActive = true
+type SystemLogRequest = {
+    source: 'backend' | 'worker' | 'frontend'
+    lines: number
+    keyword: string
+}
+let systemLogInFlight: { request: SystemLogRequest; sequence: number; promise: Promise<void> } | null = null
 const usageItems = ref<any[]>([])
 const quotaSavingId = ref<number | null>(null)
 const promptTemplates = ref<any[]>([])
@@ -529,36 +540,98 @@ const adminRetryJob = async (item: any) => {
     }
 }
 
-const fetchSystemLogs = async (showError = true) => {
-    if (systemLogLoading.value) return
-    systemLogLoading.value = true
-    try {
-        const response = await api.get('/admin/ops/system-logs', {
-            params: {
-                source: systemLogSource.value,
-                lines: systemLogLines.value,
-                keyword: systemLogKeyword.value.trim() || undefined,
-            },
-        })
-        Object.assign(systemLogData, {
-            path: String(response.data?.path || ''),
-            available: Boolean(response.data?.available),
-            size_bytes: Number(response.data?.size_bytes || 0),
-            updated_at: String(response.data?.updated_at || ''),
-            line_count: Number(response.data?.line_count || 0),
-            truncated: Boolean(response.data?.truncated),
-            content: String(response.data?.content || ''),
-            error: String(response.data?.error || ''),
-        })
-        await nextTick()
-        if (systemLogViewer.value) {
-            systemLogViewer.value.scrollTop = systemLogViewer.value.scrollHeight
-        }
-    } catch (error: any) {
-        if (showError) ElMessage.error(getApiErrorMessage(error, '无法读取系统日志'))
-    } finally {
-        systemLogLoading.value = false
+const getSystemLogRequestParams = () => ({
+    source: systemLogSource.value,
+    lines: systemLogLines.value,
+    keyword: systemLogKeyword.value.trim(),
+})
+
+const systemLogDataMatches = (params = getSystemLogRequestParams()) => (
+    systemLogData.source === params.source
+    && systemLogData.lines === params.lines
+    && systemLogData.keyword === params.keyword
+)
+
+const isSameSystemLogRequest = (left: SystemLogRequest, right: SystemLogRequest) => (
+    left.source === right.source
+    && left.lines === right.lines
+    && left.keyword === right.keyword
+)
+
+const canDownloadSystemLogs = () => (
+    !systemLogLoading.value
+    && systemLogDataMatches()
+    && Boolean(systemLogData.content)
+)
+
+const isSystemLogViewerAtBottom = (viewer: HTMLElement) => (
+    viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight <= 4
+)
+
+const invalidateSystemLogRequests = () => {
+    systemLogRequestSequence += 1
+    systemLogInFlight = null
+    systemLogLoading.value = false
+}
+
+const fetchSystemLogs = (showError = true): Promise<void> => {
+    const request = getSystemLogRequestParams()
+    if (systemLogInFlight && isSameSystemLogRequest(systemLogInFlight.request, request)) {
+        return systemLogInFlight.promise
     }
+    const requestSequence = ++systemLogRequestSequence
+    const inFlight = {
+        request,
+        sequence: requestSequence,
+        promise: Promise.resolve(),
+    }
+    systemLogInFlight = inFlight
+    systemLogLoading.value = true
+    inFlight.promise = (async () => {
+        try {
+            const response = await api.get('/admin/ops/system-logs', {
+                params: {
+                    source: request.source,
+                    lines: request.lines,
+                    keyword: request.keyword || undefined,
+                },
+            })
+            if (!systemLogRequestActive || requestSequence !== systemLogRequestSequence) return
+            const nextData = {
+                path: String(response.data?.path || ''),
+                available: Boolean(response.data?.available),
+                size_bytes: Number(response.data?.size_bytes || 0),
+                updated_at: String(response.data?.updated_at || ''),
+                line_count: Number(response.data?.line_count || 0),
+                truncated: Boolean(response.data?.truncated),
+                content: String(response.data?.content || ''),
+                error: String(response.data?.error || ''),
+                ...request,
+            }
+            const contentChanged = systemLogData.content !== nextData.content
+            const viewerWasAtBottom = systemLogViewer.value && isSystemLogViewerAtBottom(systemLogViewer.value)
+            const dataChanged = Object.entries(nextData).some(([key, value]) => systemLogData[key as keyof typeof systemLogData] !== value)
+            if (!dataChanged) return
+            Object.assign(systemLogData, nextData)
+            if (!contentChanged || !viewerWasAtBottom) return
+            await nextTick()
+            if (systemLogRequestActive && requestSequence === systemLogRequestSequence && systemLogViewer.value) {
+                systemLogViewer.value.scrollTop = systemLogViewer.value.scrollHeight
+            }
+        } catch (error: any) {
+            if (systemLogRequestActive && requestSequence === systemLogRequestSequence && showError) {
+                ElMessage.error(getApiErrorMessage(error, '无法读取系统日志'))
+            }
+        } finally {
+            if (systemLogInFlight?.sequence === requestSequence) {
+                systemLogInFlight = null
+            }
+            if (systemLogRequestActive && requestSequence === systemLogRequestSequence) {
+                systemLogLoading.value = false
+            }
+        }
+    })()
+    return inFlight.promise
 }
 
 const stopSystemLogAutoRefresh = () => {
@@ -570,8 +643,24 @@ const stopSystemLogAutoRefresh = () => {
 
 const syncSystemLogAutoRefresh = () => {
     stopSystemLogAutoRefresh()
-    if (!systemLogAutoRefresh.value || activeTab.value !== 'system_logs') return
+    if (!systemLogAutoRefresh.value || activeTab.value !== 'system_logs' || document.hidden) return
     systemLogTimer = window.setInterval(() => void fetchSystemLogs(false), 5000)
+}
+
+const handleSystemLogVisibilityChange = () => {
+    if (document.hidden) {
+        invalidateSystemLogRequests()
+        stopSystemLogAutoRefresh()
+        return
+    }
+    syncSystemLogAutoRefresh()
+}
+
+const disposeSystemLogRequests = () => {
+    systemLogRequestActive = false
+    invalidateSystemLogRequests()
+    stopSystemLogAutoRefresh()
+    document.removeEventListener('visibilitychange', handleSystemLogVisibilityChange)
 }
 
 const copySystemLogs = async () => {
@@ -588,15 +677,15 @@ const copySystemLogs = async () => {
 }
 
 const downloadSystemLogs = () => {
-    if (!systemLogData.content) {
-        ElMessage.warning('当前没有可下载的日志')
+    if (!canDownloadSystemLogs()) {
+        ElMessage.warning(systemLogLoading.value ? '日志正在刷新，请等待当前内容加载完成' : '当前没有可下载的日志')
         return
     }
     const blob = new Blob([systemLogData.content], { type: 'text/plain;charset=utf-8' })
     const url = window.URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = `${systemLogSource.value}-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
+    link.download = `${systemLogData.source}-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
     link.click()
     window.URL.revokeObjectURL(url)
 }
@@ -960,11 +1049,13 @@ watch(systemLogSource, () => {
 })
 
 onMounted(() => {
+    systemLogRequestActive = true
+    document.addEventListener('visibilitychange', handleSystemLogVisibilityChange)
     fetchUsers()
 })
 
 onUnmounted(() => {
-    stopSystemLogAutoRefresh()
+    disposeSystemLogRequests()
 })
 </script>
 
@@ -1305,7 +1396,7 @@ onUnmounted(() => {
                         </el-form-item>
                         <el-button type="primary" :loading="systemLogLoading" @click="fetchSystemLogs()">刷新</el-button>
                         <el-button @click="copySystemLogs">复制</el-button>
-                        <el-button @click="downloadSystemLogs">下载当前内容</el-button>
+                        <el-button :disabled="!canDownloadSystemLogs()" @click="downloadSystemLogs">下载当前内容</el-button>
                         <div class="flex items-center gap-2 h-8 text-sm text-gray-500">
                             <el-switch v-model="systemLogAutoRefresh" />
                             5 秒自动刷新

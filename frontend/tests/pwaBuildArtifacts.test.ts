@@ -162,11 +162,13 @@ test('--check 只读验证当前版本、入口资产、语法和完整内容', 
 test('实际 PWA 源产物、版本与构建链保持一致', async () => {
     const frontend = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
     const packageJson = JSON.parse(await readFile(path.join(frontend, 'package.json'), 'utf8'))
+    const lock = JSON.parse(await readFile(path.join(frontend, 'package-lock.json'), 'utf8'))
     const manifest = JSON.parse(await readFile(path.join(frontend, 'public/manifest.webmanifest'), 'utf8'))
     const index = await readFile(path.join(frontend, 'index.html'), 'utf8')
     const offline = await readFile(path.join(frontend, 'public/offline.html'), 'utf8')
 
-    assert.equal(packageJson.version, '0.0.5')
+    assert.equal(packageJson.version, lock.version)
+    assert.equal(packageJson.version, lock.packages[''].version)
     assert.equal(packageJson.scripts.build, 'vue-tsc && vite build && node scripts/generate-pwa-sw.mjs')
     assert.equal(manifest.lang, 'zh-CN')
     assert.equal(manifest.display, 'standalone')

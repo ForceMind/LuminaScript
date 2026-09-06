@@ -39,14 +39,20 @@ function harness(get: (url: string) => Promise<any>) {
         drawerOpen: { value: false },
         latestGenerationJob: { value: null },
         selectedOption: { value: '' }, customInput: { value: '' },
+        logline: { value: '' },
+        createProjectSubmitting: { value: false },
+        submitChoiceSubmitting: { value: false },
+        canEditCurrentProject: { value: true },
+        ownsCurrentProject: { value: true },
         ElMessage: { error() {}, warning() {}, success() {} },
         ElMessageBox: { confirm: async () => {} },
         requireOnlineAction: () => true,
         api: { get },
         confirmQuickReviewLeave: async () => true,
-        upsertProjectListItem() {}, resetQuickReviewState() {}, startPolling() {},
+        upsertProjectListItem() {}, resetQuickReviewState() {}, startPolling() {}, fetchProjects: async () => {},
         syncProjectTokensFromResponse() {}, initializeQuickReview() {},
         normalizeProjectStatus: (value: unknown) => String(value || '').toLowerCase(),
+        toTextValue: (value: unknown) => String(value ?? ''),
         analyzeLogline: async () => { throw new Error('failed details must not start analysis') },
         fetchProjectJobs: async () => [],
         analyzeProjectRequest,
@@ -178,6 +184,185 @@ test('实际 guided 分析将顶层保存稿标志传到返回快速审查入口
     assert.equal(state.interaction.value.field, 'movie_duration')
     assert.equal(state.interaction.value.saved_draft_available, true)
     assert.equal(state.interaction.value.draft_stale, true)
+})
+
+test('viewer 打开无场次项目只进入等待态，不自动发起分析或生成写入', async () => {
+    const { state } = harness(async () => ({}))
+    let analyses = 0
+    state.fetchProjectDetail = async () => ({
+        id: 1,
+        access_role: 'viewer',
+        context_revision: 'setup-v2:0:0',
+        status: 'pending',
+        scenes: [],
+    })
+    state.fetchProjectJobs = async () => []
+    state.analyzeLogline = async () => { analyses += 1 }
+    const app = install(state, [['loadProject', 'deleteProject']])
+    await app.loadProject({ id: 1, access_role: 'viewer', context_revision: 'setup-v2:0:0', status: 'pending' })
+    assert.equal(analyses, 0)
+    assert.equal(state.currentProject.value.access_role, 'viewer')
+    assert.equal(state.loading.value, false)
+})
+
+test('延迟内容审核期间连续创建项目只审核和写入一次，锁在请求结束后释放', async () => {
+    let releaseReview: (value: string) => void = () => {}
+    let reviewStarted: () => void = () => {}
+    const reviewPending = new Promise<void>((resolve) => { reviewStarted = resolve })
+    const { state } = harness(async () => ({}))
+    const writes: string[] = []
+    let reviews = 0
+    state.logline.value = '一个创意'
+    state.reviewAndMaybeRewriteInput = async () => {
+        reviews += 1
+        reviewStarted()
+        return new Promise((resolve) => { releaseReview = resolve })
+    }
+    state.api.post = async (url: string) => {
+        writes.push(url)
+        return { data: { id: 1, context_revision: '', scenes: [] } }
+    }
+    state.analyzeLogline = async () => {}
+    const app = install(state, [['createProject', 'resetQuickReviewState']])
+    const first = app.createProject()
+    await reviewPending
+    assert.equal(state.createProjectSubmitting.value, true)
+    await app.createProject()
+    assert.equal(reviews, 1)
+    releaseReview('一个改写后的创意')
+    await first
+    assert.deepEqual(writes, ['/projects/'])
+    assert.equal(state.createProjectSubmitting.value, false)
+})
+
+test('延迟内容审核期间连续提交选项只审核和写入一次，锁不会停留', async () => {
+    let releaseReview: (value: string) => void = () => {}
+    let reviewStarted: () => void = () => {}
+    const reviewPending = new Promise<void>((resolve) => { reviewStarted = resolve })
+    const { state } = harness(async () => ({}))
+    const writes: string[] = []
+    let reviews = 0
+    state.currentProject.value = { id: 1, context_revision: 'setup-v2:0:0' }
+    state.interaction.value = { field: 'genre', context_revision: 'setup-v2:0:0' }
+    state.customInput.value = '科幻'
+    state.reviewAndMaybeRewriteInput = async () => {
+        reviews += 1
+        reviewStarted()
+        return new Promise((resolve) => { releaseReview = resolve })
+    }
+    state.api.post = async (url: string) => {
+        writes.push(url)
+        return { data: {} }
+    }
+    state.analyzeLogline = async () => {}
+    const app = install(state, [['submitChoice', 'handleOptionSelect']])
+    const first = app.submitChoice()
+    await reviewPending
+    assert.equal(state.submitChoiceSubmitting.value, true)
+    await app.submitChoice()
+    assert.equal(reviews, 1)
+    releaseReview('改写后的科幻')
+    await first
+    assert.deepEqual(writes, ['/projects/1/interact'])
+    assert.equal(state.submitChoiceSubmitting.value, false)
+})
+
+test('审核等待期间出现新的自定义输入时保留新值且取消旧提交', async () => {
+    let releaseReview: (value: string) => void = () => {}
+    let reviewStarted: () => void = () => {}
+    const reviewPending = new Promise<void>((resolve) => { reviewStarted = resolve })
+    const { state } = harness(async () => ({}))
+    const writes: string[] = []
+    const warnings: string[] = []
+    state.ElMessage = { error() {}, success() {}, warning: (message: string) => warnings.push(message) }
+    state.currentProject.value = { id: 1, context_revision: 'setup-v2:0:0' }
+    state.interaction.value = { field: 'genre', context_revision: 'setup-v2:0:0' }
+    state.customInput.value = '原始输入'
+    state.reviewAndMaybeRewriteInput = async () => {
+        reviewStarted()
+        return new Promise((resolve) => { releaseReview = resolve })
+    }
+    state.api.post = async (url: string) => {
+        writes.push(url)
+        return { data: {} }
+    }
+    const app = install(state, [['submitChoice', 'handleOptionSelect']])
+    const pending = app.submitChoice()
+    await reviewPending
+    state.customInput.value = '更新后的输入'
+    releaseReview('审核后的旧输入')
+    await pending
+    assert.equal(state.customInput.value, '更新后的输入')
+    assert.deepEqual(writes, [])
+    assert.equal(state.interaction.value.field, 'genre')
+    assert.equal(state.submitChoiceSubmitting.value, false)
+    assert.equal(warnings.length, 1)
+})
+
+test('非 owner 直接调用删除函数时不发删除请求', async () => {
+    const { state } = harness(async () => ({}))
+    let deletions = 0
+    state.currentProject.value = { id: 1, context_revision: 'setup-v2:0:0' }
+    state.ownsCurrentProject.value = false
+    state.api.delete = async () => { deletions += 1 }
+    const app = install(state, [['deleteProject', 'regenerateScene']])
+    await app.deleteProject()
+    assert.equal(deletions, 0)
+})
+
+test('场次请求等待时切到 B，A 的转写和重写回包不污染 B 或显示旧提示', async () => {
+    let releaseRegenerate: () => void = () => {}
+    let releasePrompt: () => void = () => {}
+    let regenerateStarted: () => void = () => {}
+    let promptStarted: () => void = () => {}
+    const regeneratePending = new Promise<void>((resolve) => { regenerateStarted = resolve })
+    const promptPending = new Promise<void>((resolve) => { promptStarted = resolve })
+    const { state, guard } = harness(async () => ({}))
+    const success: string[] = []
+    const errors: string[] = []
+    let details = 0
+    state.ElMessage = { success: (message: string) => success.push(message), error: (message: string) => errors.push(message), warning() {} }
+    state.currentProject.value = {
+        id: 1,
+        context_revision: 'setup-v2:0:0',
+        scenes: [{ id: 11, scene_index: 1, status: 'completed', content: 'A 内容' }],
+    }
+    state.api.post = async (url: string) => {
+        if (url.endsWith('/regenerate')) {
+            regenerateStarted()
+            return new Promise((resolve) => { releaseRegenerate = () => resolve({ data: {} }) })
+        }
+        assert.equal(url, '/projects/1/scenes/1/to_prompt')
+        promptStarted()
+        return new Promise((resolve) => { releasePrompt = () => resolve({ data: { prompt: 'A 提示词' } }) })
+    }
+    state.fetchProjectDetail = async () => { details += 1; return state.currentProject.value }
+    state.toTextValue = (value: unknown) => String(value ?? '')
+    const app = install(state, [
+        ['regenerateScene', 'getScenePrompt'],
+        ['convertSceneToPrompt', 'exportScript'],
+    ])
+    const regenerate = app.regenerateScene(11, 1)
+    await regeneratePending
+    const prompt = app.convertSceneToPrompt({ id: 11, scene_index: 1 })
+    await promptPending
+    guard.invalidate()
+    state.currentProject.value = {
+        id: 2,
+        context_revision: 'setup-v2:0:0',
+        scenes: [{ id: 21, scene_index: 1, status: 'completed', content: 'B 内容' }],
+    }
+    state.scenePromptMap.value = { 21: 'B 提示词' }
+    state.scenePromptLoadingMap.value = { 21: true }
+    releaseRegenerate()
+    releasePrompt()
+    await Promise.all([regenerate, prompt])
+    assert.equal(state.currentProject.value.scenes[0].content, 'B 内容')
+    assert.deepEqual(state.scenePromptMap.value, { 21: 'B 提示词' })
+    assert.deepEqual(state.scenePromptLoadingMap.value, { 21: true })
+    assert.equal(details, 0)
+    assert.deepEqual(success, [])
+    assert.deepEqual(errors, [])
 })
 
 test('实际 getProjectTitle 优先保留权威 project.title 的内部标点', () => {
