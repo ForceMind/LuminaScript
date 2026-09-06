@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="妙笔流光">
+  <defs>
+    <linearGradient id="bg" x1="52" y1="48" x2="456" y2="468" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e8f4ff"/>
+      <stop offset="1" stop-color="#b9dcff"/>
+    </linearGradient>
+    <linearGradient id="pen" x1="184" y1="142" x2="354" y2="366" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="154" fill="#fff" opacity=".94"/>
+  <path d="M180 344c28-74 75-138 148-192 13-9 31-6 40 7 9 13 6 31-7 40-67 49-108 105-132 172l-67 29 18-56Z" fill="url(#pen)"/>
+  <path d="m162 400 18-56 49 27-67 29Z" fill="#1e3a8a"/>
+  <path d="M303 176c20 3 39 17 51 39" fill="none" stroke="#fff" stroke-linecap="round" stroke-width="14"/>
+  <circle cx="150" cy="184" r="13" fill="#60a5fa"/>
+  <circle cx="382" cy="318" r="10" fill="#93c5fd"/>
+  <path d="M120 268h28M134 254v28M366 132h24M378 120v24" stroke="#2563eb" stroke-linecap="round" stroke-width="9"/>
+</svg>

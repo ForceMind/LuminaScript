@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>暂时离线 - 妙笔流光</title>
+    <style>
+      :root { color-scheme: light; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { min-height: 100vh; min-height: 100dvh; margin: 0; display: grid; place-items: center; padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left)); color: #334155; background: #f5f7fa; }
+      main { width: min(100%, 430px); padding: 32px; text-align: center; background: white; border: 1px solid #e2e8f0; border-radius: 20px; box-shadow: 0 20px 45px rgb(15 23 42 / 9%); }
+      img { width: 84px; height: 84px; }
+      h1 { margin: 18px 0 10px; color: #1e293b; font-size: 24px; }
+      p { margin: 0; line-height: 1.7; }
+      .note { margin-top: 14px; color: #64748b; font-size: 14px; }
+      button { min-width: 120px; min-height: 44px; margin-top: 24px; padding: 10px 20px; color: white; font: inherit; font-weight: 600; background: #409eff; border: 0; border-radius: 12px; cursor: pointer; }
+      button:focus-visible { outline: 3px solid #93c5fd; outline-offset: 3px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/pwa-192.png" alt="" />
+      <h1>当前处于离线状态</h1>
+      <p>妙笔流光的离线能力仅提供此提示页。</p>
+      <p class="note">项目数据、账户功能与 AI 生成都需要联网；恢复网络后请重试。</p>
+      <button type="button" onclick="location.reload()">重新连接</button>
+    </main>
+  </body>
+</html>

@@ -41,6 +41,7 @@ function harness(get: (url: string) => Promise<any>) {
         selectedOption: { value: '' }, customInput: { value: '' },
         ElMessage: { error() {}, warning() {}, success() {} },
         ElMessageBox: { confirm: async () => {} },
+        requireOnlineAction: () => true,
         api: { get },
         confirmQuickReviewLeave: async () => true,
         upsertProjectListItem() {}, resetQuickReviewState() {}, startPolling() {},

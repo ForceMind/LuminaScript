@@ -38,6 +38,7 @@ import {
     normalizeTitleDisplay,
 } from './setupFieldPresentation'
 import { draftValuesDiffer, hydrateQuickReviewDraft, quickReviewAiEligibility, savedDraftResult } from './quickReviewDraft'
+import { getPwaManager, PwaReloadGuard, type PwaSnapshot } from './pwa'
 
 marked.setOptions({ gfm: true, breaks: true })
 const AdminDashboard = defineAsyncComponent(
@@ -84,6 +85,9 @@ const token = ref(localStorage.getItem('token') || '')
 const user = ref<any>(null)
 const drawerOpen = ref(false)
 const showAdmin = ref(false)
+const pwaManager = getPwaManager()
+const pwaSnapshot = ref<PwaSnapshot>({ ...pwaManager.snapshot })
+let unsubscribePwa: (() => void) | null = null
 
 // Auth Form
 const isLoginMode = ref(true)
@@ -146,6 +150,67 @@ const quickReviewHasUnsavedChanges = computed(() => draftValuesDiffer(
     quickReviewValues.value,
     quickReviewSavedValues.value,
 ))
+const hasPendingPwaWork = computed(() =>
+    quickReviewHasUnsavedChanges.value ||
+    Boolean(logline.value.trim()) ||
+    Boolean(customInput.value.trim()) ||
+    Boolean(selectedOption.value),
+)
+const hasPendingNonDraftPwaWork = computed(() =>
+    Boolean(logline.value.trim()) || Boolean(customInput.value.trim()) || Boolean(selectedOption.value),
+)
+const pwaUpdateActionVisible = computed(() =>
+    ['waiting', 'refresh-required'].includes(pwaSnapshot.value.updateState),
+)
+const pwaUpdateActionLabel = computed(() =>
+    pwaSnapshot.value.updateState === 'refresh-required' ? '刷新以使用已更新版本' : '应用已就绪的更新',
+)
+const pwaUpdateStatusLabel = computed(() => {
+    if (pwaSnapshot.value.updateState === 'waiting') return '更新待确认'
+    if (pwaSnapshot.value.updateState === 'activating-approved') return '正在应用更新'
+    if (pwaSnapshot.value.updateState === 'refresh-required') return '新版本已应用，待刷新'
+    return ''
+})
+const pwaCanInstall = computed(() =>
+    !pwaSnapshot.value.installed &&
+    (pwaSnapshot.value.installAvailable || pwaSnapshot.value.iosInstallHint),
+)
+const pwaConnectionLabel = computed(() => {
+    if (!pwaSnapshot.value.browserOnline) return '浏览器离线'
+    if (pwaSnapshot.value.backendReachability === 'unreachable') return '服务暂不可达'
+    if (pwaSnapshot.value.backendReachability === 'reachable') return '在线'
+    return '网络已连接'
+})
+const pwaConnectionTitle = computed(() => {
+    if (!pwaSnapshot.value.browserOnline) return '项目数据与 AI 生成需要联网'
+    if (pwaSnapshot.value.backendReachability === 'unreachable') return '浏览器已联网，但暂时无法访问后端'
+    return '项目数据与 AI 生成使用在线服务'
+})
+const createPwaReloadWorkSnapshot = () => JSON.stringify({
+    projectId: currentProject.value?.id ?? null,
+    contextRevision: currentProjectRevision(),
+    interactionField: interactionField.value,
+    logline: logline.value,
+    customInput: customInput.value,
+    selectedOption: selectedOption.value,
+    quickReviewDraftStale: quickReviewDraftStale.value,
+    quickReviewValues: quickReviewValues.value,
+    quickReviewSavedValues: quickReviewSavedValues.value,
+    quickReviewEditedFields: quickReviewEditedFields.value,
+    quickReviewAiAdjustedFields: quickReviewAiAdjustedFields.value,
+    quickReviewSavedAt: quickReviewSavedAt.value,
+})
+const pwaReloadGuard = new PwaReloadGuard(
+    createPwaReloadWorkSnapshot,
+    (callback) => { window.setTimeout(callback, 1000) },
+)
+pwaManager.setBeforeReloadCheck(() => pwaReloadGuard.checkBeforeReload())
+const requireOnlineAction = () => {
+    if (pwaManager.snapshot.browserOnline) return true
+    stopPolling()
+    ElMessage.warning('当前处于离线状态，项目数据与 AI 操作需要联网。')
+    return false
+}
 const quickReviewCanSave = computed(() => !quickReviewDraftStale.value && (
     !quickReviewSavedAt.value || quickReviewHasUnsavedChanges.value
 ))
@@ -557,8 +622,13 @@ api.interceptors.request.use((config) => {
 })
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    pwaManager.reportBackendReachability('reachable')
+    return response
+  },
   (error) => {
+    const status = Number(error.response?.status || 0)
+    pwaManager.reportBackendReachability(error.response && ![502, 504].includes(status) ? 'reachable' : 'unreachable')
     if (error.response && error.response.status === 401) {
       if (token.value) {
         ElMessage.error('登录状态已失效，请重新登录')
@@ -619,6 +689,7 @@ const reviewAndMaybeRewriteInput = async (rawInput: string, sourceLabel: string)
 
 // --- Logic ---
 const handleAuth = async () => {
+    if (!requireOnlineAction()) return
     if (!authForm.value.username || !authForm.value.password) {
         ElMessage.warning('请输入用户名和密码')
         return
@@ -750,7 +821,7 @@ const syncProjectTokensFromResponse = (payload: any, updateInteraction = false) 
 }
 
 const runPollingCycle = async () => {
-    if (!token.value || !isDocumentVisible()) return
+    if (!token.value || !isDocumentVisible() || !pwaManager.snapshot.browserOnline) return
     if (pollRequestInFlight.value) return
 
     pollRequestInFlight.value = true
@@ -770,7 +841,7 @@ const runPollingCycle = async () => {
 
 const startPolling = () => {
     stopPolling()
-    if (!token.value || !isDocumentVisible()) return
+    if (!token.value || !isDocumentVisible() || !pwaManager.snapshot.browserOnline) return
 
     let delay = 0
     if (currentProject.value?.id && (isSceneGenerationActive(currentProject.value) || isCurrentGenerationJobActive.value)) {
@@ -804,7 +875,8 @@ const handleVisibilityChange = () => {
 }
 
 const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-    if (!quickReviewHasUnsavedChanges.value) return
+    if (pwaReloadGuard.consumeBeforeUnloadBypass()) return
+    if (!hasPendingPwaWork.value) return
     event.preventDefault()
     event.returnValue = ''
 }
@@ -831,6 +903,7 @@ const logout = () => {
 }
 
 const changePassword = async () => {
+    if (!requireOnlineAction()) return
     const getPromptValue = (result: unknown): string => {
         if (typeof result !== 'object' || result === null || !('value' in result)) return ''
         return String((result as { value?: unknown }).value || '')
@@ -884,8 +957,118 @@ const changePassword = async () => {
     }
 }
 
+const requestPwaInstall = async () => {
+    if (pwaSnapshot.value.iosInstallHint && !pwaSnapshot.value.installAvailable) {
+        await ElMessageBox.alert(
+            '在 Safari 底部点击“分享”，然后选择“添加到主屏幕”。',
+            '将妙笔流光添加到主屏幕',
+            { confirmButtonText: '知道了' },
+        )
+        return
+    }
+    try {
+        const accepted = await pwaManager.promptInstall()
+        if (!accepted) ElMessage.info('已取消安装')
+    } catch (error) {
+        console.error('PWA install prompt failed', error)
+        ElMessage.error('暂时无法启动安装，请稍后重试')
+    }
+}
+
+const requestPwaUpdate = async () => {
+    if (!pwaUpdateActionVisible.value) return false
+    const expectedRevision = pwaSnapshot.value.updateRevision
+    const expectedState = pwaSnapshot.value.updateState
+    let updateConfirmed = false
+
+    if (quickReviewHasUnsavedChanges.value && quickReviewDraftStale.value) {
+        try {
+            await ElMessageBox.confirm(
+                '这份过期草案无法保存或合并。可先复制内容；只有明确放弃本地修改后才会继续更新。',
+                '过期草案保护',
+                {
+                    confirmButtonText: '复制草案',
+                    cancelButtonText: '放弃并继续',
+                    distinguishCancelAndClose: true,
+                    type: 'warning',
+                },
+            )
+            copyQuickReviewDraft()
+            ElMessage.info('草案已复制，本次不更新；确认内容安全后可再次选择更新。')
+            return false
+        } catch (reason) {
+            if (reason !== 'cancel') return false
+            updateConfirmed = true
+        }
+    } else if (quickReviewHasUnsavedChanges.value) {
+        try {
+            await ElMessageBox.confirm(
+                '更新前先保存当前快速设定工作稿。保存后如果又出现新编辑，将取消本次更新。',
+                '保存并更新',
+                { confirmButtonText: '保存并更新', cancelButtonText: '稍后处理', type: 'warning' },
+            )
+        } catch {
+            return false
+        }
+        updateConfirmed = true
+        if (!await runQuickReviewDraftAction('save')) return false
+        if (quickReviewHasUnsavedChanges.value) {
+            ElMessage.warning('保存期间检测到新编辑，已保留内容并取消更新。')
+            return false
+        }
+    }
+
+    if (pwaSnapshot.value.updateRevision !== expectedRevision || pwaSnapshot.value.updateState !== expectedState) {
+        ElMessage.info('可用更新已变化，请重新选择更新。')
+        return false
+    }
+
+    if (hasPendingNonDraftPwaWork.value) {
+        try {
+            await ElMessageBox.confirm(
+                '当前还有未提交的创意、自定义输入或已选选项，无法自动保存。继续将明确放弃这些内容。',
+                '放弃未提交输入？',
+                { confirmButtonText: '放弃输入并更新', cancelButtonText: '稍后处理', type: 'warning' },
+            )
+        } catch {
+            return false
+        }
+        updateConfirmed = true
+    } else if (!updateConfirmed) {
+        try {
+            await ElMessageBox.confirm(
+                expectedState === 'refresh-required'
+                    ? '新版本已应用。确认后仅刷新当前页面。'
+                    : '新版本已就绪。确认后将应用更新并刷新当前页面。',
+                expectedState === 'refresh-required' ? '刷新当前页面' : '应用更新',
+                { confirmButtonText: '确认更新', cancelButtonText: '稍后处理', type: 'info' },
+            )
+        } catch {
+            return false
+        }
+    }
+
+    pwaReloadGuard.approveCurrentSnapshot()
+    const applied = expectedState === 'refresh-required'
+        ? pwaManager.refreshAfterExternalUpdate(expectedRevision)
+        : pwaManager.activateWaitingWorker(expectedRevision)
+    if (!applied) {
+        pwaReloadGuard.cancelApproval()
+        ElMessage.info('更新目标已失效或内容已变化，没有刷新页面。')
+    }
+    return applied
+}
+
 const handleAccountCommand = (command: string) => {
     drawerOpen.value = false
+    if (command === 'pwa-install') {
+        void requestPwaInstall()
+        return
+    }
+    if (command === 'pwa-update') {
+        void requestPwaUpdate()
+        return
+    }
     if (command === 'admin' && user.value?.is_admin) {
         showAdmin.value = true
         return
@@ -899,11 +1082,22 @@ const handleAccountCommand = (command: string) => {
 
 // Start polling if token exists on load
 if (token.value) {
-    fetchUser()
-    fetchProjects().finally(() => startPolling())
+    if (pwaSnapshot.value.browserOnline) {
+        fetchUser()
+        fetchProjects().finally(() => startPolling())
+    }
 } 
 
 onMounted(() => {
+    unsubscribePwa = pwaManager.subscribe((snapshot) => {
+        const wasOnline = pwaSnapshot.value.browserOnline
+        pwaSnapshot.value = { ...snapshot }
+        if (!snapshot.browserOnline) {
+            stopPolling()
+        } else if (!wasOnline && token.value && isDocumentVisible()) {
+            void Promise.all([fetchUser(), fetchProjects()]).finally(() => startPolling())
+        }
+    })
     if (typeof document !== 'undefined') {
         document.addEventListener('visibilitychange', handleVisibilityChange)
         window.addEventListener('beforeunload', handleBeforeUnload)
@@ -912,6 +1106,8 @@ onMounted(() => {
 
 onUnmounted(() => {
     stopPolling()
+    unsubscribePwa?.()
+    unsubscribePwa = null
     if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityChange)
         window.removeEventListener('beforeunload', handleBeforeUnload)
@@ -919,6 +1115,7 @@ onUnmounted(() => {
 })
 
 const createProject = async () => {
+  if (!requireOnlineAction()) return
   if (!logline.value) {
       ElMessage.warning('请输入您的创意')
       return
@@ -1024,6 +1221,7 @@ const markQuickReviewFieldEdited = (key: string) => {
 type QuickReviewDraftAction = 'save' | 'save_guided' | 'discard' | 'regenerate' | 'guided'
 
 const runQuickReviewDraftAction = async (action: QuickReviewDraftAction) => {
+    if (!requireOnlineAction()) return false
     if (!currentProject.value?.id || interactionField.value !== 'quick_review') return false
     if (quickReviewDraftStale.value && !['discard', 'regenerate'].includes(action)) return false
     const projectId = currentProject.value.id
@@ -1175,6 +1373,7 @@ const requestLogout = async () => {
 }
 
 const chooseSetupMode = async (mode: 'ai_fast' | 'guided') => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id) return
     if (interactionField.value === 'quick_review') {
         if (mode === 'guided') {
@@ -1245,6 +1444,7 @@ const showQuickReviewCandidate = (data: any, baseValues: Record<string, string>)
 }
 
 const quickReviewAiRequest = async (field?: string, scope: 'edited_only' | 'related' = 'edited_only') => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewDraftStale.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
@@ -1347,6 +1547,7 @@ const applyQuickReviewFieldOption = () => {
 }
 
 const regenerateQuickReviewField = async (field: string) => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id || !interaction.value?.context_revision || quickReviewAiCandidateBusy.value || quickReviewDraftStale.value) return
     const projectId = currentProject.value.id
     const contextRevision = interaction.value.context_revision
@@ -1426,6 +1627,7 @@ const applyQuickReviewCandidate = () => {
 }
 
 const submitQuickReview = async (action: 'confirm' | 'guided') => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id || interactionField.value !== 'quick_review') return
     if (quickReviewDraftStale.value) {
         ElMessage.warning('该工作稿已过期，只能复制、重新生成或放弃。')
@@ -1492,6 +1694,7 @@ const submitQuickReview = async (action: 'confirm' | 'guided') => {
 }
 
 const analyzeLogline = async (id: number) => {
+  if (!requireOnlineAction()) return
   if (!id) {
     console.error("Analysis invoked without ID")
     return
@@ -1572,6 +1775,7 @@ const analyzeLogline = async (id: number) => {
 }
 
 const submitChoice = async () => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value) return
     const projectId = currentProject.value.id
     const contextRevision = toTextValue(interaction.value?.context_revision || currentProjectRevision()).trim()
@@ -1663,6 +1867,7 @@ const startNewProject = () => {
 }
 
 const loadProject = async (p: any) => {
+    if (!requireOnlineAction()) return
     // Prevent accidental switch if generating
     if (currentProject.value && normalizeProjectStatus(currentProject.value.status) === 'generating' && currentProject.value.id !== p.id) {
         try {
@@ -1735,6 +1940,7 @@ const loadProject = async (p: any) => {
 }
 
 const deleteProject = async () => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value) return
     const projectId = currentProject.value.id
     const request = beginProjectRequest(projectId, currentProjectRevision(), 'delete-project')
@@ -1766,6 +1972,7 @@ const deleteProject = async () => {
 }
 
 const regenerateScene = async (sceneId: number, sceneIndex: number) => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value) return;
     try {
         await api.post(`/projects/${currentProject.value.id}/scenes/${sceneIndex}/regenerate`)
@@ -1790,6 +1997,7 @@ const isScenePromptLoading = (sceneId: number) => {
 }
 
 const convertSceneToPrompt = async (scene: any) => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id || !scene?.scene_index || !scene?.id) return
 
     const sceneId = Number(scene.id)
@@ -1819,6 +2027,7 @@ const convertSceneToPrompt = async (scene: any) => {
 }
 
 const exportScript = (format: string = 'txt') => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value) return
     
     // Use backend endpoint
@@ -1941,11 +2150,13 @@ const fetchProjectTools = async () => {
 }
 
 const openProjectTools = async () => {
+    if (!requireOnlineAction()) return
     projectToolsVisible.value = true
     await fetchProjectTools()
 }
 
 const createProjectVersion = async () => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id) return
     try {
         await api.post(`/projects/${currentProject.value.id}/versions`, {
@@ -1959,6 +2170,7 @@ const createProjectVersion = async () => {
 }
 
 const showVersionDiff = async (version: any) => {
+    if (!requireOnlineAction()) return
     try {
         const response = await api.get(`/projects/${currentProject.value.id}/versions/${version.id}/diff`)
         versionDiffText.value = String(response.data?.diff || '当前内容与该版本一致')
@@ -1969,6 +2181,7 @@ const showVersionDiff = async (version: any) => {
 }
 
 const restoreProjectVersion = async (version: any) => {
+    if (!requireOnlineAction()) return
     if (!currentProject.value?.id) return
     const projectId = currentProject.value.id
     const contextRevision = currentProjectRevision()
@@ -2001,6 +2214,7 @@ const restoreProjectVersion = async (version: any) => {
 }
 
 const addProjectMember = async () => {
+    if (!requireOnlineAction()) return
     if (!memberForm.value.username.trim()) {
         ElMessage.warning('请输入用户名')
         return
@@ -2019,6 +2233,7 @@ const addProjectMember = async () => {
 }
 
 const updateProjectMember = async (member: any) => {
+    if (!requireOnlineAction()) return
     try {
         await api.patch(`/projects/${currentProject.value.id}/members/${member.id}`, { role: member.role })
         ElMessage.success('成员权限已更新')
@@ -2028,6 +2243,7 @@ const updateProjectMember = async (member: any) => {
 }
 
 const removeProjectMember = async (member: any) => {
+    if (!requireOnlineAction()) return
     try {
         await ElMessageBox.confirm(`确定移除“${member.username}”吗？`, '移除协作成员', { type: 'warning' })
         await api.delete(`/projects/${currentProject.value.id}/members/${member.id}`)
@@ -2040,6 +2256,7 @@ const removeProjectMember = async (member: any) => {
 }
 
 const cancelProjectJob = async (job: any) => {
+    if (!requireOnlineAction()) return
     try {
         await api.post(`/jobs/${job.id}/cancel`)
         await fetchProjectTools()
@@ -2050,6 +2267,7 @@ const cancelProjectJob = async (job: any) => {
 }
 
 const retryProjectJob = async (job: any) => {
+    if (!requireOnlineAction()) return
     try {
         await api.post(`/jobs/${job.id}/retry`)
         await fetchProjectTools()
@@ -2098,13 +2316,13 @@ const copyText = (value: unknown) => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gray-50 text-slate-700 font-sans">
+  <div class="app-root min-h-screen bg-gray-50 text-slate-700 font-sans">
     
     <!-- Auth Overlay -->
-    <div v-if="!token" class="fixed inset-0 z-50 bg-white/95 flex flex-col items-center justify-center p-6">
+    <div v-if="!token" class="auth-overlay fixed inset-0 z-50 bg-white/95 flex flex-col items-center justify-center p-6">
         <div class="w-full max-w-sm">
             <div class="text-center mb-8">
-                <img src="/logo.png" alt="LuminaScript" class="h-24 mx-auto mb-4" />
+                <img src="/pwa-192.png" width="96" height="96" alt="LuminaScript" class="h-24 mx-auto mb-4" />
                 <h1 class="text-3xl font-light tracking-wide text-slate-800">妙笔流光 <span class="text-base block mt-2 font-normal text-gray-400">LuminaScript</span></h1>
             </div>
             <div class="bg-white p-8 rounded-2xl shadow-xl border border-gray-100">
@@ -2126,29 +2344,29 @@ const copyText = (value: unknown) => {
     </div>
 
     <!-- Main Layout -->
-    <div v-else class="flex flex-col h-screen">
+    <div v-else class="app-shell flex flex-col h-screen">
         
         <!-- Header -->
-        <header class="bg-white border-b border-gray-200 h-16 flex items-center justify-between px-4 lg:px-8 shadow-sm shrink-0 z-20">
-            <div class="flex items-center gap-3">
-                <el-button :icon="IconMenu" circle class="lg:hidden" @click="drawerOpen = true" />
-                <img src="/logo.png" alt="Logo" class="h-8 w-auto hidden lg:block" />
-                <span class="text-xl font-light tracking-tight text-slate-800">妙笔<span class="font-bold">流光</span></span>
+        <header class="app-header bg-white border-b border-gray-200 h-16 flex items-center justify-between px-2 sm:px-4 lg:px-8 shadow-sm shrink-0 z-20">
+            <div class="app-brand flex shrink-0 items-center gap-2 lg:gap-3 whitespace-nowrap">
+                <el-button :icon="IconMenu" circle class="mobile-menu-button lg:hidden" aria-label="打开项目菜单" title="打开项目菜单" @click="drawerOpen = true" />
+                <img src="/pwa-192.png" width="32" height="32" alt="Logo" class="h-8 w-auto hidden lg:block" />
+                <span class="brand-name shrink-0 whitespace-nowrap text-xl font-light tracking-tight text-slate-800">妙笔<span class="font-bold">流光</span></span>
             </div>
             <!-- Logline Display in Header -->
-            <div v-if="currentProject && currentProject.logline" class="hidden md:block flex-1 mx-8 max-w-2xl">
+            <div v-if="currentProject && currentProject.logline" class="header-summary hidden md:block min-w-0 flex-1 mx-4 xl:mx-8 max-w-2xl">
                  <div class="text-xs text-gray-400 font-bold uppercase tracking-wider mb-1">我的创意</div>
                  <div class="text-sm text-gray-600 truncate" :title="currentProject.logline">
                      {{ currentProject.logline }}
                  </div>
             </div>
-            <div class="flex items-center gap-3">
-                 <el-button v-if="currentProject?.id" plain @click="openProjectTools">
-                    项目工具
+            <div class="header-actions flex shrink-0 items-center gap-1 lg:gap-3">
+                 <el-button v-if="currentProject?.id" plain class="header-action-button" aria-label="打开项目工具" title="项目工具" @click="openProjectTools">
+                    <el-icon><Monitor /></el-icon><span class="header-action-text">项目工具</span>
                  </el-button>
                  <el-dropdown v-if="currentProject && currentProject.scenes && currentProject.scenes.length > 0" @command="exportScript">
-                    <el-button plain>
-                        <el-icon class="mr-1"><Download /></el-icon> 导出 <el-icon class="el-icon--right"><arrow-down /></el-icon>
+                    <el-button plain class="header-action-button" aria-label="导出剧本" title="导出剧本">
+                        <el-icon><Download /></el-icon><span class="header-action-text">导出</span><el-icon class="header-action-text el-icon--right"><arrow-down /></el-icon>
                     </el-button>
                     <template #dropdown>
                         <el-dropdown-menu>
@@ -2158,7 +2376,9 @@ const copyText = (value: unknown) => {
                         </el-dropdown-menu>
                     </template>
                  </el-dropdown>
-                 <el-button type="primary" round :icon="Plus" @click="requestStartNewProject">开始新创意</el-button>
+                 <el-button type="primary" round class="header-action-button" aria-label="开始新创意" title="开始新创意" @click="requestStartNewProject">
+                    <el-icon><Plus /></el-icon><span class="header-action-text">开始新创意</span>
+                 </el-button>
             </div>
         </header>
 
@@ -2204,10 +2424,18 @@ const copyText = (value: unknown) => {
                             <el-dropdown-menu>
                                 <el-dropdown-item v-if="user?.is_admin" command="admin" :icon="DataLine">管理后台</el-dropdown-item>
                                 <el-dropdown-item command="password" :icon="Edit">修改密码</el-dropdown-item>
+                                <el-dropdown-item v-if="pwaCanInstall" command="pwa-install" :icon="Download">
+                                    {{ pwaSnapshot.iosInstallHint && !pwaSnapshot.installAvailable ? '添加到主屏幕' : '安装应用' }}
+                                </el-dropdown-item>
+                                <el-dropdown-item v-if="pwaUpdateActionVisible" command="pwa-update" :icon="Loading">{{ pwaUpdateActionLabel }}</el-dropdown-item>
                                 <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
                             </el-dropdown-menu>
                         </template>
                     </el-dropdown>
+                    <div class="pwa-status mt-2 text-center text-xs" :class="pwaSnapshot.browserOnline && pwaSnapshot.backendReachability !== 'unreachable' ? 'text-emerald-600' : 'text-amber-600'" :title="pwaConnectionTitle">
+                        <span class="pwa-status-dot" aria-hidden="true"></span>{{ pwaConnectionLabel }}
+                        <span v-if="pwaUpdateStatusLabel"> · {{ pwaUpdateStatusLabel }}</span>
+                    </div>
                     <p class="mt-2 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
                 </div>
             </aside>
@@ -2261,17 +2489,25 @@ const copyText = (value: unknown) => {
                                 <el-dropdown-menu>
                                     <el-dropdown-item v-if="user?.is_admin" command="admin" :icon="DataLine">管理后台</el-dropdown-item>
                                     <el-dropdown-item command="password" :icon="Edit">修改密码</el-dropdown-item>
+                                    <el-dropdown-item v-if="pwaCanInstall" command="pwa-install" :icon="Download">
+                                        {{ pwaSnapshot.iosInstallHint && !pwaSnapshot.installAvailable ? '添加到主屏幕' : '安装应用' }}
+                                    </el-dropdown-item>
+                                    <el-dropdown-item v-if="pwaUpdateActionVisible" command="pwa-update" :icon="Loading">{{ pwaUpdateActionLabel }}</el-dropdown-item>
                                     <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
                                 </el-dropdown-menu>
                             </template>
                         </el-dropdown>
+                        <div class="pwa-status mt-2 text-center text-xs" :class="pwaSnapshot.browserOnline && pwaSnapshot.backendReachability !== 'unreachable' ? 'text-emerald-600' : 'text-amber-600'" :title="pwaConnectionTitle">
+                            <span class="pwa-status-dot" aria-hidden="true"></span>{{ pwaConnectionLabel }}
+                            <span v-if="pwaUpdateStatusLabel"> · {{ pwaUpdateStatusLabel }}</span>
+                        </div>
                         <p class="mt-2 text-center text-xs text-gray-400">LuminaScript v{{ APP_VERSION }}</p>
                     </div>
                 </div>
             </el-drawer>
 
             <!-- Workspace -->
-            <main class="flex-1 overflow-y-auto p-4 lg:p-12 flex flex-col items-center bg-gray-50/50">
+            <main class="app-workspace flex-1 overflow-y-auto p-4 lg:p-12 flex flex-col items-center bg-gray-50/50">
                 
                 <!-- Stage 1: Input -->
                 <div v-if="!currentProject" class="w-full max-w-2xl animate-fade-in-up">

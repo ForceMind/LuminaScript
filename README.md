@@ -29,7 +29,7 @@ LuminaScript/
 
 ## 本地开发
 ### Windows
-1. 安装 Python 3.10+ 和 Node.js 18+
+1. 安装 Python 3.10+ 和 Node.js 20.19+ 或 22.12+（Vite 8 的构建要求）
 2. 在项目根目录运行 `start.bat`
 3. 首次运行按提示设置引导管理员，并补充 `backend/.env` 中的模型配置
 
@@ -38,6 +38,16 @@ LuminaScript/
 默认地址：
 - 前端：`http://localhost:5173`
 - 后端：`http://127.0.0.1:8000`
+
+## PWA（可安装网页应用）
+
+前端支持作为 PWA 安装。在 Chromium 浏览器满足安装条件后，可从账户菜单或移动端菜单选择“安装应用”；iPhone/iPad 请使用 Safari 的“分享 → 添加到主屏幕”。生产环境必须使用 HTTPS（本地 `localhost` 可用于开发验证）。
+
+Service Worker 只预缓存明确列出的静态资源；API、Token、项目内容、管理数据和 AI 响应不会写入该缓存。已有登录 Token 的存储方式保持不变。断网时当前已加载内容仍可查看；重新打开应用显示离线说明页，项目读取、保存和 AI 创作需联网。
+
+新版本等待用户确认。可保存的快速工作稿先保存，保存或激活期间有新编辑则取消刷新；其他未提交输入需先复制或明确放弃。另一个标签更新不会强制刷新当前标签。
+
+开发模式 `npm run dev` 不注册生产 Service Worker。验证 PWA 时先运行 `npm run build`，再运行 `npm run preview`；`node scripts/generate-pwa-sw.mjs --check` 可以只读核对生成产物与当前版本及入口资源是否一致。部署/更新脚本在完整构建或产物检查失败时停止，不跳过检查继续重启服务。
 
 ## 服务器部署
 ### 首次部署

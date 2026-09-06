@@ -41,6 +41,25 @@ mkdir -p "$BACKUP_DIR"
 echo -e "${BLUE}====== 妙笔流光一键更新脚本 ======${NC}"
 echo "项目目录: $PROJECT_DIR"
 
+ensure_frontend_node_version() {
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}未找到 Node.js 或 npm；前端构建要求 Node.js 20.19+ 或 22.12+。请先运行部署脚本更新运行环境。${NC}"
+        exit 1
+    fi
+
+    if ! node -p '
+const [major, minor] = process.versions.node.split(".").map(Number);
+process.exit(
+  (major === 20 && minor >= 19) ||
+  (major === 22 && minor >= 12) ||
+  major > 22 ? 0 : 1,
+);
+' >/dev/null 2>&1; then
+        echo -e "${RED}当前 Node.js $(node -v) 不支持当前 Vite 前端；要求 Node.js 20.19+ 或 22.12+。${NC}"
+        exit 1
+    fi
+}
+
 backup_if_exists() {
     local source_path="$1"
     local relative_path
@@ -299,6 +318,7 @@ backup_if_exists "$RUNTIME_FILE"
 echo -e "${YELLOW}[3/6] 拉取最新代码...${NC}"
 git fetch origin
 git pull --ff-only origin "$CURRENT_BRANCH"
+ensure_frontend_node_version
 # Repair the global command before any migration can stop the update early.
 install_miaobi
 
@@ -344,6 +364,7 @@ fi
 
 echo -e "${YELLOW}[5/6] 构建前端...${NC}"
 cd "$FRONTEND_DIR"
+ensure_frontend_node_version
 if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
     if ! npm ci; then
         echo -e "${YELLOW}npm ci 失败，回退到 npm install。${NC}"
@@ -354,8 +375,12 @@ else
 fi
 
 if ! npm run build; then
-    echo -e "${YELLOW}检测到 npm run build 不可用，自动回退到 vite build。${NC}"
-    npx vite build
+    echo -e "${RED}前端完整构建失败，更新已停止，服务尚未重启。请修复类型检查或 PWA 构建错误后重试。${NC}"
+    exit 1
+fi
+if ! node scripts/generate-pwa-sw.mjs --check; then
+    echo -e "${RED}PWA 构建产物校验失败，更新已停止，服务尚未重启。${NC}"
+    exit 1
 fi
 
 echo -e "${YELLOW}[6/6] 重启当前服务...${NC}"

@@ -160,17 +160,24 @@ check_swap() {
     echo -e "${GREEN}Swap 创建完成。${NC}"
 }
 
-node_major() {
-    if ! command_exists node; then
-        echo 0
-        return
+node_meets_frontend_requirement() {
+    if ! command_exists node || ! command_exists npm; then
+        return 1
     fi
-    node -v | sed -E 's/^v([0-9]+).*/\1/'
+
+    node -p '
+const [major, minor] = process.versions.node.split(".").map(Number);
+process.exit(
+  (major === 20 && minor >= 19) ||
+  (major === 22 && minor >= 12) ||
+  major > 22 ? 0 : 1,
+);
+' >/dev/null 2>&1
 }
 
 ensure_node_from_binary() {
     local node_version arch arch_alias tmpdir tarball_url extract_dir install_dir
-    node_version="${1:-18.20.8}"
+    node_version="${1:-22.23.2}"
     arch="$(uname -m)"
 
     case "$arch" in
@@ -202,9 +209,7 @@ ensure_node_from_binary() {
 }
 
 ensure_node() {
-    local major
-    major="$(node_major)"
-    if [ "$major" -ge 18 ] && command_exists npm; then
+    if node_meets_frontend_requirement; then
         echo "Node.js 已可用: $(node -v)"
         return
     fi
@@ -219,15 +224,13 @@ ensure_node() {
         fi
     fi
 
-    major="$(node_major)"
-    if [ "$major" -lt 18 ] || ! command_exists npm; then
-        echo "系统源 Node.js 版本不足或 npm 缺失，回退到官方二进制安装..."
-        ensure_node_from_binary "18.20.8"
+    if ! node_meets_frontend_requirement; then
+        echo "系统源 Node.js 版本不满足前端构建要求或 npm 缺失，回退到官方二进制安装..."
+        ensure_node_from_binary
     fi
 
-    major="$(node_major)"
-    if [ "$major" -lt 18 ] || ! command_exists npm; then
-        echo -e "${RED}Node.js 安装失败，要求 Node.js >= 18。${NC}"
+    if ! node_meets_frontend_requirement; then
+        echo -e "${RED}Node.js 安装失败，要求 Node.js 20.19+ 或 22.12+。${NC}"
         exit 1
     fi
 
@@ -357,8 +360,12 @@ build_frontend() {
     fi
 
     if ! npm run build; then
-        echo -e "${YELLOW}npm run build 失败，回退到 npx vite build。${NC}"
-        npx vite build
+        echo -e "${RED}前端完整构建失败，部署已停止。请修复类型检查或 PWA 构建错误后重试。${NC}"
+        exit 1
+    fi
+    if ! node scripts/generate-pwa-sw.mjs --check; then
+        echo -e "${RED}PWA 构建产物校验失败，部署已停止。${NC}"
+        exit 1
     fi
 }
 

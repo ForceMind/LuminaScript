@@ -32,6 +32,7 @@ const draftActionState = (post: (url: string, body: any) => Promise<any>) => {
         quickReviewSavedValues: { value: { title: '生成基线' } },
         quickReviewSavedAt: { value: '' },
         api: { post },
+        requireOnlineAction: () => true,
         toTextValue: (value: unknown) => String(value ?? ''),
         currentProjectRevision: () => state.currentProject.value.context_revision,
         beginProjectRequest: () => ({ request: true }),
@@ -139,6 +140,7 @@ test('实际 stale 草案禁止确认和 AI 请求', async () => {
         quickReviewDraftStale: { value: true },
         ElMessage: { warning() {} },
         api: { post: async () => { postCalls += 1; return { data: {} } } },
+        requireOnlineAction: () => true,
     }
     const confirmApp = install(base, 'submitQuickReview', 'analyzeLogline')
     await confirmApp.submitQuickReview('confirm')
@@ -149,7 +151,8 @@ test('实际 stale 草案禁止确认和 AI 请求', async () => {
 
 test('save_guided 竞态留下的 stale 本地编辑仍触发刷新和离开保护', async () => {
     const unloadState: Record<string, any> = {
-        quickReviewHasUnsavedChanges: { value: true },
+        hasPendingPwaWork: { value: true },
+        pwaReloadGuard: { consumeBeforeUnloadBypass: () => false },
     }
     const unloadApp = install(unloadState, 'handleBeforeUnload', 'logout')
     const event: Record<string, any> = { prevented: false, preventDefault() { this.prevented = true } }
@@ -166,4 +169,139 @@ test('save_guided 竞态留下的 stale 本地编辑仍触发刷新和离开保�
     }
     const leaveApp = install(leaveState, 'confirmQuickReviewLeave', 'requestStartNewProject')
     assert.equal(await leaveApp.confirmQuickReviewLeave(), true)
+})
+
+test('beforeunload 统一保护快速草案、创意、自定义输入和已选选项', () => {
+    const values: Record<string, any> = {
+        quickReviewHasUnsavedChanges: { value: false },
+        logline: { value: '' },
+        customInput: { value: '' },
+        selectedOption: { value: '' },
+        computed: (factory: () => unknown) => ({ get value() { return factory() } }),
+    }
+    const computedApp = install(values, 'hasPendingPwaWork', 'hasPendingNonDraftPwaWork')
+    const cases = [
+        ['quickReviewHasUnsavedChanges', true],
+        ['logline', '未提交创意'],
+        ['customInput', '未提交输入'],
+        ['selectedOption', 'choice'],
+    ] as const
+    for (const [name, value] of cases) {
+        values.quickReviewHasUnsavedChanges.value = false
+        values.logline.value = ''
+        values.customInput.value = ''
+        values.selectedOption.value = ''
+        values[name].value = value
+        assert.equal(computedApp.hasPendingPwaWork.value, true)
+    }
+})
+
+test('离线时需网操作会停止轮询并给出明确反馈', () => {
+    let stops = 0
+    let warnings = 0
+    const state: Record<string, any> = {
+        pwaManager: { snapshot: { browserOnline: false } },
+        stopPolling: () => { stops += 1 },
+        ElMessage: { warning: () => { warnings += 1 } },
+    }
+    const app = install(state, 'requireOnlineAction', 'quickReviewCanSave')
+    assert.equal(app.requireOnlineAction(), false)
+    assert.equal(stops, 1)
+    assert.equal(warnings, 1)
+
+    state.pwaManager.snapshot.browserOnline = true
+    assert.equal(app.requireOnlineAction(), true)
+    assert.equal(stops, 1)
+})
+
+const pwaUpdateState = () => {
+    const state: Record<string, any> = {
+        pwaUpdateActionVisible: { value: true },
+        pwaSnapshot: { value: { updateRevision: 7, updateState: 'waiting' } },
+        quickReviewHasUnsavedChanges: { value: true },
+        quickReviewDraftStale: { value: false },
+        hasPendingNonDraftPwaWork: { value: false },
+        ElMessageBox: { confirm: async () => {} },
+        ElMessage: { info() {}, warning() {} },
+        copyQuickReviewDraft() {},
+        runQuickReviewDraftAction: async () => true,
+        pwaManager: {
+            activateWaitingWorker: () => true,
+            refreshAfterExternalUpdate: () => true,
+        },
+        pwaReloadGuard: {
+            approveCurrentSnapshot() {},
+            cancelApproval() {},
+        },
+    }
+    return state
+}
+
+test('PWA “保存并更新”在保存后重查草案和更新目标', async () => {
+    const calls: any[] = []
+    const state = pwaUpdateState()
+    state.runQuickReviewDraftAction = async (action: string) => {
+        calls.push(action)
+        state.quickReviewHasUnsavedChanges.value = false
+        return true
+    }
+    state.pwaManager.activateWaitingWorker = (revision: number) => {
+        calls.push(['activate', revision])
+        return true
+    }
+    const app = install(state, 'requestPwaUpdate', 'handleAccountCommand')
+    assert.equal(await app.requestPwaUpdate(), true)
+    assert.deepEqual(calls, ['save', ['activate', 7]])
+
+    calls.length = 0
+    state.quickReviewHasUnsavedChanges.value = true
+    state.runQuickReviewDraftAction = async () => true
+    assert.equal(await app.requestPwaUpdate(), false)
+    assert.deepEqual(calls, [])
+
+    state.quickReviewHasUnsavedChanges.value = true
+    state.runQuickReviewDraftAction = async () => {
+        state.quickReviewHasUnsavedChanges.value = false
+        state.pwaSnapshot.value.updateRevision = 8
+        return true
+    }
+    assert.equal(await app.requestPwaUpdate(), false)
+})
+
+test('过期草案先复制则不更新，明确放弃后才继续', async () => {
+    let activations = 0
+    let copies = 0
+    const state = pwaUpdateState()
+    state.quickReviewDraftStale.value = true
+    state.copyQuickReviewDraft = () => { copies += 1 }
+    state.pwaManager.activateWaitingWorker = () => { activations += 1; return true }
+    const app = install(state, 'requestPwaUpdate', 'handleAccountCommand')
+
+    assert.equal(await app.requestPwaUpdate(), false)
+    assert.equal(copies, 1)
+    assert.equal(activations, 0)
+
+    state.ElMessageBox.confirm = async () => { throw 'cancel' }
+    assert.equal(await app.requestPwaUpdate(), true)
+    assert.equal(activations, 1)
+})
+
+test('外部已更新状态只在用户确认后刷新当前页', async () => {
+    let refreshes = 0
+    const state = pwaUpdateState()
+    state.pwaSnapshot.value = { updateRevision: 11, updateState: 'refresh-required' }
+    state.quickReviewHasUnsavedChanges.value = false
+    state.pwaManager.refreshAfterExternalUpdate = (revision: number) => {
+        assert.equal(revision, 11)
+        refreshes += 1
+        return true
+    }
+    state.ElMessageBox.confirm = async () => { throw 'cancel' }
+    const app = install(state, 'requestPwaUpdate', 'handleAccountCommand')
+    assert.equal(await app.requestPwaUpdate(), false)
+    assert.equal(refreshes, 0)
+
+    state.ElMessageBox.confirm = async () => {}
+    assert.equal(await app.requestPwaUpdate(), true)
+    assert.equal(refreshes, 1)
 })
